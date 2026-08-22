@@ -42,45 +42,109 @@ function ocId(prefix) {
   return `${prefix}_${ts}${rnd}`;
 }
 
+// Zero-cost model snapshot from https://models.opencode.ai/api.json → ["opencode"].models
+// Used as fallback when the live registry cannot be fetched/parsed.
 const DEFAULT_MODELS = [
-  "deepseek-v4-flash-free",
-  "mimo-v2.5-free",
-  "ling-3.0-flash-free",
+  "x-preview-f-free",
+  "nemotron-3.5-lightning-free",
+  "muse-spark-1.2-contributor-free",
+  "hy3-free",
   "nemotron-3-ultra-free",
-  "north-mini-code-free",
+  "mimo-v2.5-free",
+  "big-pickle",
+  "ling-3.0-tiny-free",
+  "deepseek-v4-flash-free",
+  "ling-3.0-flash-free",
   "laguna-s-2.1-free",
+  "longcat-2.0-free",
+  "north-mini-code-free",
+  "minimax-m3-free",
+  "ring-2.6-1t-free",
+  "ling-2.6-flash-free",
+  "hy3-preview-free",
+  "qwen3.6-plus-free",
+  "mimo-v2-pro-free",
+  "mimo-v2-omni-free",
+  "nemotron-3-super-free",
+  "minimax-m2.5-free",
+  "glm-5-free",
+  "kimi-k2.5-free",
+  "trinity-large-preview-free",
+  "minimax-m2.1-free",
+  "glm-4.7-free",
+  "mimo-v2-flash-free",
+  "grok-code",
 ];
 
 let MODELS = [];
 
+// Metadata per model id: { name, status, reasoning, toolCall, contextLimit, outputLimit }
+const MODEL_META = {};
+
+const MODELS_SOURCE =
+  process.env.MODELS_SOURCE || "https://models.opencode.ai/api.json";
+
+function applyRegistry(models) {
+  const entries = Object.entries(models).filter(
+    ([, m]) => m?.cost && m.cost.input === 0 && m.cost.output === 0,
+  );
+  if (!entries.length) return false;
+
+  // Active first, then newest release_date.
+  entries.sort((a, b) => {
+    const sa = a[1].status === "deprecated" ? 1 : 0;
+    const sb = b[1].status === "deprecated" ? 1 : 0;
+    if (sa !== sb) return sa - sb;
+    return (b[1].release_date || "").localeCompare(a[1].release_date || "");
+  });
+
+  MODELS = [];
+  for (const [id, m] of entries) {
+    MODELS.push(id);
+    MODEL_META[id] = {
+      name: m.name || id,
+      status: m.status || "active",
+      reasoning: !!m.reasoning,
+      toolCall: !!m.tool_call,
+      contextLimit: m.limit?.context ?? 0,
+      outputLimit: m.limit?.output ?? 0,
+    };
+  }
+
+  const dep = MODELS.filter((id) => MODEL_META[id].status === "deprecated").length;
+  console.log(
+    `[MODELS] Loaded ${MODELS.length} zero-cost models from ${MODELS_SOURCE}` +
+      ` (${MODELS.length - dep} active, ${dep} deprecated)`,
+  );
+  return true;
+}
+
 async function loadModels() {
   return new Promise((resolve) => {
+    const u = new URL(MODELS_SOURCE);
     const req = https.request({
-      hostname: "opencode.ai",
+      hostname: u.hostname,
       port: 443,
-      path: "/zen/v1/models",
+      path: u.pathname,
       method: "GET",
       headers: {
         "User-Agent": `opencode/${OC_VERSION}`,
         "Accept": "application/json",
       },
     }, (res) => {
-      let data = "";
-      res.on("data", (chunk) => { data += chunk; });
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => {
         try {
-          const json = JSON.parse(data);
-          const freeModels = (json.data || []).map((m) => m.id).filter((id) => id.includes("free"));
-          if (freeModels.length) {
-            MODELS = freeModels;
-            console.log(`[MODELS] Loaded ${MODELS.length} free models from API`);
-          } else {
+          const json = JSON.parse(Buffer.concat(chunks).toString());
+          const models = json?.opencode?.models;
+          if (!models || !applyRegistry(models)) {
             MODELS = [...DEFAULT_MODELS];
-            console.log("[MODELS] No free models found in API, using defaults");
+            console.log("[MODELS] No zero-cost models in registry, using defaults");
           }
         } catch (e) {
           MODELS = [...DEFAULT_MODELS];
-          console.log("[MODELS] Failed to parse API response:", e.message);
+          console.log("[MODELS] Failed to parse registry:", e.message);
         }
         resolve();
       });
@@ -90,7 +154,7 @@ async function loadModels() {
       console.log("[MODELS] Fetch error:", e.message, "- using defaults");
       resolve();
     });
-    req.setTimeout(10000, () => {
+    req.setTimeout(30000, () => {
       req.destroy();
       MODELS = [...DEFAULT_MODELS];
       console.log("[MODELS] Fetch timeout - using defaults");
@@ -637,9 +701,17 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
 app.get("/v1/models", (_req, res) => {
   res.json({
     object: "list",
-    data: MODELS.map((id) => ({
-      id, object: "model", created: 1779000000, owned_by: "opencode-free",
-    })),
+    data: MODELS.map((id) => {
+      const meta = MODEL_META[id] || {};
+      return {
+        id, object: "model", created: 1779000000, owned_by: "opencode-free",
+        name: meta.name,
+        status: meta.status,
+        reasoning: meta.reasoning,
+        tool_call: meta.toolCall,
+        limit: { context: meta.contextLimit || undefined, output: meta.outputLimit || undefined },
+      };
+    }),
   });
 });
 
