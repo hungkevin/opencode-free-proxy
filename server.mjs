@@ -116,6 +116,11 @@ function getSession(user) {
 // Default 65536 (~262K chars) — DeepSeek V4 Flash supports up to 384K
 // output tokens total, so keep the fuse wide enough for long thinking.
 const REASONING_CAP = parseInt(process.env.REASONING_CAP || "65536", 10);
+// Default output-token cap injected when the client sends none. Reasoning
+// models count thinking toward output tokens, so this bounds a runaway
+// thinker at the API level (covers sync requests the SSE sniffer can't see).
+// Set MAX_TOKENS_DEFAULT=0 to disable injection.
+const DEFAULT_MAX_TOKENS = parseInt(process.env.MAX_TOKENS_DEFAULT || "32768", 10);
 
 function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extra = {}) {
   const reqBody = { model, messages, stream: !!stream };
@@ -125,6 +130,14 @@ function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extr
   // which let reasoning models think forever with no max_tokens cap).
   for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "seed"]) {
     if (extra[k] !== undefined) reqBody[k] = extra[k];
+  }
+  // Anthropic clients send stop_sequences; map it to OpenAI's stop.
+  if (reqBody.stop === undefined && extra.stop_sequences !== undefined) {
+    reqBody.stop = extra.stop_sequences;
+  }
+  // Safety net when the client specified no length cap.
+  if (DEFAULT_MAX_TOKENS > 0 && reqBody.max_tokens === undefined && reqBody.max_completion_tokens === undefined) {
+    reqBody.max_tokens = DEFAULT_MAX_TOKENS;
   }
   const body = JSON.stringify(reqBody);
   const requestId = ocId("msg");
@@ -162,6 +175,7 @@ function pipeZenResponse(zenOpts, body, stream, res) {
     let reasoningTokens = 0;
     let contentStarted = false;
     let stopped = false;
+    let finishSeen = false;
 
     function stopForReasoningCap() {
       if (stopped) return;
@@ -186,11 +200,12 @@ function pipeZenResponse(zenOpts, body, stream, res) {
         for (const line of lines) {
           if (!line.startsWith("data: ")) continue;
           const payload = line.slice(6).trim();
-          if (payload === "[DONE]") continue;
+          if (payload === "[DONE]") { finishSeen = true; continue; }
           let p;
           try { p = JSON.parse(payload); } catch { continue; }
           const delta = p.choices?.[0]?.delta;
           if (!delta) continue;
+          if (p.choices?.[0]?.finish_reason) finishSeen = true;
           if (delta.content) contentStarted = true;
           if (delta.reasoning_content) reasoningTokens += Math.ceil(delta.reasoning_content.length / 4);
         }
@@ -251,6 +266,12 @@ function pipeZenResponse(zenOpts, body, stream, res) {
           res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
         }
         return;
+      }
+      // Upstream closed mid-stream without finish_reason/[DONE]: synthesize a
+      // clean ending so OpenAI SDK clients don't hang on an unterminated SSE.
+      if (stream && headersSent && !stopped && !finishSeen && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "length" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
       }
       if (headersSent && !res.writableEnded) res.end();
     });
@@ -415,6 +436,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
     let contentIdx = 0;
     let toolIdx = -1;
     let firstChunkHandled = false;
+    let finishHandled = false;
 
     function sendSSE(event, data) {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -562,6 +584,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
             usage: { output_tokens: outputTokens },
           });
           sendSSE("message_stop", { type: "message_stop" });
+          finishHandled = true;
         }
       }
     });
@@ -572,6 +595,21 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
           res.status(502).json({ type: "error", error: { type: "upstream_error", message: "Empty response" } });
         }
         return;
+      }
+      // Upstream closed without finish_reason (abnormal cut): close open
+      // blocks and synthesize message_delta/message_stop so Anthropic SDK
+      // clients don't hang waiting for a proper stream termination.
+      if (!finishHandled && !res.writableEnded) {
+        const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
+        for (let i = 0; i < totalBlocks; i++) {
+          sendSSE("content_block_stop", { type: "content_block_stop", index: i });
+        }
+        sendSSE("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: outputTokens },
+        });
+        sendSSE("message_stop", { type: "message_stop" });
       }
       res.end();
     });
@@ -650,10 +688,23 @@ app.post("/v1/messages", async (req, res) => {
   } else {
     try {
       const zenResp = await zenRequestFull(options, body);
-      if (zenResp.status === 429 || zenResp.data?.error) {
+      if (zenResp.status === 429) {
         const errMsg = zenResp.data?.error?.message || "Rate limit exceeded";
         return res.status(429).json({
           type: "error", error: { type: "rate_limit_error", message: errMsg + " (free model rate limit)" },
+        });
+      }
+      if (zenResp.data?.error) {
+        // Map upstream status codes to Anthropic error types instead of
+        // mislabeling every upstream failure as a rate limit.
+        const errType = ({
+          400: "invalid_request_error",
+          401: "authentication_error",
+          403: "authentication_error",
+          404: "not_found_error",
+        })[zenResp.status] || "api_error";
+        return res.status(zenResp.status >= 400 ? zenResp.status : 502).json({
+          type: "error", error: { type: errType, message: zenResp.data.error?.message || "Upstream error" },
         });
       }
       if (!zenResp.data?.choices) {
