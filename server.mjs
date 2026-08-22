@@ -42,61 +42,56 @@ function ocId(prefix) {
   return `${prefix}_${ts}${rnd}`;
 }
 
-// Zero-cost model snapshot from https://models.opencode.ai/api.json → ["opencode"].models
+// Active zero-cost model snapshot from https://models.opencode.ai/api.json → ["opencode"].models
 // Used as fallback when the live registry cannot be fetched/parsed.
 const DEFAULT_MODELS = [
-  "x-preview-f-free",
-  "nemotron-3.5-lightning-free",
-  "muse-spark-1.2-contributor-free",
-  "hy3-free",
-  "nemotron-3-ultra-free",
-  "mimo-v2.5-free",
-  "big-pickle",
-  "ling-3.0-tiny-free",
-  "deepseek-v4-flash-free",
-  "ling-3.0-flash-free",
-  "laguna-s-2.1-free",
-  "longcat-2.0-free",
-  "north-mini-code-free",
-  "minimax-m3-free",
-  "ring-2.6-1t-free",
-  "ling-2.6-flash-free",
-  "hy3-preview-free",
-  "qwen3.6-plus-free",
-  "mimo-v2-pro-free",
-  "mimo-v2-omni-free",
-  "nemotron-3-super-free",
-  "minimax-m2.5-free",
-  "glm-5-free",
-  "kimi-k2.5-free",
-  "trinity-large-preview-free",
-  "minimax-m2.1-free",
-  "glm-4.7-free",
-  "mimo-v2-flash-free",
-  "grok-code",
+  { id: "x-preview-f-free", name: "Ox Alpha Free (Unlimited)", reasoning: true, toolCall: true, contextLimit: 1000000, outputLimit: 131072, releaseDate: "2026-08-21" },
+  { id: "nemotron-3.5-lightning-free", name: "Nemotron 3.5 Lightning Free", reasoning: true, toolCall: true, contextLimit: 262144, outputLimit: 262144, releaseDate: "2026-08-11" },
+  { id: "muse-spark-1.2-contributor-free", name: "Muse Spark 1.2 Free", reasoning: true, toolCall: true, contextLimit: 1048576, outputLimit: 131072, releaseDate: "2026-08-05" },
+  { id: "hy3-free", name: "Hy3 Free", reasoning: true, toolCall: true, contextLimit: 190000, outputLimit: 64000, releaseDate: "2026-07-06" },
+  { id: "nemotron-3-ultra-free", name: "Nemotron 3 Ultra Free", reasoning: true, toolCall: true, contextLimit: 1000000, outputLimit: 128000, releaseDate: "2026-06-04" },
+  { id: "mimo-v2.5-free", name: "MiMo V2.5 Free", reasoning: true, toolCall: true, contextLimit: 200000, outputLimit: 32000, releaseDate: "2026-04-24" },
+  { id: "big-pickle", name: "Big Pickle", reasoning: true, toolCall: true, contextLimit: 200000, outputLimit: 32000, releaseDate: "2025-10-17" },
 ];
 
 let MODELS = [];
 
-// Metadata per model id: { name, status, reasoning, toolCall, contextLimit, outputLimit }
+// Metadata per model id: { name, status, reasoning, toolCall, contextLimit, outputLimit, releaseDate }
 const MODEL_META = {};
 
 const MODELS_SOURCE =
   process.env.MODELS_SOURCE || "https://models.opencode.ai/api.json";
 
+function useDefaults(reason) {
+  MODELS = [];
+  for (const m of DEFAULT_MODELS) {
+    MODELS.push(m.id);
+    MODEL_META[m.id] = {
+      name: m.name,
+      status: "active",
+      reasoning: !!m.reasoning,
+      toolCall: !!m.toolCall,
+      contextLimit: m.contextLimit || 0,
+      outputLimit: m.outputLimit || 0,
+      releaseDate: m.releaseDate || "-",
+    };
+  }
+  console.log(`[MODELS] ${reason} - using ${MODELS.length} built-in defaults`);
+}
+
 function applyRegistry(models) {
+  // Only currently-active zero-cost models (input & output both free).
   const entries = Object.entries(models).filter(
-    ([, m]) => m?.cost && m.cost.input === 0 && m.cost.output === 0,
+    ([, m]) =>
+      m?.cost && m.cost.input === 0 && m.cost.output === 0 &&
+      m.status !== "deprecated",
   );
   if (!entries.length) return false;
 
-  // Active first, then newest release_date.
-  entries.sort((a, b) => {
-    const sa = a[1].status === "deprecated" ? 1 : 0;
-    const sb = b[1].status === "deprecated" ? 1 : 0;
-    if (sa !== sb) return sa - sb;
-    return (b[1].release_date || "").localeCompare(a[1].release_date || "");
-  });
+  // Newest release_date first.
+  entries.sort((a, b) =>
+    (b[1].release_date || "").localeCompare(a[1].release_date || ""),
+  );
 
   MODELS = [];
   for (const [id, m] of entries) {
@@ -108,13 +103,12 @@ function applyRegistry(models) {
       toolCall: !!m.tool_call,
       contextLimit: m.limit?.context ?? 0,
       outputLimit: m.limit?.output ?? 0,
+      releaseDate: m.release_date || "-",
     };
   }
 
-  const dep = MODELS.filter((id) => MODEL_META[id].status === "deprecated").length;
   console.log(
-    `[MODELS] Loaded ${MODELS.length} zero-cost models from ${MODELS_SOURCE}` +
-      ` (${MODELS.length - dep} active, ${dep} deprecated)`,
+    `[MODELS] Loaded ${MODELS.length} active zero-cost models from ${MODELS_SOURCE}`,
   );
   return true;
 }
@@ -139,25 +133,21 @@ async function loadModels() {
           const json = JSON.parse(Buffer.concat(chunks).toString());
           const models = json?.opencode?.models;
           if (!models || !applyRegistry(models)) {
-            MODELS = [...DEFAULT_MODELS];
-            console.log("[MODELS] No zero-cost models in registry, using defaults");
+            useDefaults("No active zero-cost models in registry");
           }
         } catch (e) {
-          MODELS = [...DEFAULT_MODELS];
-          console.log("[MODELS] Failed to parse registry:", e.message);
+          useDefaults("Failed to parse registry: " + e.message);
         }
         resolve();
       });
     });
     req.on("error", (e) => {
-      MODELS = [...DEFAULT_MODELS];
-      console.log("[MODELS] Fetch error:", e.message, "- using defaults");
+      useDefaults("Fetch error: " + e.message);
       resolve();
     });
     req.setTimeout(30000, () => {
       req.destroy();
-      MODELS = [...DEFAULT_MODELS];
-      console.log("[MODELS] Fetch timeout - using defaults");
+      useDefaults("Fetch timeout");
       resolve();
     });
     req.end();
@@ -798,16 +788,51 @@ app.get("/health", (_req, res) => res.json({
   endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
 }));
 
+// ── Startup model report ────────────────────────────────────────────
+function fmtTokens(n) {
+  if (!n) return "-";
+  if (n >= 1000000) return `${String(n / 1000000).replace(/\.0+$/, "")}M`;
+  if (n >= 1000) return `${String(n / 1000).replace(/\.0+$/, "")}K`;
+  return String(n);
+}
+
+function printModels() {
+  const line = "-".repeat(96);
+  console.log("");
+  console.log(`  Free models (active, cost=0): ${MODELS.length}`);
+  console.log(`  ${line}`);
+  console.log(
+    `  ${"MODEL ID".padEnd(34)}${"NAME".padEnd(32)}${"CONTEXT".padEnd(10)}${"OUTPUT".padEnd(10)}${"REASON".padEnd(8)}${"TOOLS".padEnd(7)}RELEASE`,
+  );
+  for (const id of MODELS) {
+    const m = MODEL_META[id] || {};
+    console.log(
+      `  ${id.padEnd(34)}${(m.name || "-").padEnd(32)}${fmtTokens(m.contextLimit).padEnd(10)}${fmtTokens(m.outputLimit).padEnd(10)}${(m.reasoning ? "yes" : "no").padEnd(8)}${(m.toolCall ? "yes" : "no").padEnd(7)}${m.releaseDate || "-"}`,
+    );
+  }
+  console.log(`  ${line}`);
+}
+
 // ── Start ──────────────────────────────────────────────────────────
 await loadModels();
-app.listen(PORT, "0.0.0.0", () => {
+printModels();
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");
   console.log("  Models:    GET  /v1/models");
   console.log("  Health:    GET  /health");
-  console.log("  Models:", MODELS.join(", "));
   for (const [name, key] of Object.entries(apiKeys)) {
     console.log(`  ${name.padEnd(15)} ${key}`);
   }
+});
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(
+      `[FATAL] Port ${PORT} is already in use. Stop the other instance or set PROXY_PORT to a free port.`,
+    );
+  } else {
+    console.error("[FATAL] Server error:", e.message);
+  }
+  process.exit(1);
 });
