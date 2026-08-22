@@ -42,13 +42,63 @@ function ocId(prefix) {
   return `${prefix}_${ts}${rnd}`;
 }
 
-const MODELS = [
+const DEFAULT_MODELS = [
   "deepseek-v4-flash-free",
-  "big-pickle",
-  "minimax-m2.5-free",
-  "nemotron-3-super-free",
-  "qwen3.6-plus-free",
+  "mimo-v2.5-free",
+  "ling-3.0-flash-free",
+  "nemotron-3-ultra-free",
+  "north-mini-code-free",
+  "laguna-s-2.1-free",
 ];
+
+let MODELS = [];
+
+async function loadModels() {
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: "opencode.ai",
+      port: 443,
+      path: "/zen/v1/models",
+      method: "GET",
+      headers: {
+        "User-Agent": `opencode/${OC_VERSION}`,
+        "Accept": "application/json",
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          const freeModels = (json.data || []).map((m) => m.id).filter((id) => id.includes("free"));
+          if (freeModels.length) {
+            MODELS = freeModels;
+            console.log(`[MODELS] Loaded ${MODELS.length} free models from API`);
+          } else {
+            MODELS = [...DEFAULT_MODELS];
+            console.log("[MODELS] No free models found in API, using defaults");
+          }
+        } catch (e) {
+          MODELS = [...DEFAULT_MODELS];
+          console.log("[MODELS] Failed to parse API response:", e.message);
+        }
+        resolve();
+      });
+    });
+    req.on("error", (e) => {
+      MODELS = [...DEFAULT_MODELS];
+      console.log("[MODELS] Fetch error:", e.message, "- using defaults");
+      resolve();
+    });
+    req.setTimeout(10000, () => {
+      req.destroy();
+      MODELS = [...DEFAULT_MODELS];
+      console.log("[MODELS] Fetch timeout - using defaults");
+      resolve();
+    });
+    req.end();
+  });
+}
 
 // Track sessions per user (rotate every 30 min)
 const userSessions = {};
@@ -61,10 +111,21 @@ function getSession(user) {
 }
 
 // ── Zen API transport ──────────────────────────────────────────────
-function zenRequest(model, messages, stream, tools, tool_choice, sessionId) {
+// Reasoning safety cap: if a reasoning model streams this many reasoning
+// tokens without producing any content, force-stop the stream.
+// Default 65536 (~262K chars) — DeepSeek V4 Flash supports up to 384K
+// output tokens total, so keep the fuse wide enough for long thinking.
+const REASONING_CAP = parseInt(process.env.REASONING_CAP || "65536", 10);
+
+function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extra = {}) {
   const reqBody = { model, messages, stream: !!stream };
   if (tools?.length) reqBody.tools = tools;
   if (tool_choice) reqBody.tool_choice = tool_choice;
+  // Forward client-side generation controls to Zen (was dropped before,
+  // which let reasoning models think forever with no max_tokens cap).
+  for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "seed"]) {
+    if (extra[k] !== undefined) reqBody[k] = extra[k];
+  }
   const body = JSON.stringify(reqBody);
   const requestId = ocId("msg");
 
@@ -95,8 +156,50 @@ function pipeZenResponse(zenOpts, body, stream, res) {
   const req = https.request(zenOpts, (zenRes) => {
     let firstChunk = null;
     let headersSent = false;
+    // Reasoning sniffer: count reasoning_content tokens in the SSE stream.
+    // If a reasoning model thinks forever without emitting content, force-stop.
+    let sniffBuf = "";
+    let reasoningTokens = 0;
+    let contentStarted = false;
+    let stopped = false;
+
+    function stopForReasoningCap() {
+      if (stopped) return;
+      stopped = true;
+      console.log(`[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+      req.destroy();
+      if (stream && headersSent && !res.writableEnded) {
+        const fin = { choices: [{ index: 0, delta: {}, finish_reason: "length" }] };
+        res.write(`data: ${JSON.stringify(fin)}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } else if (!res.headersSent) {
+        res.status(502).json({ error: { message: "Upstream reasoning timeout", type: "timeout_error" } });
+      }
+    }
 
     zenRes.on("data", (chunk) => {
+      if (stream && !stopped) {
+        sniffBuf += chunk.toString();
+        const lines = sniffBuf.split("\n");
+        sniffBuf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          if (payload === "[DONE]") continue;
+          let p;
+          try { p = JSON.parse(payload); } catch { continue; }
+          const delta = p.choices?.[0]?.delta;
+          if (!delta) continue;
+          if (delta.content) contentStarted = true;
+          if (delta.reasoning_content) reasoningTokens += Math.ceil(delta.reasoning_content.length / 4);
+        }
+        if (!contentStarted && reasoningTokens > REASONING_CAP) {
+          stopForReasoningCap();
+          return;
+        }
+      }
+
       if (!firstChunk) {
         firstChunk = chunk;
         const str = chunk.toString().trim();
@@ -149,7 +252,7 @@ function pipeZenResponse(zenOpts, body, stream, res) {
         }
         return;
       }
-      if (headersSent) res.end();
+      if (headersSent && !res.writableEnded) res.end();
     });
   });
 
@@ -308,6 +411,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
     let headersSent = false;
     let buffer = "";
     let outputTokens = 0;
+    let reasoningTokens = 0;
     let contentIdx = 0;
     let toolIdx = -1;
     let firstChunkHandled = false;
@@ -377,6 +481,25 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
         try { parsed = JSON.parse(payload); } catch { continue; }
         const delta = parsed.choices?.[0]?.delta;
         if (!delta) continue;
+
+        // Reasoning sniffer (Anthropic path): count reasoning_content tokens.
+        // If the model thinks forever without content/tools, force-stop.
+        if (delta.reasoning_content) {
+          reasoningTokens += Math.ceil(delta.reasoning_content.length / 4);
+          if (reasoningTokens > REASONING_CAP && contentIdx === 0 && toolIdx === -1) {
+            console.log(`[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+            req.destroy();
+            sendHeaders();
+            sendSSE("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: "max_tokens" },
+              usage: { output_tokens: outputTokens + reasoningTokens },
+            });
+            sendSSE("message_stop", { type: "message_stop" });
+            res.end();
+            return;
+          }
+        }
 
         sendHeaders();
 
@@ -495,7 +618,7 @@ app.post("/v1/chat/completions", (req, res) => {
   const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
   console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
 
-  const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId);
+  const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId, req.body);
   pipeZenResponse(options, body, stream, res);
 });
 
@@ -520,7 +643,7 @@ app.post("/v1/messages", async (req, res) => {
 
   console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
 
-  const { body, options } = zenRequest(model, messages, stream, tools, undefined, sessionId);
+  const { body, options } = zenRequest(model, messages, stream, tools, undefined, sessionId, req.body);
 
   if (stream) {
     pipeZenAsAnthropic(options, body, model, res, inputTokens);
@@ -553,6 +676,7 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 // ── Start ──────────────────────────────────────────────────────────
+await loadModels();
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
