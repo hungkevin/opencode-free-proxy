@@ -3,3 +3,7 @@ api-keys.json
 package-lock.json
 *.log
 .env
+
+review/*.mjs
+review/*.py
+review/*.pptx
