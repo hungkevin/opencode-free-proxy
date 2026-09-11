@@ -24,8 +24,8 @@ Always check `GET /v1/models` for the live list; the table below is a snapshot.
 
 | Model (snapshot 2026-09-11) | What it is | Reliability |
 |-------|-----------|-------------|
-| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 | Solid |
-| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 | Solid |
+| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 (**responses only**) | Solid |
+| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 (**responses only**) | Solid |
 | `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning | Solid |
 | `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | Hit or miss |
 | `mimo-v2.5-free` | MiMo V2.5 | Solid |
@@ -48,7 +48,7 @@ curl http://localhost:6446/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "muse-spark-1.2-contributor-free",
+    "model": "mimo-v2.5-free",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
@@ -61,7 +61,7 @@ curl http://localhost:6446/v1/messages \
   -H "x-api-key: YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "muse-spark-1.2-contributor-free",
+    "model": "mimo-v2.5-free",
     "system": "You are helpful.",
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 1024,
@@ -97,8 +97,13 @@ curl http://localhost:6446/v1/responses \
 ### Auth
 
 `Authorization: Bearer ***` and `x-api-key: ***` both work on the
-authenticated endpoints (`POST /v1/chat/completions`, `POST /v1/messages`).
+authenticated endpoints (`POST /v1/chat/completions`, `POST /v1/messages`,
+`POST /v1/responses`).
 `GET /v1/models` and `GET /health` are public (no key needed, probe-friendly).
+
+> Note: this proxy enforces no per-key rate limits — upstream free-tier quotas
+> apply. Don't hammer it; burst abuse can get the shared egress throttled for
+> everyone.
 
 > Note: on the Anthropic endpoint, `reasoning_content` from thinking models is
 > not forwarded — non-streaming responses contain `text` (+ `tool_use`) blocks
@@ -119,9 +124,9 @@ Add to `~/.config/opencode/opencode.json`:
       "apiKey": "YOUR_KEY",
       "baseURL": "http://localhost:6446/v1",
       "models": {
-        "free/muse-spark-1.2-contributor-free": {
-          "id": "muse-spark-1.2-contributor-free",
-          "name": "free/muse-spark-1.2-contributor-free",
+        "free/mimo-v2.5-free": {
+          "id": "mimo-v2.5-free",
+          "name": "free/mimo-v2.5-free",
           "attachment": true,
           "reasoning": true
         }
@@ -135,7 +140,7 @@ Add to `~/.config/opencode/opencode.json`:
 
 - Base URL: `http://YOUR_HOST:6446/v1`
 - API Key: your key from `api-keys.json`
-- Model: `muse-spark-1.2-contributor-free` (or any ID from `GET /v1/models`)
+- Model: `mimo-v2.5-free` (or any non-Spark ID from `GET /v1/models`; Spark models live on `/v1/responses`)
 
 ### Claude Code (Anthropic format)
 

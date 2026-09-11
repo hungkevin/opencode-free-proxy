@@ -192,6 +192,14 @@ function getSession(user) {
   }
   return userSessions[user].id;
 }
+// P2.1: bound userSessions growth — sweep entries dead for >2× their TTL.
+// Runs on a 10-minute interval; a live user re-creates its entry on next call.
+setInterval(() => {
+  const now = Date.now();
+  for (const [user, s] of Object.entries(userSessions)) {
+    if (now - s.ts > (s.ttl || SESSION_TTL_MS) * 2) delete userSessions[user];
+  }
+}, 10 * 60 * 1000).unref?.();
 
 // ── Zen API transport ──────────────────────────────────────────────
 // Reasoning safety cap: if a reasoning model streams this many reasoning
@@ -320,7 +328,9 @@ function pipeZenResponse(zenOpts, body, stream, res) {
         firstChunk = chunk;
         const str = chunk.toString().trim();
 
-        if (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes('"error"'))) {
+        // P2.3: also catch {"type":"error",...} shaped bodies, not just
+        // FreeUsageLimitError / "error" substrings.
+        if (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes('"error"') || str.includes('"type":"error"') || str.includes('"type": "error"'))) {
           try {
             const parsed = JSON.parse(str);
             if (parsed.error || parsed.type === "error") {
@@ -513,8 +523,14 @@ function openAIToAnthropic(oaiResp, model, inputTokens) {
   }
 
   const content = [];
+  // P1.3: some OpenAI-compatible APIs return content as an array of parts —
+  // extract text instead of pushing the raw array into a string field.
   if (choice.message?.content) {
-    content.push({ type: "text", text: choice.message.content });
+    const c = choice.message.content;
+    const text = Array.isArray(c)
+      ? c.map(p => (typeof p === "string" ? p : (p?.text || ""))).join("\n")
+      : c;
+    content.push({ type: "text", text });
   }
   if (choice.message?.tool_calls) {
     for (const tc of choice.message.tool_calls) {
@@ -587,6 +603,8 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
     let reasoningTokens = 0;
     let contentIdx = 0;
     let toolIdx = -1;
+    // P1.1: track text-block closure so finish handler never re-stops index 0.
+    let textBlockClosed = false;
     let firstChunkHandled = false;
     let finishHandled = false;
 
@@ -619,11 +637,11 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
     zenRes.on("data", (chunk) => {
       const str = chunk.toString();
 
-      // Check for errors on first chunk
+      // Check for errors on first chunk (P2.3: also {"type":"error"} shape)
       if (!firstChunkHandled) {
         firstChunkHandled = true;
         const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes('"error"'))) {
+        if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes('"error"') || trimmed.includes('"type":"error"') || trimmed.includes('"type": "error"'))) {
           try {
             const parsed = JSON.parse(trimmed);
             if (parsed.error || parsed.type === "error") {
@@ -698,6 +716,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
               // Close previous text block if open
               if (toolIdx === -1 && contentIdx > 0) {
                 sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
+                textBlockClosed = true;
               }
               toolIdx = idx;
               const blockIdx = contentIdx > 0 ? idx + 1 : idx;
@@ -717,12 +736,14 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
           }
         }
 
-        // Finish
-        if (parsed.choices?.[0]?.finish_reason) {
+        // Finish (idempotent: upstream may repeat finish_reason — P1.1)
+        if (parsed.choices?.[0]?.finish_reason && !finishHandled) {
+          finishHandled = true;
           const fr = parsed.choices[0].finish_reason;
-          // Close open blocks
+          // Close open blocks (skip index 0 if already closed on tool arrival — P1.1)
           const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
           for (let i = 0; i < totalBlocks; i++) {
+            if (i === 0 && textBlockClosed) continue;
             sendSSE("content_block_stop", { type: "content_block_stop", index: i });
           }
 
@@ -736,7 +757,6 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
             usage: { output_tokens: outputTokens },
           });
           sendSSE("message_stop", { type: "message_stop" });
-          finishHandled = true;
         }
       }
     });
@@ -754,6 +774,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
       if (!finishHandled && !res.writableEnded) {
         const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
         for (let i = 0; i < totalBlocks; i++) {
+          if (i === 0 && textBlockClosed) continue; // P1.1: same skip as finish handler
           sendSSE("content_block_stop", { type: "content_block_stop", index: i });
         }
         sendSSE("message_delta", {
@@ -790,7 +811,24 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
 // Body is passed through untouched (client controls input/tools/reasoning);
 // only auth + model-membership are enforced locally.
 function zenResponsesRequest(clientBody, sessionId) {
-  const body = JSON.stringify(clientBody);
+  // P1.5: Responses API uses max_output_tokens (NOT max_tokens — upstream
+  // 400s "unknown parameter" on the latter). Translate an explicit max_tokens
+  // if present, else inject DEFAULT_MAX_TOKENS when no length cap was sent
+  // (reasoning models count thinking toward output; unbounded thinking can
+  // burn the free quota). No REASONING_CAP sniffer here: Responses reasoning
+  // does not stream as delta.reasoning_content, so chat-style sniffing does
+  // not apply — injection is the whole protection. Set MAX_TOKENS_DEFAULT=0
+  // to disable.
+  const reqBody = { ...clientBody };
+  if (reqBody.max_output_tokens === undefined) {
+    if (reqBody.max_tokens !== undefined) {
+      reqBody.max_output_tokens = reqBody.max_tokens;
+    } else if (DEFAULT_MAX_TOKENS > 0) {
+      reqBody.max_output_tokens = DEFAULT_MAX_TOKENS;
+    }
+  }
+  delete reqBody.max_tokens;
+  const body = JSON.stringify(reqBody);
   const requestId = ocId("msg");
   return {
     body,
@@ -887,6 +925,21 @@ function sparkWrongEndpoint(model) {
   return { message: `Model ${model} requires the Responses API: POST /v1/responses (Muse Spark is not served on this endpoint)`, type: "invalid_request_error", code: "wrong_endpoint" };
 }
 
+// P2.5: basic generation-param validation (garbage in → local 400,
+// not confusing upstream errors). Returns an error string or null.
+function validateGenParams(b) {
+  if (b.max_tokens !== undefined && (!Number.isInteger(b.max_tokens) || b.max_tokens <= 0)) {
+    return "max_tokens must be a positive integer";
+  }
+  if (b.temperature !== undefined && (typeof b.temperature !== "number" || b.temperature < 0 || b.temperature > 2)) {
+    return "temperature must be a number in [0, 2]";
+  }
+  if (b.top_p !== undefined && (typeof b.top_p !== "number" || b.top_p < 0 || b.top_p > 1)) {
+    return "top_p must be a number in [0, 1]";
+  }
+  return null;
+}
+
 // ── Routes: OpenAI format ──────────────────────────────────────────
 app.get("/v1/models", (_req, res) => {
   res.json({
@@ -921,6 +974,11 @@ app.post("/v1/chat/completions", (req, res) => {
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: { message: "messages must be a non-empty array", type: "invalid_request_error" } });
   }
+  // P2.5: generation-param validation.
+  {
+    const perr = validateGenParams(req.body);
+    if (perr) return res.status(400).json({ error: { message: perr, type: "invalid_request_error" } });
+  }
 
   const sessionId = getSession(user);
   const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
@@ -938,6 +996,12 @@ app.post("/v1/responses", (req, res) => {
   const { model, stream } = req.body;
   if (!MODELS.includes(model)) {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
+  }
+  // P2.7: reject missing/empty input locally (mirrors messages checks on chat routes).
+  if (req.body.input === undefined || req.body.input === null ||
+      (typeof req.body.input === "string" && !req.body.input.trim()) ||
+      (Array.isArray(req.body.input) && req.body.input.length === 0)) {
+    return res.status(400).json({ error: { message: "input must be a non-empty string or array", type: "invalid_request_error" } });
   }
 
   const sessionId = getSession(user);
@@ -1014,8 +1078,11 @@ app.post("/v1/messages", async (req, res) => {
         });
       }
       if (!zenResp.data?.choices) {
+        // P1.2: data null means upstream sent non-JSON (e.g. HTML error page) —
+        // surface the raw fragment instead of a misleading canned message.
+        const rawFrag = typeof zenResp.raw === "string" ? zenResp.raw.slice(0, 200) : "";
         return res.status(502).json({
-          type: "error", error: { type: "upstream_error", message: "Invalid upstream response" },
+          type: "error", error: { type: "upstream_error", message: rawFrag ? `Invalid upstream response: ${rawFrag}` : "Invalid upstream response" },
         });
       }
       res.json(openAIToAnthropic(zenResp.data, model, inputTokens));
