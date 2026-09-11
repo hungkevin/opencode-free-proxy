@@ -924,6 +924,12 @@ function isSparkModel(m) {
 function sparkWrongEndpoint(model) {
   return { message: `Model ${model} requires the Responses API: POST /v1/responses (Muse Spark is not served on this endpoint)`, type: "invalid_request_error", code: "wrong_endpoint" };
 }
+// B2 (reverse): /v1/responses serves ONLY the muse-spark family upstream —
+// anything else 500s there. Fail locally with a pointer to the right endpoints
+// instead of surfacing a bare upstream 500 (same philosophy as the P1.3 guard).
+function nonSparkWrongEndpoint(model) {
+  return { message: `Model ${model} requires POST /v1/chat/completions or POST /v1/messages (only Muse Spark models are served on /v1/responses)`, type: "invalid_request_error", code: "wrong_endpoint" };
+}
 
 // P2.5: basic generation-param validation (garbage in → local 400,
 // not confusing upstream errors). Returns an error string or null.
@@ -996,6 +1002,11 @@ app.post("/v1/responses", (req, res) => {
   const { model, stream } = req.body;
   if (!MODELS.includes(model)) {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
+  }
+  // B2 (reverse): only muse-spark* is served on /v1/responses upstream —
+  // anything else 500s there. Point the client at the right endpoint locally.
+  if (!isSparkModel(model)) {
+    return res.status(400).json({ error: nonSparkWrongEndpoint(model) });
   }
   // P2.7: reject missing/empty input locally (mirrors messages checks on chat routes).
   if (req.body.input === undefined || req.body.input === null ||

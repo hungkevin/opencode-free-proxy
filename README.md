@@ -82,10 +82,13 @@ curl http://localhost:6446/v1/responses \
   }'
 ```
 
-> **Endpoint routing**: `muse-spark*` models are served **only** on `/v1/responses`
-> (they 500 on chat/completions and messages — same as the official opencode CLI,
-> which routes them to the Codex Responses API). Calling them on the wrong
-> endpoint returns `400 wrong_endpoint` pointing here.
+> **Endpoint routing** (enforced locally, both directions):
+> `muse-spark*` models are served **only** on `/v1/responses` (they 500 on
+> chat/completions and messages — same as the official opencode CLI, which
+> routes them to the Codex Responses API); all other models are served **only**
+> on `/v1/chat/completions` and `/v1/messages` (they 500 upstream on
+> `/v1/responses`). Calling a model on the wrong endpoint returns
+> `400 wrong_endpoint` pointing at the right one.
 
 ### Other endpoints
 
