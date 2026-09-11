@@ -82,13 +82,15 @@ curl http://localhost:6446/v1/responses \
   }'
 ```
 
-> **Endpoint routing** (enforced locally, both directions):
-> `muse-spark*` models are served **only** on `/v1/responses` (they 500 on
-> chat/completions and messages — same as the official opencode CLI, which
-> routes them to the Codex Responses API); all other models are served **only**
-> on `/v1/chat/completions` and `/v1/messages` (they 500 upstream on
-> `/v1/responses`). Calling a model on the wrong endpoint returns
-> `400 wrong_endpoint` pointing at the right one.
+> **Endpoint routing** (enforced locally):
+> `muse-spark*` models work on **all three endpoints** — chat/completions and
+> messages are served via automatic translation to the upstream Responses API
+> (their home endpoint). Note: upstream accepts `tool_choice: "auto"` only —
+> `"none"` drops the tools, `"required"`/named-function choices degrade to
+> auto (named keeps just that tool). All other models are served on
+> `/v1/chat/completions` and `/v1/messages` (they 500 upstream on
+> `/v1/responses`, which returns `400 wrong_endpoint` pointing at the right
+> one — Responses-for-everyone is Phase 2).
 
 ### Other endpoints
 

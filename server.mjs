@@ -917,12 +917,514 @@ function pipeZenResponses(zenOpts, body, stream, res) {
   req.end();
 }
 
-// B2: Muse Spark is not served on chat/completions or messages — point at /v1/responses.
+// ── Chat → Responses translation (Phase 1: Spark on chat/messages) ──
+// Upstream serves muse-spark* ONLY on /zen/v1/responses (registry
+// provider.npm=@ai-sdk/openai). Ground truth from 2026-09-12 probes
+// (review/probe_responses_loop.mjs):
+//   - Stateless tool-loop replay WITHOUT reasoning items → 200. Reasoning
+//     replay is not needed — and actually 400s ("Referenced reasoning item
+//     not found"): upstream rejects its own reasoning ids across requests.
+//     chat replay carries no reasoning anyway → perfect match, no bridge.
+//   - Upstream tool_choice accepts ONLY "auto" (none/required/named 400).
+//     Degradation: none → drop tools; named → keep only that tool; all → auto.
+//   - Stream events: response.created → output_item.added(reasoning) →
+//     output_item.done → content_part.added → output_text.delta →
+//     content_part.done → response.completed; function_call items stream via
+//     output_item.added + function_call_arguments.delta.
+
+function chatContentText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p && (p.type === "text" || p.type === "output_text" || p.type === "input_text"))
+      .map((p) => p.text || "")
+      .join("");
+  }
+  if (content && typeof content === "object") return content.text || "";
+  return "";
+}
+
+// OpenAI chat request body → OpenAI Responses request body.
+// max_tokens stays as-is: zenResponsesRequest translates it to
+// max_output_tokens and injects DEFAULT_MAX_TOKENS when absent.
+function chatToResponsesRequest(c) {
+  const instructions = [];
+  const input = [];
+  for (const m of c.messages || []) {
+    if (m.role === "system" || m.role === "developer") {
+      const t = chatContentText(m.content);
+      if (t) instructions.push(t);
+      continue;
+    }
+    if (m.role === "tool") {
+      let out = chatContentText(m.content);
+      if (!out && m.content !== undefined && m.content !== null) out = JSON.stringify(m.content);
+      input.push({ type: "function_call_output", call_id: m.tool_call_id, output: out });
+      continue;
+    }
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const t = chatContentText(m.content);
+      if (t) input.push({ role: "assistant", content: [{ type: "output_text", text: t }] });
+      for (const tc of m.tool_calls) {
+        input.push({
+          type: "function_call",
+          call_id: tc.id,
+          name: tc.function?.name || "",
+          arguments: typeof tc.function?.arguments === "string" ? tc.function.arguments : JSON.stringify(tc.function?.arguments || {}),
+        });
+      }
+      continue;
+    }
+    const t = chatContentText(m.content);
+    input.push({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: [{ type: m.role === "assistant" ? "output_text" : "input_text", text: t }],
+    });
+  }
+  const out = { model: c.model, stream: !!c.stream, input };
+  if (instructions.length) out.instructions = instructions.join("\n\n");
+  if (Array.isArray(c.tools) && c.tools.length) {
+    out.tools = c.tools
+      .filter((t) => t && (t.type === "function" || t.function))
+      .map((t) => {
+        const f = t.function || t;
+        return { type: "function", name: f.name, description: f.description || "", parameters: f.parameters || { type: "object", properties: {} } };
+      })
+      .filter((t) => t.name);
+  }
+  // tool_choice: upstream accepts only "auto" — degrade the rest loudly.
+  const tc = c.tool_choice;
+  if (tc === "auto") {
+    out.tool_choice = "auto";
+  } else if (tc === "none") {
+    delete out.tools; // no tools → cannot call any
+  } else if (tc === "required" || (tc && typeof tc === "object")) {
+    const want = tc && typeof tc === "object" ? (tc.function?.name || tc.name) : null;
+    if (want && Array.isArray(out.tools)) out.tools = out.tools.filter((t) => t.name === want);
+    if (out.tools && out.tools.length) {
+      out.tool_choice = "auto";
+      console.log("[RES-DEGRADE] tool_choice", JSON.stringify(tc), "→ auto (upstream supports only auto)");
+    } else {
+      delete out.tools;
+    }
+  }
+  // Responses API has no stop/seed params — passing them 400s upstream.
+  for (const k of ["max_tokens", "temperature", "top_p"]) {
+    if (c[k] !== undefined) out[k] = c[k];
+  }
+  return out;
+}
+
+// OpenAI Responses response object → OpenAI chat completion response.
+function responsesObjectToChatResponse(resp, chatModel) {
+  let content = "";
+  const toolCalls = [];
+  let reasoning = "";
+  for (const item of resp.output || []) {
+    if (item.type === "message") {
+      for (const p of item.content || []) {
+        if (p.type === "output_text" || p.type === "text") content += p.text || "";
+      }
+    } else if (item.type === "function_call") {
+      toolCalls.push({
+        id: item.call_id || item.id,
+        type: "function",
+        function: { name: item.name, arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}) },
+      });
+    } else if (item.type === "reasoning") {
+      for (const s of item.summary || []) reasoning += s.text || "";
+    }
+  }
+  const message = { role: "assistant", content: content || null };
+  if (reasoning) message.reasoning_content = reasoning;
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  const finish = toolCalls.length ? "tool_calls" : resp.status === "incomplete" ? "length" : "stop";
+  const u = resp.usage || {};
+  return {
+    id: resp.id || ocId("chatcmpl"),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: chatModel,
+    choices: [{ index: 0, message, finish_reason: finish }],
+    usage: {
+      prompt_tokens: u.input_tokens || 0,
+      completion_tokens: u.output_tokens || 0,
+      total_tokens: u.total_tokens || (u.input_tokens || 0) + (u.output_tokens || 0),
+    },
+  };
+}
+
+// Incremental SSE reader for Responses-API upstream: calls onEvent(d) per
+// data payload. Tolerates "event:" lines and partial chunks.
+function responsesSSEParser(onEvent) {
+  let buf = "";
+  return (chunk) => {
+    buf += chunk.toString();
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        onEvent(JSON.parse(payload));
+      } catch {}
+    }
+  };
+}
+
+function responsesNon200(zenRes, res, anthropicShape) {
+  const chunks = [];
+  zenRes.on("data", (c) => chunks.push(c));
+  zenRes.on("end", () => {
+    let msg = "Upstream error";
+    let status = zenRes.statusCode;
+    try {
+      const p = JSON.parse(Buffer.concat(chunks).toString());
+      msg = p.error?.message || p.message || msg;
+    } catch {}
+    console.log(`[ZEN RESPONSES UPSTREAM ${status}]`, String(msg).slice(0, 200));
+    if (res.headersSent) return;
+    if (anthropicShape) {
+      const errType = ({ 400: "invalid_request_error", 401: "authentication_error", 403: "authentication_error", 404: "not_found_error", 429: "rate_limit_error" })[status] || "api_error";
+      res.status(status >= 400 ? status : 502).json({ type: "error", error: { type: errType, message: msg } });
+    } else {
+      res.status(status >= 400 ? status : 502).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
+    }
+  });
+}
+
+// Shared: detect upstream 200-with-inline-error bodies (FreeUsageLimitError
+// pattern, P2.3/P2.4 family). Returns true when the chunk looks like an error.
+function responsesFirstChunkIsError(s) {
+  const t = s.trimStart();
+  if (!t.startsWith("{")) return false;
+  if (t.includes("FreeUsageLimitError") || t.includes('"error"') || t.includes('"type":"error"') || t.includes('"type": "error"')) {
+    try {
+      const p = JSON.parse(t);
+      return !!(p.error || p.type === "error");
+    } catch {
+      return false; // partial JSON across chunks — treat as stream
+    }
+  }
+  return false;
+}
+
+// Spark branch of /v1/chat/completions: translate the chat request upstream
+// to the Responses API, translate the reply back to chat (sync + stream).
+function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
+  const req = https.request(zenOpts, (zenRes) => {
+    if (zenRes.statusCode !== 200) return responsesNon200(zenRes, res, false);
+
+    if (!stream) {
+      const chunks = [];
+      zenRes.on("data", (c) => chunks.push(c));
+      zenRes.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        let d = null;
+        try { d = JSON.parse(raw); } catch {}
+        if (!d) {
+          const frag = raw.slice(0, 200);
+          return res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
+        }
+        if (d.error || d.type === "error") {
+          const msg = d.error?.message || d.message || "Upstream error";
+          const limited = raw.includes("FreeUsageLimitError");
+          return res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
+        }
+        res.json(responsesObjectToChatResponse(d, chatModel));
+      });
+      return;
+    }
+
+    // ── stream: Responses event machine → chat chunks ──
+    // Headers are written lazily on the first non-error upstream chunk (same
+    // pattern as pipeZenResponse) so a 200-with-inline-error body can still
+    // surface as a clean 429/502 instead of hitting ERR_HTTP_HEADERS_SENT.
+    let headSent = false;
+    function sendHead() {
+      if (headSent) return;
+      headSent = true;
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Transfer-Encoding": "chunked",
+      });
+      res.flushHeaders();
+      res.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now().toString(16)}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: chatModel, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
+    }
+    let toolCount = 0;
+    const argIdx = new Map(); // function_call item_id → chat tool_calls index
+    let contentStarted = false;
+    let reasoningTokens = 0;
+    let stopped = false;
+    let completed = false;
+    function emitChunk(delta, finish) {
+      if (res.writableEnded) return;
+      const c = { id: `chatcmpl-${Date.now().toString(16)}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: chatModel, choices: [{ index: 0, delta, finish_reason: finish ?? null }] };
+      res.write(`data: ${JSON.stringify(c)}\n\n`);
+      if (res.flush) res.flush();
+    }
+    function finishUp(reason) {
+      if (res.writableEnded) return;
+      sendHead();
+      emitChunk({}, reason);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+    function stopForReasoningCap() {
+      if (stopped) return;
+      stopped = true;
+      console.log(`[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+      req.destroy();
+      finishUp("length");
+    }
+    const onEvent = (d) => {
+      if (stopped) return;
+      sendHead();
+      const t = d.type;
+      if (t === "response.output_item.added" && d.item?.type === "function_call") {
+        const idx = toolCount++;
+        argIdx.set(d.item.id, idx);
+        emitChunk({ tool_calls: [{ index: idx, id: d.item.call_id || d.item.id, type: "function", function: { name: d.item.name || "", arguments: "" } }] });
+      } else if (t === "response.function_call_arguments.delta") {
+        const idx = argIdx.get(d.item_id) ?? Math.max(0, toolCount - 1);
+        emitChunk({ tool_calls: [{ index: idx, function: { arguments: d.delta || "" } }] });
+      } else if (t === "response.output_text.delta") {
+        contentStarted = true;
+        emitChunk({ content: d.delta || "" });
+      } else if (t === "response.reasoning_summary_text.delta" || t === "response.reasoning_text.delta") {
+        reasoningTokens += Math.ceil((d.delta || "").length / 4);
+        emitChunk({ reasoning_content: d.delta || "" });
+        if (!contentStarted && reasoningTokens > REASONING_CAP) stopForReasoningCap();
+      } else if (t === "response.completed" || t === "response.incomplete" || t === "response.failed") {
+        completed = true;
+        const resp = d.response || {};
+        const reason = toolCount > 0 ? "tool_calls" : resp.status === "incomplete" ? "length" : "stop";
+        if (t === "response.failed") console.log("[ZEN RESPONSES FAILED]", String(resp.error?.message || "").slice(0, 200));
+        finishUp(reason);
+      }
+    };
+    const parser = responsesSSEParser(onEvent);
+    let firstChunk = null;
+    let errBuffering = false;
+    const errChunks = [];
+    zenRes.on("data", (c) => {
+      if (stopped) return;
+      if (firstChunk === null) {
+        firstChunk = c;
+        if (responsesFirstChunkIsError(c.toString())) {
+          errBuffering = true;
+          errChunks.push(c);
+          return;
+        }
+      } else if (errBuffering) {
+        errChunks.push(c);
+        return;
+      }
+      parser(c);
+    });
+    zenRes.on("end", () => {
+      if (errBuffering) {
+        const raw = Buffer.concat(errChunks).toString();
+        let msg = "Rate limit";
+        try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
+        const limited = raw.includes("FreeUsageLimitError");
+        console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502}]`, String(msg).slice(0, 200));
+        return res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
+      }
+      // Abnormal upstream close without response.completed → synthesize a
+      // finish (parity with pipeZenResponse's no-finish_reason handling).
+      if (!completed && !stopped) {
+        console.log("[ZEN RESPONSES ABORT] stream ended without response.completed");
+        finishUp(toolCount > 0 ? "tool_calls" : "stop");
+      }
+    });
+  });
+  req.on("error", (e) => {
+    console.log("[ZEN RESPONSES ERROR]", e.message);
+    if (!res.headersSent) res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
+  });
+  req.on("timeout", () => {
+    req.destroy();
+    console.log("[ZEN RESPONSES TIMEOUT]");
+    if (!res.headersSent) res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
+  });
+  req.write(body);
+  req.end();
+}
+
+// Spark branch of /v1/messages: Responses upstream → Anthropic SSE/JSON.
+function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTokens) {
+  const req = https.request(zenOpts, (zenRes) => {
+    if (zenRes.statusCode !== 200) return responsesNon200(zenRes, res, true);
+
+    if (!stream) {
+      const chunks = [];
+      zenRes.on("data", (c) => chunks.push(c));
+      zenRes.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        let d = null;
+        try { d = JSON.parse(raw); } catch {}
+        if (!d) {
+          const frag = raw.slice(0, 200);
+          return res.status(502).json({ type: "error", error: { type: "upstream_error", message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response" } });
+        }
+        if (d.error || d.type === "error") {
+          const msg = d.error?.message || d.message || "Upstream error";
+          const limited = raw.includes("FreeUsageLimitError");
+          return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
+        }
+        res.json(openAIToAnthropic(responsesObjectToChatResponse(d, chatModel), chatModel, inputTokens));
+      });
+      return;
+    }
+
+    // ── stream: Responses event machine → Anthropic SSE ──
+    let headSent = false;
+    let msgId = `msg_${Date.now().toString(16)}`;
+    let nextIndex = 0;
+    let textOpen = false;
+    let textIndex = -1;
+    const openTools = new Set();
+    const toolIdx = new Map(); // function_call item_id → block index
+    let anyTool = false;
+    let reasoningTokens = 0;
+    let stopped = false;
+    let completed = false;
+    let outputTokens = 0;
+    function sendHeaders() {
+      if (headSent) return;
+      headSent = true;
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no", "Transfer-Encoding": "chunked" });
+      res.flushHeaders();
+      sendSSE("message_start", {
+        type: "message_start",
+        message: { id: msgId, type: "message", role: "assistant", content: [], model: chatModel, stop_reason: null, usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+      });
+    }
+    function sendSSE(name, payload) {
+      if (res.writableEnded) return;
+      res.write(`event: ${name}\ndata: ${JSON.stringify(payload)}\n\n`);
+      if (res.flush) res.flush();
+    }
+    function closeTextBlock() {
+      if (textOpen) {
+        sendSSE("content_block_stop", { type: "content_block_stop", index: textIndex });
+        textOpen = false;
+      }
+    }
+    function finishUp(stopReason, outTok) {
+      if (res.writableEnded) return;
+      sendHeaders();
+      closeTextBlock();
+      for (const idx of [...openTools]) sendSSE("content_block_stop", { type: "content_block_stop", index: idx });
+      openTools.clear();
+      sendSSE("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outTok } });
+      sendSSE("message_stop", { type: "message_stop" });
+      res.end();
+    }
+    const onEvent = (d) => {
+      if (stopped) return;
+      const t = d.type;
+      if (t === "response.output_text.delta") {
+        sendHeaders();
+        if (!textOpen) {
+          textIndex = nextIndex++;
+          textOpen = true;
+          sendSSE("content_block_start", { type: "content_block_start", index: textIndex, content_block: { type: "text", text: "" } });
+        }
+        sendSSE("content_block_delta", { type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: d.delta || "" } });
+      } else if (t === "response.output_item.added" && d.item?.type === "function_call") {
+        sendHeaders();
+        closeTextBlock();
+        anyTool = true;
+        const idx = nextIndex++;
+        toolIdx.set(d.item.id, idx);
+        openTools.add(idx);
+        sendSSE("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "tool_use", id: d.item.call_id || d.item.id, name: d.item.name || "", input: {} } });
+      } else if (t === "response.function_call_arguments.delta") {
+        const idx = toolIdx.get(d.item_id);
+        if (idx !== undefined) sendSSE("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: d.delta || "" } });
+      } else if (t === "response.reasoning_summary_text.delta" || t === "response.reasoning_text.delta") {
+        reasoningTokens += Math.ceil((d.delta || "").length / 4);
+        if (!anyTool && reasoningTokens > REASONING_CAP && !textOpen) {
+          stopped = true;
+          console.log(`[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+          req.destroy();
+          sendHeaders();
+          finishUp("max_tokens", reasoningTokens);
+        }
+      } else if (t === "response.completed" || t === "response.incomplete" || t === "response.failed") {
+        completed = true;
+        const resp = d.response || {};
+        outputTokens = resp.usage?.output_tokens || 0;
+        if (t === "response.failed") console.log("[ZEN RESPONSES FAILED]", String(resp.error?.message || "").slice(0, 200));
+        const stop = anyTool ? "tool_use" : resp.status === "incomplete" ? "max_tokens" : "end_turn";
+        sendHeaders();
+        finishUp(stop, outputTokens);
+      }
+    };
+    const parser = responsesSSEParser(onEvent);
+    let firstChunk = null;
+    let errBuffering = false;
+    const errChunks = [];
+    zenRes.on("data", (c) => {
+      if (stopped) return;
+      if (firstChunk === null) {
+        firstChunk = c;
+        if (responsesFirstChunkIsError(c.toString())) {
+          errBuffering = true;
+          errChunks.push(c);
+          return;
+        }
+      } else if (errBuffering) {
+        errChunks.push(c);
+        return;
+      }
+      parser(c);
+    });
+    zenRes.on("end", () => {
+      if (errBuffering) {
+        const raw = Buffer.concat(errChunks).toString();
+        let msg = "Rate limit";
+        try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
+        const limited = raw.includes("FreeUsageLimitError");
+        console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502}]`, String(msg).slice(0, 200));
+        if (res.headersSent) return res.end();
+        return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
+      }
+      if (!completed && !stopped) {
+        console.log("[ZEN RESPONSES ABORT] stream ended without response.completed");
+        sendHeaders();
+        finishUp(anyTool ? "tool_use" : "end_turn", outputTokens);
+      }
+    });
+  });
+  req.on("error", (e) => {
+    console.log("[ZEN RESPONSES ERROR]", e.message);
+    if (!res.headersSent) res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
+  });
+  req.on("timeout", () => {
+    req.destroy();
+    console.log("[ZEN RESPONSES TIMEOUT]");
+    if (!res.headersSent) res.status(504).json({ type: "error", error: { type: "timeout_error", message: "Upstream timeout" } });
+  });
+  req.write(body);
+  req.end();
+}
+
+// B2: Muse Spark routing helpers. B2's original "sparkWrongEndpoint" rejection
+// on chat/messages was retired in Phase 1 — Spark now rides the Chat →
+// Responses translation (chatToResponsesRequest / pipeResponsesAsChat /
+// pipeResponsesAsAnthropic). The reverse guard (nonSparkWrongEndpoint) stays:
+// upstream serves ONLY muse-spark* on /v1/responses — anything else 500s
+// there, so fail locally with a pointer to the right endpoints (P1.3 philosophy).
 function isSparkModel(m) {
   return String(m || "").toLowerCase().startsWith("muse-spark");
-}
-function sparkWrongEndpoint(model) {
-  return { message: `Model ${model} requires the Responses API: POST /v1/responses (Muse Spark is not served on this endpoint)`, type: "invalid_request_error", code: "wrong_endpoint" };
 }
 // B2 (reverse): /v1/responses serves ONLY the muse-spark family upstream —
 // anything else 500s there. Fail locally with a pointer to the right endpoints
@@ -973,9 +1475,8 @@ app.post("/v1/chat/completions", (req, res) => {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
   }
   // B2: Spark → /v1/responses (chat/completions 500s on it).
-  if (isSparkModel(model)) {
-    return res.status(400).json({ error: sparkWrongEndpoint(model) });
-  }
+  // Phase 1: B2 retired for chat — Spark is now translated to the upstream
+  // Responses API right here (review/probe_responses_loop.mjs ground truth).
   // P2.7: reject empty/missing messages locally instead of forwarding upstream.
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: { message: "messages must be a non-empty array", type: "invalid_request_error" } });
@@ -988,6 +1489,15 @@ app.post("/v1/chat/completions", (req, res) => {
 
   const sessionId = getSession(user);
   const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
+
+  if (isSparkModel(model)) {
+    // Spark home endpoint is upstream /zen/v1/responses — translate chat ⇄ responses.
+    console.log("[OAI→RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
+    const respBody = chatToResponsesRequest(req.body);
+    const { body, options } = zenResponsesRequest(respBody, sessionId);
+    return pipeResponsesAsChat(options, body, !!stream, res, model);
+  }
+
   console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
 
   const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId, req.body);
@@ -1036,11 +1546,8 @@ app.post("/v1/messages", async (req, res) => {
       error: { type: "invalid_request_error", message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` },
     });
   }
-  // B2: Spark → /v1/responses (messages 500s on it, same as chat).
-  if (isSparkModel(model)) {
-    return res.status(400).json({ type: "error", error: sparkWrongEndpoint(model) });
-  }
-
+  // B2 retired for messages — Spark is translated to the upstream Responses
+  // API right here (Phase 1, same as the chat route).
   const sessionId = getSession(user);
   const { messages, tools, error } = anthropicToOpenAI(req.body);
   if (error) {
@@ -1058,10 +1565,26 @@ app.post("/v1/messages", async (req, res) => {
   }
   const inputTokens = JSON.stringify(messages).length / 4 | 0;
 
-  console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
-
   // P1.2: forward mapped tool_choice (guard: only when tools are present).
   const mappedChoice = tools?.length ? anthropicToolChoiceToOpenAI(tool_choice) : undefined;
+
+  if (isSparkModel(model)) {
+    // Spark home endpoint is upstream /zen/v1/responses — translate.
+    console.log("[ANT→RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
+    const chatReq = { model, messages, stream: !!stream };
+    if (tools?.length) chatReq.tools = tools;
+    if (mappedChoice) chatReq.tool_choice = mappedChoice;
+    if (req.body.max_tokens !== undefined) chatReq.max_tokens = req.body.max_tokens;
+    if (req.body.temperature !== undefined) chatReq.temperature = req.body.temperature;
+    if (req.body.top_p !== undefined) chatReq.top_p = req.body.top_p;
+    // stop_sequences：Responses API 無 stop 參數，chatToResponsesRequest 不轉發（捨棄）。
+    const respBody = chatToResponsesRequest(chatReq);
+    const { body, options } = zenResponsesRequest(respBody, sessionId);
+    return pipeResponsesAsAnthropic(options, body, !!stream, res, model, inputTokens);
+  }
+
+  console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
+
   const { body, options } = zenRequest(model, messages, stream, tools, mappedChoice, sessionId, req.body);
 
   if (stream) {
@@ -1128,10 +1651,12 @@ function fmtTokens(n) {
   return String(n);
 }
 
-// Which endpoints serve this model (mirrors the B2/P2.9 local enforcement:
-// muse-spark* only on /v1/responses; everything else on chat/completions+messages).
+// Which endpoints serve this model (mirrors local enforcement:
+// muse-spark* = all three since Phase 1 — chat/messages ride the Responses
+// translation; other models are chat/completions+messages, and /v1/responses
+// 400s locally via nonSparkWrongEndpoint until Phase 2).
 function modelEndpoints(id) {
-  return isSparkModel(id) ? "responses" : "chat+messages";
+  return isSparkModel(id) ? "chat+msg+resp" : "chat+messages";
 }
 
 function printModels() {
@@ -1158,7 +1683,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");
-  console.log("  Responses: POST /v1/responses  (Muse Spark models live here)");
+  console.log("  Responses: POST /v1/responses  (Muse Spark home; chat/messages auto-translate Spark)");
   console.log("  Models:    GET  /v1/models");
   console.log("  Health:    GET  /health");
   for (const [name, key] of Object.entries(apiKeys)) {
