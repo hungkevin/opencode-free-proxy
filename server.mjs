@@ -1,6 +1,7 @@
 import express from "express";
 import crypto from "crypto";
 import https from "https";
+import http from "http";
 import fs from "fs";
 
 const app = express();
@@ -116,10 +117,14 @@ function applyRegistry(models) {
 async function loadModels() {
   return new Promise((resolve) => {
     const u = new URL(MODELS_SOURCE);
-    const req = https.request({
+    // P1.4: honor MODELS_SOURCE scheme (http for LAN mirrors/tests) instead
+    // of hardcoded https; keep query string (u.search) in the path.
+    const transport = u.protocol === "http:" ? http : https;
+    const defaultPort = u.protocol === "http:" ? 80 : 443;
+    const req = transport.request({
       hostname: u.hostname,
-      port: 443,
-      path: u.pathname,
+      port: u.port ? parseInt(u.port, 10) : defaultPort,
+      path: u.pathname + u.search,
       method: "GET",
       headers: {
         "User-Agent": `opencode/${OC_VERSION}`,
@@ -372,9 +377,35 @@ function zenRequestFull(zenOpts, body) {
   });
 }
 
+// Anthropic tool_choice → OpenAI tool_choice mapping.
+// Anthropic: {type:"auto"|"any"|"tool"+name|"none"}; OpenAI: "auto"|"required"|"none"|{type:"function",...}.
+// Unknown future types are dropped (with a log) rather than passed through as dirty values.
+function anthropicToolChoiceToOpenAI(tc) {
+  if (!tc) return undefined;
+  if (tc.type === "auto") return "auto";
+  if (tc.type === "any") return "required";
+  if (tc.type === "none") return "none";
+  if (tc.type === "tool" && tc.name) {
+    return { type: "function", function: { name: tc.name } };
+  }
+  console.log("[ANT] Unknown tool_choice type, dropping:", JSON.stringify(tc));
+  return undefined;
+}
+
 // ── Anthropic Messages → OpenAI conversion ─────────────────────────
 function anthropicToOpenAI(body) {
   const messages = [];
+  // P1.3 guard: only text/tool_use/tool_result are supported. Anything else
+  // (image/document/...) would previously be silently dropped — fail loudly.
+  const SUPPORTED_BLOCKS = new Set(["text", "tool_use", "tool_result"]);
+  for (const msg of body.messages || []) {
+    if (Array.isArray(msg.content)) {
+      const bad = msg.content.filter(b => !SUPPORTED_BLOCKS.has(b.type));
+      if (bad.length) {
+        return { error: `Unsupported content block type(s): ${[...new Set(bad.map(b => b.type))].join(", ")}. This proxy currently supports text only.` };
+      }
+    }
+  }
   if (body.system) {
     const sys = typeof body.system === "string" ? body.system
       : Array.isArray(body.system) ? body.system.map(b => b.text || "").join("\n") : "";
@@ -729,7 +760,7 @@ app.post("/v1/messages", async (req, res) => {
     return res.status(401).json({ type: "error", error: { type: "authentication_error", message: "Invalid API key" } });
   }
 
-  const { model, stream } = req.body;
+  const { model, stream, tool_choice } = req.body;
   if (!MODELS.includes(model)) {
     return res.status(400).json({
       type: "error",
@@ -738,12 +769,20 @@ app.post("/v1/messages", async (req, res) => {
   }
 
   const sessionId = getSession(user);
-  const { messages, tools } = anthropicToOpenAI(req.body);
+  const { messages, tools, error } = anthropicToOpenAI(req.body);
+  if (error) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: error },
+    });
+  }
   const inputTokens = JSON.stringify(messages).length / 4 | 0;
 
   console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
 
-  const { body, options } = zenRequest(model, messages, stream, tools, undefined, sessionId, req.body);
+  // P1.2: forward mapped tool_choice (guard: only when tools are present).
+  const mappedChoice = tools?.length ? anthropicToolChoiceToOpenAI(tool_choice) : undefined;
+  const { body, options } = zenRequest(model, messages, stream, tools, mappedChoice, sessionId, req.body);
 
   if (stream) {
     pipeZenAsAnthropic(options, body, model, res, inputTokens);

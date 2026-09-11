@@ -1,0 +1,234 @@
+# 審查核對清單 — opencode-free-proxy（server.mjs）
+
+> **審查日期**：2026-09-11
+> **審查者**：Mercury
+> **範圍**：`c:/work/opencode-free-proxy` 全源碼審查。基準檔案：`server.mjs`（838 行）、`package.json`、`README.md`、`free_model.md`、`gen_ppt.py`；實測：`node --check server.mjs` ✅ 通過、`git log`（8 commits）、`git status`。
+> **說明**：每行一個審查項目，依優先級排列。檔案命名一律 `_`（本報告檔名亦同）。
+
+---
+
+## 圖例
+
+### 審查進度 (progress)
+
+| 符號 | 意義 |
+|------|------|
+| ⏳ | 待審查 (pending) |
+| 🔍 | 審查中 (in-progress) |
+| 🔄 | 修正中 (fixing) |
+| ✅🔄 | 已修正 (fixed) |
+
+### 審查結果 (verdict)
+
+| 符號 | 意義 |
+|------|------|
+| — | 尚未判定 (pending) |
+| ✅ | 通過 (pass) |
+| ⚠️ | 需討論 (discuss) |
+| ❌ | 不通過 (fail) |
+
+---
+
+## Priority 1（高 — 安全 / 功能正確性 / 文件與實作嚴重脫節）
+
+| # | 類別 | 檢查項目 | 檔案 | 預期結果 | 審查進度 | 審查結果 | 審查日期 | 審查備註 |
+|---|------|----------|------|----------|----------|----------|----------|----------|
+| P1.1 | SEC | **API keys 啟動時印到 stdout**：`loadKeys()` 首次生成 + 啟動回調每次列印全文，構成「生成→寫檔→顯示→用戶取用」憑證交付鏈。經釐清為 **by design，不修**：VPS/遠端部署時啟動日誌是用戶取得 key 的唯一便捷來源；能讀 log 者本就能讀 `api-keys.json`，防線未降低。真要加強走權限模型（admin 分權/key 輪替，另立項） | `server.mjs` L16-27、L825-827 | 維持現狀 | ✅🔄 | ✅ | 2026-09-11 | 見 §P1.1。原 ❌ 誤判修正為 ✅（by design）。`admin`/`user-default` 同權為已知簡化 |
+| P1.2 | FUNC | **Anthropic `tool_choice` 被丟棄**：`/v1/messages` 呼叫 `zenRequest(..., undefined, ...)`，第 5 參固定 `undefined`。**已修正**：新增 `anthropicToolChoiceToOpenAI()` 純函數（auto→auto / any→required / tool+name→function / none→none / 未知丟棄+log），路由取出 `req.body.tool_choice` 映射後轉發（僅 tools 存在時）。**實測**：any+閒聊 `end_turn`→`tool_use` ✅；none+中性提示→`end_turn` 純文字 ✅；none+強制提示仍調工具，但原生 OpenAI 路徑對照組同樣如此，證實為上游無視 `none`，非代理問題 | `server.mjs` 映射函數 + `/v1/messages` 路由、`zenRequest` | 映射轉發（Anthropic→OpenAI 格式映射） | ✅🔄 | ✅ | 2026-09-11 | 見 §P1.2。`disable_parallel_tool_use` 忽略+log（OpenAI 無對應概念）；映射函數為純函數，可 `node --test` 零網路測試 |
+| P1.3 | FUNC | **Anthropic image/document 區塊靜默丟失**：`anthropicToOpenAI` 只取 `type === "text"` 拼接，非文字區塊無聲丟棄。**已修正（階段一：明確報錯）**：`anthropicToOpenAI` 開頭加守衛，非 `text`/`tool_use`/`tool_result` 區塊即回 `{error}`，路由轉為本地 `400 invalid_request_error`。**實測**：image-only 修前上游 400 `Input must have at least 1 token`（誤導）→ 修後代理 400 `Unsupported content block type(s): image. This proxy currently supports text only.` ✅；文字+圖混合修前 200「你沒附圖」→ 修後 400 ✅。階段二（image→`image_url` 直傳）視需求另立項 | `server.mjs` `anthropicToOpenAI` + `/v1/messages` 路由 | 不支援則回 400 明確報錯，而非靜默降級 | ✅🔄 | ✅ | 2026-09-11 | 見 §P1.3。失效形態從最壞（200 答錯）變最好（400 明確） |
+| P1.4 | BUG | **`loadModels` 寫死 `https.request`**：無視 `MODELS_SOURCE` 的 scheme，`http://` 源（內網鏡像/測試）必失敗走 fallback，外表正常實則用快照。**已修正**：`import http` + 依 `u.protocol` 選 transport 與預設埠 + `path` 補上 `u.search`（原先 querystring 亦被丟掉）。**實測**：本地 HTTP 假源（含標記模型 `p14_probe_model`）修前 `/v1/models` 只有 7 快照 → 修後出現 `p14_probe_model` ✅；回歸：預設 https 取 7 live 模型 + chat smoke 200 ✅ | `server.mjs` `loadModels` | 依 scheme 選 transport（含正確埠 + querystring） | ✅🔄 | ✅ | 2026-09-11 | 見 §P1.4。驗證腳本 `review/fake_models_source.mjs` 留存可重跑 |
+| P1.5 | DOC | **README 模型表與實作完全脫節**：旧表 5 個 ID 與實作/註冊表零交集，curl 範例用舊 ID 照抄必收 `400 Unknown model`。**已修正**：模型表改為 2026-09-11 快照 7 個 + 「以 `GET /v1/models` 為準」聲明 + active-only 策略說明（含 `deepseek-v4-flash-free` 為何被擋的註解，引用 `free_model.md` §2）；兩處 curl 範例、opencode.json 範例、Cursor 段落改用 `muse-spark-1.2-contributor-free`（本輪實測可用）；環境變數表補 `MODELS_SOURCE`/`REASONING_CAP`/`MAX_TOKENS_DEFAULT`（順手帶掉 P2.6） | `README.md` | 模型表/curl/opencode.json 改現行 ID + live-list 聲明 + active-only 註解 | ✅🔄 | ✅ | 2026-09-11 | 見 §P1.5。P2.6 同步解決，表格更新時一併改狀態 |
+
+---
+
+## Priority 2（中 — 邊界行為 / 次要功能缺失 / 文件缺口）
+
+| # | 類別 | 檢查項目 | 檔案 | 預期結果 | 審查進度 | 審查結果 | 審查日期 | 審查備註 |
+|---|------|----------|------|----------|----------|----------|----------|----------|
+| P2.1 | FUNC | **非串流 Anthropic 路徑丟棄 `reasoning_content`**：`openAIToAnthropic`（L428-479）只取 `choice.message.content` + `tool_calls`，推理模型的 thinking 全丟；串流路徑同樣不轉發 reasoning 區塊 | `server.mjs` L428-479、L482-688 | 非串流至少可選附 `reasoning_content` 為獨立 text 塊或擴展欄位；文件註明行為 | ⏳ | ⚠️ | 2026-09-11 | 見 §P2.1。7 個預設模型 `reasoning` 全為 true，影響面是全部模型 |
+| P2.2 | DOC/SEC | **`/v1/models` 與 `/health` 無鑑權**：L691、L786 兩個 GET 無 `auth()`，但 README L67-69 寫「Both auth methods work on **all** endpoints」 | `server.mjs` L691/L786、`README.md` L67-69 | 二擇一：(a) 補 `auth()`；(b) README 改為「chat/messages 需鑑權，models/health 公開」 | ⏳ | ⚠️ | 2026-09-11 | 模型清單公開實務可接受；重點是文件說謊 |
+| P2.3 | SEC | **`auth()` 明文 `===` 比對**：L32-34 逐 key `tok === key`，有時序側信道；低風險（本地/內網服務）但順手可修 | `server.mjs` L29-36 | `crypto.timingSafeEqual` 定長比對 | ⏳ | ⚠️ | 2026-09-11 | 低優先級，與 P1.1 同 commit 修最划算 |
+| P2.4 | BUG | **首包錯誤偵測只看第一個 chunk**：`pipeZenResponse` L272-309、`pipeZenAsAnthropic` L525-545 僅檢查 `firstChunk` 是否含 `FreeUsageLimitError`/`"error"`；錯誤 JSON 被拆到多個 chunk 即漏檢，轉為正常 200 串流髒資料 | `server.mjs` L272-309、L525-545 | 累積小緩衝（如 8KB）再判定，或檢查 `zenRes.statusCode !== 200` 先行分流 | ⏳ | ⚠️ | 2026-09-11 | 上游錯誤多為小 JSON 一包即達，實務命中率尚可，屬邊界強健性 |
+| P2.5 | BUG | **`express.json` 無錯誤處理**：L7 `express.json({limit:"10mb"})`，畸形 JSON 觸發預設 HTML 錯誤頁，與 JSON API 契約不一致 | `server.mjs` L7 | 補 `app.use((err, req, res, next) => ... 400 JSON...)` | ⏳ | ⚠️ | 2026-09-11 | 順手修，5 行 |
+| P2.6 | DOC | **README 環境變數表缺 3 項**：只列 `PROXY_PORT`、`KEYS_FILE`，實作還有 `MODELS_SOURCE`、`REASONING_CAP`、`MAX_TOKENS_DEFAULT` | `README.md` 環境變數表 | 補三行含預設值與語意（何時設 0 關閉） | ✅🔄 | ✅ | 2026-09-11 | 隨 P1.5 README 更新同步解決 |
+| P2.7 | FUNC | **`/v1/chat/completions` 無 messages 基本校驗**：L712 直接解構轉發，空陣列/缺欄轉發上游才報錯，400 訊息不含本地上下文 | `server.mjs` L708-723 | 空 `messages` 本地即回 400；`model` 缺失亦同 | ⏳ | ⚠️ | 2026-09-11 | 小修；Anthropic 路徑同理可補 |
+
+---
+
+## Priority 3（低 — 強健性 / 可維護性 / 工程衛生）
+
+| # | 類別 | 檢查項目 | 檔案 | 預期結果 | 審查進度 | 審查結果 | 審查日期 | 審查備註 |
+|---|------|----------|------|----------|----------|----------|----------|----------|
+| P3.1 | REL | **fallback 快照會刊登死模型**：`DEFAULT_MODELS` 為 2026-08 靜態快照；`free_model.md` §1 自承註冊表滯後率約 69%，快照模型下架後 `/v1/models` 照列、`chat` 打上游才炸 | `server.mjs` L47-55、`free_model.md` §1 | `/health` 附 `models_stale: true` 當使用 fallback；或 fallback 附快照日期供判斷 | ⏳ | ⚠️ | 2026-09-11 | 啟動日誌已有 `using ... built-in defaults` 一行，可接受；建議健康端點機器可讀化 |
+| P3.2 | FUNC | **Anthropic system 陣列拼接丟 `cache_control`**：L379-380 `b.text \|\| ""` join，prompt caching 標記丟失 | `server.mjs` L378-382 | 文件註明不支援 prompt caching，或透傳標記 | ⏳ | — | 2026-09-11 | 免費代理本就不計費，影響極小 |
+| P3.3 | OPS | **session 30 分鐘輪轉寫死**：L161 `30*60*1000` 無環境變數可調 | `server.mjs` L157-165 | `SESSION_TTL_MS` 環境變數，預設 1800000 | ⏳ | — | 2026-09-11 | 一行修 |
+| P3.4 | HYG | **倉庫根目錄雜物**：`gen_ppt.py`（323 行）、`opencode_free_proxy_tech.pptx` 未追蹤（`git status` 顯示 `??`），與代理服務無關 | 倉庫根目錄 | 移入 `docs/` 或刪 pptx 留腳本；至少進 `.gitignore` 決策 | ⏳ | ⚠️ | 2026-09-11 | 與本次審查無關但擋 `git status` 乾淨 |
+| P3.5 | HYG | **`package-lock.json` 被 gitignore 卻存在於本地**：`.gitignore` 排除 lock 檔，可重現安裝無保障；`npm install` 每次解析浮動版本 | `.gitignore`、`package.json` | 二擇一並寫進 README：(a) 追蹤 lock（推薦，服務部署）；(b) 維持忽略並接受浮動 | ⏳ | ⚠️ | 2026-09-11 | `express ^4.21.0` 浮動範圍大，生產部署建議鎖定 |
+| P3.6 | OPS | **EADDRINUSE 直接 `process.exit(1)`**：L829-838 端口佔用即退出，無重試；systemd 有 `Restart=always` 兜底但會空轉重啟 | `server.mjs` L829-838 | 可接受現狀；文件註明多開需換 `PROXY_PORT`（已有錯誤訊息指引 ✅） | ⏳ | ✅ | 2026-09-11 | 錯誤訊息本身寫得好，不需改 |
+
+---
+
+## 審查結果統計
+
+### 審查進度分布
+
+| 優先級 | 總數 | ⏳ 待審查 | 🔍 審查中 | 🔄 修正中 | ✅🔄 已修正 |
+|--------|------|-----------|-----------|-----------|------------|
+| P1 (高) | 5 | 0 | 0 | 0 | 5 |
+| P2 (中) | 7 | 6 | 0 | 0 | 1 |
+| P3 (低) | 6 | 6 | 0 | 0 | 0 |
+| **總計** | **18** | **12** | **0** | **0** | **6** |
+
+### 審查結果分布
+
+| 優先級 | 總數 | ✅ 通過 | ⚠️ 需討論 | ❌ 不通過 | — 未判定/不需動作 |
+|--------|------|---------|-----------|-----------|------------------|
+| P1 (高) | 5 | 5 | 0 | 0 | 0 |
+| P2 (中) | 7 | 1 | 6 | 0 | 0 |
+| P3 (低) | 6 | 1 | 3 | 0 | 2 |
+| **總計** | **18** | **7** | **9** | **0** | **2** |
+
+---
+
+## 詳細分節敘述（工作項清單）
+
+> 每一項含問題/證據/影響分析/改善建議。修正完成後回到上方表格更新狀態並打勾。
+
+### P1.1 — API keys 啟動時印到 stdout（SEC，by design 不修）
+
+- **釐清**：`loadKeys()`（L16-27）首次自動生成兩把 key 寫檔；啟動回調（L825-827）每次列印全文。兩段合起來是「生成→寫檔→顯示→用戶取用」**憑證交付鏈**，不是除錯殘留。
+- **為何不能改**：VPS/遠端部署（README L119 `nohup` / systemd）時，啟動日誌是用戶取得 key 的唯一便捷來源；遮罩顯示等於砍掉交付鏈最後一棒。能讀 log 者本就能讀 `api-keys.json`，防線未降低。
+- **原誤判修正**：「與 gitignore 用意矛盾」表述不精確 —— gitignore 防 key 進版本庫（防擴散），啟動日誌不進 git，兩條防線不同。
+- **已知簡化（另立項，不屬本項）**：`admin` 與 `user-default` 在 `auth()` 只區分名字、路由不分權。
+- **狀態**：✅（by design，維持現狀）
+
+### P1.2 — Anthropic `tool_choice` 被丟棄（FUNC，高）
+
+- **問題**：Anthropic 路徑固定傳 `tool_choice: undefined`。`zenRequest` 本有轉發邏輯（L182 `if (tool_choice) reqBody.tool_choice = tool_choice`），OpenAI 路徑（L721 從 `req.body` 解構傳入）正常，唯 Anthropic 路徑（L746）寫死 `undefined`。
+- **證據**：`server.mjs` L726 解構 `const { model, stream } = req.body` —— 連取都沒取；L746 `zenRequest(model, messages, stream, tools, undefined, sessionId, req.body)`。
+- **影響分析**：`tool_choice: {"type": "any"}` / `{"type": "tool", "name": ...}` 的強制工具呼叫場景在 Anthropic 端點全滅，且為靜默降級（請求成功、模型自由發揮）。
+- **改善建議**：取出 `req.body.tool_choice` 並映射：Anthropic `{"type":"any"}` → OpenAI `"required"`；`{"type":"auto"}` → `"auto"`；`{"type":"tool","name"}` → `{"type":"function","function":{"name"}}`；`{"type":"none"}` → `"none"`。補一條單元測試（映射表純函數可抽出測）。
+- **修正內容（2026-09-11）**：新增 `anthropicToolChoiceToOpenAI()` 純函數（5 種映射 + 未知格式丟棄並 log）；`/v1/messages` 路由取出 `tool_choice` 映射後轉發（僅 tools 存在時守衛）；`disable_parallel_tool_use` 忽略（OpenAI 無對應概念）。
+- **驗證（6447 測試實例，模型 mimo-v2.5-free）**：
+  - 修前：none+強制提示 → `tool_use`（無視）；any+閒聊 → `end_turn`（無視）。BUG 雙向確認。
+  - 修後：any+閒聊 → `tool_use` ✅；none+中性提示 → `end_turn` 純文字 ✅；none+強制提示仍調工具，但原生 OpenAI 路徑對照組（`/v1/chat/completions` + `tool_choice:"none"`）同樣調工具，證實為**上游無視 `none`**，非代理問題。
+- **狀態**：✅（已修正並驗證）
+
+### P1.3 — Anthropic image/document 區塊靜默丟失（FUNC，高）
+
+- **問題**：`anthropicToOpenAI` 文本拼接只認 `type === "text"`（L387-390）；`tool_result` 陣列 content 同樣只認 `c.text`（L405-406）。含圖片的請求會「200 成功但模型沒看到圖」。
+- **證據**：`server.mjs` L386-412 全段無 `image`、`document`、`image_url` 字樣。
+- **影響分析**：最壞的失效形態 —— 不報錯、只答錯。用戶會以為模型不行，實則圖沒送達。
+- **改善建議**：(a) 完整方案：Anthropic `image`（base64）→ OpenAI `{"type":"image_url","image_url":{"url":"data:...;base64,..."}}` content part；(b) 最小方案：偵測到非文字區塊即回 `400 {"type":"error",... "message": "image input not supported by this proxy"}`。先做 (b) 再做 (a)。
+- **修正內容（2026-09-11，階段一）**：`anthropicToOpenAI` 開頭加守衛，非 `text`/`tool_use`/`tool_result` 區塊即回 `{error}`；路由轉為本地 `400 invalid_request_error`。
+- **驗證（6447 測試實例）**：
+  - image-only：修前上游 400 `Input must have at least 1 token`（圖被丟、訊息誤導）→ 修後代理 400 `Unsupported content block type(s): image. This proxy currently supports text only.` ✅
+  - 文字+圖混合：修前 **200** + 模型回「你沒附圖」（最壞形態）→ 修後 400 ✅
+- **狀態**：✅（階段一已修正並驗證；階段二 image 直傳另立項）
+
+### P1.4 — `loadModels` 寫死 `https.request`（BUG，中高）
+
+- **問題**：`MODELS_SOURCE` 允許環境覆寫（L62-63），但 `loadModels`（L116-155）固定 `https.request`，且 `port: 443` 寫死。`http://` 源一律 `Fetch error` → 靜默 fallback，啟動日誌僅一行 `[MODELS] Fetch error ... using built-in defaults`，易誤判為上游故障。
+- **證據**：`server.mjs` L118-122。
+- **改善建議**：
+  ```js
+  import http from "http";
+  const transport = u.protocol === "http:" ? http : https;
+  const req = transport.request({ hostname: u.hostname, port: u.port || (u.protocol === "http:" ? 80 : 443), path: u.pathname + u.search, ... });
+  ```
+  注意現有 `path: u.pathname` 還丟了 querystring（`u.search`），順手補上。
+- **修正內容（2026-09-11）**：照上述建議實作（`import http` + transport/port/path 三處）。
+- **驗證**：本地 HTTP 假源 `review/fake_models_source.mjs`（:6499，含標記模型 `p14_probe_model`，cost 全 0 + active）→ 修前 `/v1/models` 僅 7 內建快照（BUG 確認）→ 修後出現 `p14_probe_model` ✅；回歸：預設 https 註冊表取 7 live 模型 + `/v1/chat/completions` smoke（`SMOKE_OK`）✅。
+- **狀態**：✅（已修正並驗證）
+
+### P1.5 — README 模型表與實作零交集（DOC，高）
+
+- **問題**：README 表格 5 個 ID（L20-27）與 `DEFAULT_MODELS` 7 個 ID（L47-55）無一相同；`free_model.md` §3（2026-08-23）確認現行 7 個，README 明顯停留在 v1.x 時代。curl/opencode.json 範例（L35-96）用的 `deepseek-v4-flash-free` 不在 `MODELS` 內，照抄得 `400 Unknown model: deepseek-v4-flash-free. Available: x-preview-f-free, ...`。
+- **影響分析**：新用戶按 README 上手，**第一個請求就失敗**。且 `deepseek-v4-flash-free` 在 `free_model.md` §4 表中標「線上仍在服務」（deprecated 但未下架），用戶會困惑「明明可用為何 400」—— 因為代理的 active-only 過濾把它擋了，兩份文件都沒把這層講清。
+- **改善建議**：README 模型表改為「以 `GET /v1/models` 為準 + 抓取日期」，curl 範例改用 `muse-spark-1.2-contributor-free`（當前會話實證可用）；另加一節說明 active-only 策略與 deprecated-but-alive 模型的關係（`free_model.md` §2 已有決策記錄，README 需一句話引用）。
+- **修正內容（2026-09-11）**：照上述建議實作 —— 模型表改 2026-09-11 快照 7 個 + live-list 聲明 + active-only 註解（含 `deepseek-v4-flash-free` 被擋原因）；兩處 curl、opencode.json、Cursor 段落改 `muse-spark-1.2-contributor-free`；環境變數表補 `MODELS_SOURCE`/`REASONING_CAP`/`MAX_TOKENS_DEFAULT`（P2.6 順手解決）。
+- **狀態**：✅（已修正；範例 ID 皆為本輪實測可用）
+
+### P2.1 — 非串流 Anthropic 路徑丟 reasoning（FUNC，中）
+
+- **問題**：`openAIToAnthropic` 只組 `text` + `tool_use`（L442-457）。7 個預設模型 reasoning 全 true，thinking 在 Anthropic 非串流路徑全丟；另 `usage.output_tokens` 取 `completion_tokens`，含 reasoning 計費口徑倒是一致，無需改。
+- **改善建議**：可選 `FORWARD_REASONING=1` 時把 `reasoning_content` 包成首個 `text` 塊（標 `[thinking]` 前綴）或 `thinking` 塊（需 Anthropic extended thinking 格式，慎用）；預設保持丟棄但文件註明。
+
+### P2.2 — `/v1/models` 與 `/health` 無鑑權（DOC/SEC，低中）
+
+- **問題**：行為（公開）vs 文件（all endpoints 需 key）矛盾。模型清單公開是業界常態（OpenAI `/v1/models` 亦需 key 倒是例外），風險低。
+- **改善建議**：README 改為「chat/messages 需鑑權；models/health 公開便於探活」。若反向想全鎖，兩行加 `auth()` 即可，但會破壞監控探針簡潔性，不推薦。
+
+### P2.3 — `auth()` 時序側信道（SEC，低）
+
+- **問題**：`tok === key` 逐字短路比對（L32-34）。本地服務風險極低。
+- **改善建議**：`crypto.timingSafeEqual(Buffer.from(tok), Buffer.from(key))`（需先對齊長度），與 P1.1 同 commit 修。
+
+### P2.4 — 首包錯誤偵測漏多 chunk（BUG，低中）
+
+- **問題**：詳見表格。另 `zenRes.statusCode` 完全未被檢查，兩處 `pipe*` 皆直接 200 轉發（OpenAI 路徑 L295、Anthropic L503）。
+- **改善建議**：先查 `zenRes.statusCode !== 200` 即按錯誤分流；保留首包 JSON sniff 作補充。改動約 10 行，兩處對稱修。
+
+### P2.5 — `express.json` 無錯誤處理（BUG，低）
+
+- **問題**：畸形 JSON → Express 預設錯誤 handler 回 HTML。JSON API 客戶端難解析。
+- **改善建議**：尾部加
+  ```js
+  app.use((err, _req, res, _next) => {
+    if (err?.type === "entity.parse.failed") return res.status(400).json({ error: { message: "Invalid JSON body", type: "invalid_request_error" } });
+    throw err;
+  });
+  ```
+
+### P2.6 — README 環境變數表缺 3 項（DOC，低中）
+
+- **問題**：`MODELS_SOURCE`、`REASONING_CAP`、`MAX_TOKENS_DEFAULT` 未記載。後兩者是推理防爆的核心安全閥（`free_model.md` 附錄亦引用 `REASONING_CAP`），運維調參與逃生全靠讀源碼。
+- **改善建議**：補表：
+  | `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | 模型註冊表 URL |
+  | `REASONING_CAP` | `65536` | 串流推理 token 熔斷閾值，0 關閉 |
+  | `MAX_TOKENS_DEFAULT` | `32768` | 無長度上限時注入的 `max_tokens`，0 關閉 |
+
+### P2.7 — `/v1/chat/completions` 無輸入校驗（FUNC，低）
+
+- **問題**：`messages` 非陣列/空陣列直接轉發，上游 400 訊息對用戶不友好；且 `console.log` L718 對非字串 content 做 `JSON.stringify`，10MB 級 payload 會刷屏（DoS 放大日誌）。
+- **改善建議**：空 messages 本地 400；日誌只印長度（已是 `len` 摘要 ✅，但 `JSON.stringify(m.content)` 先全序列化再取 length，大包仍有 CPU 成本，建議截斷後再計）。
+
+### P3.1 — fallback 快照陳舊（REL，低）
+
+- **問題**：詳見表格。`free_model.md` §1 證明註冊表本身滯後 69%，靜態快照只會更舊。
+- **改善建議**：`/health` 加 `models_source: "live" | "fallback"` + `models_loaded_at`，監控可告警。改動 5 行。
+
+### P3.2 — system 陣列丟 `cache_control`（FUNC，極低）
+
+- **現狀**：免費代理不計費，caching 無成本意義，僅多輪 system 復用有效能差異。記錄備查，不建議修。
+
+### P3.3 — session TTL 寫死（OPS，極低）
+
+- **現狀**：`x-opencode-session` 30 分鐘輪轉的語意上游未公開，現值工作正常。抽環境變數一行修，列入順手清單。
+
+### P3.4 — 倉庫根雜物（HYG，低）
+
+- **證據**：`git status -sb` → `?? gen_ppt.py`、`?? opencode_free_proxy_tech.pptx`；`gen_ppt.py` 323 行與代理功能無關。
+- **改善建議**：`mkdir docs && mv` 或刪 pptx（二進位不應進 git）；`.gitignore` 加 `*.pptx` 若決定不追蹤。
+
+### P3.5 — `package-lock.json` 被忽略（HYG，低中）
+
+- **證據**：`.gitignore` 含 `package-lock.json`（本次 `commit 2c5e730` 親手加的）；`express ^4.21.0` 浮動。
+- **改善建議**：服務型倉庫推薦追蹤 lock；若堅持忽略，README 加一句「生產部署請 `npm ci` 前先固定版本」。需決策（upstream 同步時注意衝突）。
+
+### P3.6 — EADDRINUSE 直接退出（OPS，通過）
+
+- **現狀**：錯誤訊息指引清晰（L830-833），systemd `Restart=always` 兜底。✅ 通過，無需改。
+
+---
+
+## 審查記錄變更日誌
+
+| 日期 | 變更說明 | 操作者 |
+|------|----------|--------|
+| 2026-09-11 | 建立審查核對清單（18 項）：以 server.mjs 全行閱讀 + README/free_model.md/package.json 對照 + node --check + git 狀態實測為據 | Mercury |
+| 2026-09-11 | P1.1 誤判修正：啟動印 key 為憑證交付鏈（by design），❌→✅ 不修 | Mercury |
+| 2026-09-11 | P1.2 修正驗證：新增 `anthropicToolChoiceToOpenAI()` 映射轉發；6447 實例黑盒驗證（修前雙向無視 → 修後 any/none 生效；none 殘留證實為上游行為）→ ✅ | Mercury |
+| 2026-09-11 | P1.3 修正驗證（階段一）：非文字區塊守衛 + 本地 400；6447 實例黑盒驗證（修前 200 答錯/上游誤導 400 → 修後代理明確 400）→ ✅ | Mercury |
+| 2026-09-11 | P1.4 修正驗證：`loadModels` 依 scheme 選 transport（+正確埠+querystring）；本地 HTTP 假源（`review/fake_models_source.mjs`）驗證修前 fallback → 修後出現標記模型；預設 https + chat smoke 無回歸 → ✅ | Mercury |
+| 2026-09-11 | P1.5 + P2.6 修正：README 模型表改現行快照 + live-list 聲明 + active-only 註解；curl/opencode.json/IDE 段落改 `muse-spark-1.2-contributor-free`；環境變數表補 3 項 → ✅ | Mercury |

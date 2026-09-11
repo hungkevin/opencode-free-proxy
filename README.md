@@ -17,15 +17,27 @@ Done. Server is at `http://localhost:6446`. API keys are in `api-keys.json` (aut
 
 ## What you get
 
-| Model | What it is | Reliability |
+Model availability rotates — the proxy loads the currently-active zero-cost
+models from `https://models.opencode.ai/api.json` at startup
+(filter: `cost.input === 0 && cost.output === 0 && status !== "deprecated"`).
+Always check `GET /v1/models` for the live list; the table below is a snapshot.
+
+| Model (snapshot 2026-09-11) | What it is | Reliability |
 |-------|-----------|-------------|
-| `deepseek-v4-flash-free` | DeepSeek V4 Flash | Solid |
-| `big-pickle` | DeepSeek V4 Flash (alias) | Solid |
-| `minimax-m2.5-free` | MiniMax M2.5 | Solid |
-| `nemotron-3-super-free` | NVIDIA Nemotron 3 Super | Hit or miss |
-| `qwen3.6-plus-free` | Qwen 3.6 Plus | Intermittent |
+| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 | Solid |
+| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 | Solid |
+| `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning | Solid |
+| `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | Hit or miss |
+| `mimo-v2.5-free` | MiMo V2.5 | Solid |
+| `ling-3.0-flash-fin-free` | Ling 3.0 Flash | Intermittent |
+| `big-pickle` | Big Pickle (alias, name has no `free`) | Solid |
 
 All models support streaming, tool calls, and system messages.
+
+> Note: some models are usable upstream but excluded here on purpose —
+> e.g. `deepseek-v4-flash-free` still answers on `opencode.ai/zen/v1` but is
+> marked `deprecated` in the registry, so this proxy's active-only filter
+> rejects it with `400 Unknown model`. See `free_model.md` §2 for the rationale.
 
 ## API
 
@@ -36,7 +48,7 @@ curl http://localhost:6446/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash-free",
+    "model": "muse-spark-1.2-contributor-free",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
@@ -49,7 +61,7 @@ curl http://localhost:6446/v1/messages \
   -H "x-api-key: YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash-free",
+    "model": "muse-spark-1.2-contributor-free",
     "system": "You are helpful.",
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 1024,
@@ -83,9 +95,9 @@ Add to `~/.config/opencode/opencode.json`:
       "apiKey": "YOUR_KEY",
       "baseURL": "http://localhost:6446/v1",
       "models": {
-        "free/deepseek-v4-flash-free": {
-          "id": "deepseek-v4-flash-free",
-          "name": "free/deepseek-v4-flash-free",
+        "free/muse-spark-1.2-contributor-free": {
+          "id": "muse-spark-1.2-contributor-free",
+          "name": "free/muse-spark-1.2-contributor-free",
           "attachment": true,
           "reasoning": true
         }
@@ -99,7 +111,7 @@ Add to `~/.config/opencode/opencode.json`:
 
 - Base URL: `http://YOUR_HOST:6446/v1`
 - API Key: your key from `api-keys.json`
-- Model: `deepseek-v4-flash-free`
+- Model: `muse-spark-1.2-contributor-free` (or any ID from `GET /v1/models`)
 
 ### Claude Code (Anthropic format)
 
@@ -156,6 +168,9 @@ sudo systemctl enable --now opencode-proxy
 |----------|---------|------|
 | `PROXY_PORT` | `6446` | Server port |
 | `KEYS_FILE` | `./api-keys.json` | API keys file path |
+| `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | Model registry URL (http allowed, e.g. LAN mirror) |
+| `REASONING_CAP` | `65536` | Stream reasoning-token fuse before force-stop; `0` disables |
+| `MAX_TOKENS_DEFAULT` | `32768` | Injected `max_tokens` when client sends no length cap; `0` disables |
 
 ## How it works
 
