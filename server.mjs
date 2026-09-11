@@ -31,9 +31,17 @@ function auth(req) {
   const hdr = req.headers.authorization || req.headers["x-api-key"] || "";
   const tok = hdr.startsWith("Bearer ") ? hdr.slice(7) : hdr;
   for (const [name, key] of Object.entries(apiKeys)) {
-    if (tok === key) return name;
+    if (safeEqual(tok, key)) return name;
   }
   return null;
+}
+
+// P2.3: constant-time comparison (length check first to avoid throw).
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -226,6 +234,24 @@ function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extr
 // Pipe Zen response to client (OpenAI format passthrough)
 function pipeZenResponse(zenOpts, body, stream, res) {
   const req = https.request(zenOpts, (zenRes) => {
+    // P2.4: upstream non-200 → buffer full body, return mapped error with the
+    // real status instead of streaming it as 200 / mislabeling as rate_limit.
+    if (zenRes.statusCode !== 200) {
+      const chunks = [];
+      zenRes.on("data", (c) => chunks.push(c));
+      zenRes.on("end", () => {
+        let msg = "Upstream error";
+        try {
+          const p = JSON.parse(Buffer.concat(chunks).toString());
+          msg = p.error?.message || p.message || msg;
+        } catch {}
+        console.log(`[ZEN UPSTREAM ${zenRes.statusCode}]`, String(msg).slice(0, 200));
+        if (!res.headersSent) {
+          res.status(zenRes.statusCode).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
+        }
+      });
+      return;
+    }
     let firstChunk = null;
     let headersSent = false;
     // Reasoning sniffer: count reasoning_content tokens in the SSE stream.
@@ -514,6 +540,31 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
   const msgId = ocId("msg");
 
   const req = https.request(zenOpts, (zenRes) => {
+    // P2.4: upstream non-200 → buffer full body, return Anthropic-format error
+    // with mapped type (mirrors the sync-path mapping below).
+    if (zenRes.statusCode !== 200) {
+      const chunks = [];
+      zenRes.on("data", (c) => chunks.push(c));
+      zenRes.on("end", () => {
+        let msg = "Upstream error";
+        try {
+          const p = JSON.parse(Buffer.concat(chunks).toString());
+          msg = p.error?.message || p.message || msg;
+        } catch {}
+        const errType = ({
+          400: "invalid_request_error",
+          401: "authentication_error",
+          403: "authentication_error",
+          404: "not_found_error",
+          429: "rate_limit_error",
+        })[zenRes.statusCode] || "api_error";
+        console.log(`[ZEN UPSTREAM ${zenRes.statusCode}]`, String(msg).slice(0, 200));
+        if (!res.headersSent) {
+          res.status(zenRes.statusCode).json({ type: "error", error: { type: errType, message: msg } });
+        }
+      });
+      return;
+    }
     let headersSent = false;
     let buffer = "";
     let outputTokens = 0;
@@ -744,6 +795,10 @@ app.post("/v1/chat/completions", (req, res) => {
   if (!MODELS.includes(model)) {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
   }
+  // P2.7: reject empty/missing messages locally instead of forwarding upstream.
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: { message: "messages must be a non-empty array", type: "invalid_request_error" } });
+  }
 
   const sessionId = getSession(user);
   const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
@@ -774,6 +829,13 @@ app.post("/v1/messages", async (req, res) => {
     return res.status(400).json({
       type: "error",
       error: { type: "invalid_request_error", message: error },
+    });
+  }
+  // P2.7:converted messages empty (e.g. body.messages missing) → local 400.
+  if (!messages.length) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: "messages must be a non-empty array" },
     });
   }
   const inputTokens = JSON.stringify(messages).length / 4 | 0;
@@ -826,6 +888,15 @@ app.get("/health", (_req, res) => res.json({
   status: "ok", version: `v${PROXY_VERSION}`, models: MODELS.length,
   endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
 }));
+
+// P2.5: malformed JSON body → JSON 400 (not Express default HTML error page).
+// Must be registered after all routes.
+app.use((err, _req, res, _next) => {
+  if (err?.type === "entity.parse.failed" || (err instanceof SyntaxError && "body" in err)) {
+    return res.status(400).json({ error: { message: "Invalid JSON body", type: "invalid_request_error" } });
+  }
+  _next(err);
+});
 
 // ── Startup model report ────────────────────────────────────────────
 function fmtTokens(n) {

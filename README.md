@@ -78,7 +78,13 @@ curl http://localhost:6446/v1/messages \
 
 ### Auth
 
-Both `Authorization: Bearer KEY` and `x-api-key: KEY` work on all endpoints.
+`Authorization: Bearer ***` and `x-api-key: ***` both work on the
+authenticated endpoints (`POST /v1/chat/completions`, `POST /v1/messages`).
+`GET /v1/models` and `GET /health` are public (no key needed, probe-friendly).
+
+> Note: on the Anthropic endpoint, `reasoning_content` from thinking models is
+> not forwarded — non-streaming responses contain `text` (+ `tool_use`) blocks
+> only. Use the OpenAI endpoint if you need the raw reasoning stream.
 
 ## Use with tools
 

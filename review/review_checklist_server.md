@@ -45,13 +45,13 @@
 
 | # | 類別 | 檢查項目 | 檔案 | 預期結果 | 審查進度 | 審查結果 | 審查日期 | 審查備註 |
 |---|------|----------|------|----------|----------|----------|----------|----------|
-| P2.1 | FUNC | **非串流 Anthropic 路徑丟棄 `reasoning_content`**：`openAIToAnthropic`（L428-479）只取 `choice.message.content` + `tool_calls`，推理模型的 thinking 全丟；串流路徑同樣不轉發 reasoning 區塊 | `server.mjs` L428-479、L482-688 | 非串流至少可選附 `reasoning_content` 為獨立 text 塊或擴展欄位；文件註明行為 | ⏳ | ⚠️ | 2026-09-11 | 見 §P2.1。7 個預設模型 `reasoning` 全為 true，影響面是全部模型 |
-| P2.2 | DOC/SEC | **`/v1/models` 與 `/health` 無鑑權**：L691、L786 兩個 GET 無 `auth()`，但 README L67-69 寫「Both auth methods work on **all** endpoints」 | `server.mjs` L691/L786、`README.md` L67-69 | 二擇一：(a) 補 `auth()`；(b) README 改為「chat/messages 需鑑權，models/health 公開」 | ⏳ | ⚠️ | 2026-09-11 | 模型清單公開實務可接受；重點是文件說謊 |
-| P2.3 | SEC | **`auth()` 明文 `===` 比對**：L32-34 逐 key `tok === key`，有時序側信道；低風險（本地/內網服務）但順手可修 | `server.mjs` L29-36 | `crypto.timingSafeEqual` 定長比對 | ⏳ | ⚠️ | 2026-09-11 | 低優先級，與 P1.1 同 commit 修最划算 |
-| P2.4 | BUG | **首包錯誤偵測只看第一個 chunk**：`pipeZenResponse` L272-309、`pipeZenAsAnthropic` L525-545 僅檢查 `firstChunk` 是否含 `FreeUsageLimitError`/`"error"`；錯誤 JSON 被拆到多個 chunk 即漏檢，轉為正常 200 串流髒資料 | `server.mjs` L272-309、L525-545 | 累積小緩衝（如 8KB）再判定，或檢查 `zenRes.statusCode !== 200` 先行分流 | ⏳ | ⚠️ | 2026-09-11 | 上游錯誤多為小 JSON 一包即達，實務命中率尚可，屬邊界強健性 |
-| P2.5 | BUG | **`express.json` 無錯誤處理**：L7 `express.json({limit:"10mb"})`，畸形 JSON 觸發預設 HTML 錯誤頁，與 JSON API 契約不一致 | `server.mjs` L7 | 補 `app.use((err, req, res, next) => ... 400 JSON...)` | ⏳ | ⚠️ | 2026-09-11 | 順手修，5 行 |
+| P2.1 | FUNC | **非串流 Anthropic 路徑丟 `reasoning_content`**：`openAIToAnthropic` 只組 `text` + `tool_use`。**處置**：預設保持丟棄（7 個模型全為推理模型，透傳 thinking 需 Anthropic extended-thinking 格式，另立項），**文件註明**：README Auth 節加註（Anthropic 端不轉發 reasoning，需原始流走 OpenAI 端）。**實測**：`Think step by step: 17*23` → content 僅 `[text]` ✅ 行為符合文件 | `server.mjs` `openAIToAnthropic`、`README.md` Auth 節 | 文件註明丟棄行為 | ✅🔄 | ✅ | 2026-09-11 | 見 §P2.1 |
+| P2.2 | DOC | **`/v1/models` 與 `/health` 無鑑權但文件寫全端點需 key**。**處置**：採 (b) —— 行為維持公開（探活友好），README Auth 節改為「chat/messages 需鑑權；models/health 公開」。**實測**：無 key `GET` 兩端點皆 200 ✅ 符合文件 | `README.md` Auth 節 | 文件改為鑑權端點/公開端點分述 | ✅🔄 | ✅ | 2026-09-11 | 見 §P2.2 |
+| P2.3 | SEC | **`auth()` 明文 `===` 比對**有時序側信道。**已修正**：新增 `safeEqual()`（先比長度防 throw + `crypto.timingSafeEqual`），`auth()` 迴圈改用。**實測**：錯 key chat → 401 ✅；models/health 公開端點不受影響 ✅ | `server.mjs` `auth()` + `safeEqual()` | `crypto.timingSafeEqual` 定長比對 | ✅🔄 | ✅ | 2026-09-11 | 見 §P2.3 |
+| P2.4 | BUG | **首包錯誤偵測只看第一個 chunk + 從不查 `statusCode`**：錯誤 JSON 跨 chunk 即漏檢轉 200 髒流；且 OpenAI 非串流路徑把一切上游錯誤標成 429 rate_limit。**已修正**：兩處 pipe 入口加 `zenRes.statusCode !== 200` 分流 —— 緩衝全文後按真實狀態碼回 mapped 錯誤（OpenAI 側 `upstream_error`；Anthropic 側沿用 sync 版映射表）。**實測**：超大 max_tokens 觸發上游 400，修前 429 rate_limit 誤標 → 修後 400 + 真實訊息 ✅ | `server.mjs` `pipeZenResponse` + `pipeZenAsAnthropic` | 非 200 先行分流，按真實狀態回 mapped 錯誤 | ✅🔄 | ✅ | 2026-09-11 | 見 §P2.4。200 內錯誤 JSON 的首包 sniff 保留作補充 |
+| P2.5 | BUG | **`express.json` 無錯誤處理**：畸形 JSON 觸發預設 HTML 錯誤頁。**已修正**：路由後加錯誤中介，parse 失敗回 `400 {"error":{"message":"Invalid JSON body","type":"invalid_request_error"}}`。**實測**：`{bad json,,,` 修前 400 HTML → 修後 400 JSON ✅ | `server.mjs` 路由後錯誤中介 | 畸形 JSON 回 JSON 400 | ✅🔄 | ✅ | 2026-09-11 | 見 §P2.5 |
 | P2.6 | DOC | **README 環境變數表缺 3 項**：只列 `PROXY_PORT`、`KEYS_FILE`，實作還有 `MODELS_SOURCE`、`REASONING_CAP`、`MAX_TOKENS_DEFAULT` | `README.md` 環境變數表 | 補三行含預設值與語意（何時設 0 關閉） | ✅🔄 | ✅ | 2026-09-11 | 隨 P1.5 README 更新同步解決 |
-| P2.7 | FUNC | **`/v1/chat/completions` 無 messages 基本校驗**：L712 直接解構轉發，空陣列/缺欄轉發上游才報錯，400 訊息不含本地上下文 | `server.mjs` L708-723 | 空 `messages` 本地即回 400；`model` 缺失亦同 | ⏳ | ⚠️ | 2026-09-11 | 小修；Anthropic 路徑同理可補 |
+| P2.7 | FUNC | **空 `messages` 被轉發上游**：空陣列直送，上游 400 還被誤標成 429 rate_limit。**已修正**：OpenAI 路由 + Anthropic 路由（轉換後）皆加非空陣列校驗，違規回本地 400 `messages must be a non-empty array`。**實測**：空陣列修前 429 誤標 → 修後兩端點皆本地 400 ✅；正常 chat 回歸 200 ✅ | `server.mjs` 兩路由 | 空 messages 本地 400 | ✅🔄 | ✅ | 2026-09-11 | 見 §P2.7 |
 
 ---
 
@@ -75,18 +75,18 @@
 | 優先級 | 總數 | ⏳ 待審查 | 🔍 審查中 | 🔄 修正中 | ✅🔄 已修正 |
 |--------|------|-----------|-----------|-----------|------------|
 | P1 (高) | 5 | 0 | 0 | 0 | 5 |
-| P2 (中) | 7 | 6 | 0 | 0 | 1 |
+| P2 (中) | 7 | 0 | 0 | 0 | 7 |
 | P3 (低) | 6 | 6 | 0 | 0 | 0 |
-| **總計** | **18** | **12** | **0** | **0** | **6** |
+| **總計** | **18** | **6** | **0** | **0** | **12** |
 
 ### 審查結果分布
 
 | 優先級 | 總數 | ✅ 通過 | ⚠️ 需討論 | ❌ 不通過 | — 未判定/不需動作 |
 |--------|------|---------|-----------|-----------|------------------|
 | P1 (高) | 5 | 5 | 0 | 0 | 0 |
-| P2 (中) | 7 | 1 | 6 | 0 | 0 |
+| P2 (中) | 7 | 7 | 0 | 0 | 0 |
 | P3 (低) | 6 | 1 | 3 | 0 | 2 |
-| **總計** | **18** | **7** | **9** | **0** | **2** |
+| **總計** | **18** | **13** | **3** | **0** | **2** |
 
 ---
 
@@ -232,3 +232,4 @@
 | 2026-09-11 | P1.3 修正驗證（階段一）：非文字區塊守衛 + 本地 400；6447 實例黑盒驗證（修前 200 答錯/上游誤導 400 → 修後代理明確 400）→ ✅ | Mercury |
 | 2026-09-11 | P1.4 修正驗證：`loadModels` 依 scheme 選 transport（+正確埠+querystring）；本地 HTTP 假源（`review/fake_models_source.mjs`）驗證修前 fallback → 修後出現標記模型；預設 https + chat smoke 無回歸 → ✅ | Mercury |
 | 2026-09-11 | P1.5 + P2.6 修正：README 模型表改現行快照 + live-list 聲明 + active-only 註解；curl/opencode.json/IDE 段落改 `muse-spark-1.2-contributor-free`；環境變數表補 3 項 → ✅ | Mercury |
+| 2026-09-11 | P2 全項修正驗證（6447 實例黑盒）：P2.5 畸形 JSON 修前 HTML→修後 JSON 400；P2.7 空 messages 修前上游 429 誤標→修後本地 400；P2.4 上游非 200 修前 429 誤標→修後真實狀態；P2.3 timingSafeEqual 後 401 正常；P2.1/P2.2 文件註明 → P2 7/7 ✅ | Mercury |
