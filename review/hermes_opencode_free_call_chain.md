@@ -113,8 +113,8 @@
 
 | # | 條目 | 對應 Hermes 出處 | 工作量 | 狀態 |
 |---|------|-----------------|--------|------|
-| B1 | `POST /v1/responses` 透傳（先原樣透傳，不做 chat↔responses 互譯） | §6（adapter/runtime） | 中（新端點 + SSE 管道複用既有 `pipeZenResponse` 模式） | 待決策 |
-| B2 | chat 收到 `muse-spark*` 回 400 指路 `/v1/responses`（P1.3 同哲學：不支援就大聲說） | §5 路由表註解 | 小（5 行 + 測試） | 待決策 |
+| B1 | `POST /v1/responses` 透傳（先原樣透傳，不做 chat↔responses 互譯） | §6（adapter/runtime） | 中（新端點 + SSE 管道複用既有 `pipeZenResponse` 模式） | ✅ 完成（2026-09-11）：`zenResponsesRequest` + `pipeZenResponses`（byte-passthrough，sync/stream，非 200 分流同 P2.4）；上游預驗 spark 200/mimo 500；實測 B1a sync 200 + B1b stream 200 事件流 ✅ |
+| B2 | chat 收到 `muse-spark*` 回 400 指路 `/v1/responses`（P1.3 同哲學：不支援就大聲說） | §5 路由表註解 | 小（5 行 + 測試） | ✅ 完成（2026-09-11）：`isSparkModel` + `sparkWrongEndpoint`（`wrong_endpoint`），chat 與 messages 雙路同加；實測皆 400 指路 ✅ |
 | B3 | 目錄三層化：static floor + live + 失敗不卡（health 增 `degraded` 態） | §4 | 小 | 待決策 |
 | B4 | `ox-alpha-free` 永久排除（防 stale 名單誤路由） | §4 `_OPENCODE_FREE_KEYED_SUFFIX_MODELS` | 極小（1 行 + 註解） | 待決策 |
 | B5 | per-model `max_tokens` 上限表（mimo-v2.5-pro 131072 為首條） | §8 `_MODEL_MAX_TOKENS` | 小（dict + 單測） | 待決策 |

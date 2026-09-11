@@ -69,6 +69,24 @@ curl http://localhost:6446/v1/messages \
   }'
 ```
 
+### Responses format — `POST /v1/responses`
+
+```bash
+curl http://localhost:6446/v1/responses \
+  -H "Authorization: Bearer ***" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "muse-spark-1.3-contributor-free",
+    "input": "Hello",
+    "stream": false
+  }'
+```
+
+> **Endpoint routing**: `muse-spark*` models are served **only** on `/v1/responses`
+> (they 500 on chat/completions and messages — same as the official opencode CLI,
+> which routes them to the Codex Responses API). Calling them on the wrong
+> endpoint returns `400 wrong_endpoint` pointing here.
+
 ### Other endpoints
 
 | Method | Path | What |

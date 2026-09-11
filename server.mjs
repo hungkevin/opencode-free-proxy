@@ -785,6 +785,108 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
   req.end();
 }
 
+// ── Responses API transport (B1) ─────────────────────────────────────
+// Muse Spark models are served ONLY here (they 500 on chat/completions).
+// Body is passed through untouched (client controls input/tools/reasoning);
+// only auth + model-membership are enforced locally.
+function zenResponsesRequest(clientBody, sessionId) {
+  const body = JSON.stringify(clientBody);
+  const requestId = ocId("msg");
+  return {
+    body,
+    options: {
+      hostname: "opencode.ai",
+      port: 443,
+      path: "/zen/v1/responses",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        "Authorization": "Bearer public",
+        "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
+        "x-opencode-client": "cli",
+        "x-opencode-project": "global",
+        "x-opencode-request": requestId,
+        "x-opencode-session": sessionId,
+      },
+      timeout: 120000,
+    },
+  };
+}
+
+// Byte-passthrough pipe for the Responses API (sync JSON + SSE stream).
+// Same non-200分流 as the chat pipes: buffer + mapped error, never 200-dirty.
+function pipeZenResponses(zenOpts, body, stream, res) {
+  const req = https.request(zenOpts, (zenRes) => {
+    if (zenRes.statusCode !== 200) {
+      const chunks = [];
+      zenRes.on("data", (c) => chunks.push(c));
+      zenRes.on("end", () => {
+        let msg = "Upstream error";
+        try {
+          const p = JSON.parse(Buffer.concat(chunks).toString());
+          msg = p.error?.message || p.message || msg;
+        } catch {}
+        console.log(`[ZEN RESPONSES UPSTREAM ${zenRes.statusCode}]`, String(msg).slice(0, 200));
+        if (!res.headersSent) {
+          res.status(zenRes.statusCode).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
+        }
+      });
+      return;
+    }
+    let headersSent = false;
+    zenRes.on("data", (chunk) => {
+      if (!headersSent) {
+        headersSent = true;
+        if (stream) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Transfer-Encoding": "chunked",
+          });
+          res.flushHeaders();
+        } else {
+          res.writeHead(zenRes.statusCode, { "Content-Type": "application/json" });
+        }
+      }
+      res.write(chunk);
+      if (res.flush) res.flush();
+    });
+    zenRes.on("end", () => {
+      if (!headersSent && !res.headersSent) {
+        res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
+        return;
+      }
+      if (headersSent && !res.writableEnded) res.end();
+    });
+  });
+  req.on("error", (e) => {
+    console.log("[ZEN RESPONSES ERROR]", e.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
+    }
+  });
+  req.on("timeout", () => {
+    req.destroy();
+    console.log("[ZEN RESPONSES TIMEOUT]");
+    if (!res.headersSent) {
+      res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
+    }
+  });
+  req.write(body);
+  req.end();
+}
+
+// B2: Muse Spark is not served on chat/completions or messages — point at /v1/responses.
+function isSparkModel(m) {
+  return String(m || "").toLowerCase().startsWith("muse-spark");
+}
+function sparkWrongEndpoint(model) {
+  return { message: `Model ${model} requires the Responses API: POST /v1/responses (Muse Spark is not served on this endpoint)`, type: "invalid_request_error", code: "wrong_endpoint" };
+}
+
 // ── Routes: OpenAI format ──────────────────────────────────────────
 app.get("/v1/models", (_req, res) => {
   res.json({
@@ -811,6 +913,10 @@ app.post("/v1/chat/completions", (req, res) => {
   if (!MODELS.includes(model)) {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
   }
+  // B2: Spark → /v1/responses (chat/completions 500s on it).
+  if (isSparkModel(model)) {
+    return res.status(400).json({ error: sparkWrongEndpoint(model) });
+  }
   // P2.7: reject empty/missing messages locally instead of forwarding upstream.
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: { message: "messages must be a non-empty array", type: "invalid_request_error" } });
@@ -822,6 +928,23 @@ app.post("/v1/chat/completions", (req, res) => {
 
   const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId, req.body);
   pipeZenResponse(options, body, stream, res);
+});
+
+// ── Routes: Responses API (B1) ───────────────────────────────────────
+app.post("/v1/responses", (req, res) => {
+  const user = auth(req);
+  if (!user) return res.status(401).json({ error: { message: "Invalid API key" } });
+
+  const { model, stream } = req.body;
+  if (!MODELS.includes(model)) {
+    return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
+  }
+
+  const sessionId = getSession(user);
+  console.log("[RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync");
+
+  const { body, options } = zenResponsesRequest(req.body, sessionId);
+  pipeZenResponses(options, body, !!stream, res);
 });
 
 // ── Routes: Anthropic Messages format ──────────────────────────────
@@ -837,6 +960,10 @@ app.post("/v1/messages", async (req, res) => {
       type: "error",
       error: { type: "invalid_request_error", message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` },
     });
+  }
+  // B2: Spark → /v1/responses (messages 500s on it, same as chat).
+  if (isSparkModel(model)) {
+    return res.status(400).json({ type: "error", error: sparkWrongEndpoint(model) });
   }
 
   const sessionId = getSession(user);
@@ -903,7 +1030,7 @@ app.post("/v1/messages", async (req, res) => {
 app.get("/health", (_req, res) => res.json({
   status: "ok", version: `v${PROXY_VERSION}`, models: MODELS.length,
   models_source: MODELS_ORIGIN, models_loaded_at: MODELS_LOADED_AT,
-  endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
+  endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
 }));
 
 // P2.5: malformed JSON body → JSON 400 (not Express default HTML error page).
@@ -947,6 +1074,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");
+  console.log("  Responses: POST /v1/responses  (Muse Spark models live here)");
   console.log("  Models:    GET  /v1/models");
   console.log("  Health:    GET  /health");
   for (const [name, key] of Object.entries(apiKeys)) {
