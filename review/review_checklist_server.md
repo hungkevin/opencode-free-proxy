@@ -59,11 +59,11 @@
 
 | # | 類別 | 檢查項目 | 檔案 | 預期結果 | 審查進度 | 審查結果 | 審查日期 | 審查備註 |
 |---|------|----------|------|----------|----------|----------|----------|----------|
-| P3.1 | REL | **fallback 快照會刊登死模型**：`DEFAULT_MODELS` 為 2026-08 靜態快照；`free_model.md` §1 自承註冊表滯後率約 69%，快照模型下架後 `/v1/models` 照列、`chat` 打上游才炸 | `server.mjs` L47-55、`free_model.md` §1 | `/health` 附 `models_stale: true` 當使用 fallback；或 fallback 附快照日期供判斷 | ⏳ | ⚠️ | 2026-09-11 | 啟動日誌已有 `using ... built-in defaults` 一行，可接受；建議健康端點機器可讀化 |
-| P3.2 | FUNC | **Anthropic system 陣列拼接丟 `cache_control`**：L379-380 `b.text \|\| ""` join，prompt caching 標記丟失 | `server.mjs` L378-382 | 文件註明不支援 prompt caching，或透傳標記 | ⏳ | — | 2026-09-11 | 免費代理本就不計費，影響極小 |
-| P3.3 | OPS | **session 30 分鐘輪轉寫死**：L161 `30*60*1000` 無環境變數可調 | `server.mjs` L157-165 | `SESSION_TTL_MS` 環境變數，預設 1800000 | ⏳ | — | 2026-09-11 | 一行修 |
-| P3.4 | HYG | **倉庫根目錄雜物**：`gen_ppt.py`（323 行）、`opencode_free_proxy_tech.pptx` 未追蹤（`git status` 顯示 `??`），與代理服務無關 | 倉庫根目錄 | 移入 `docs/` 或刪 pptx 留腳本；至少進 `.gitignore` 決策 | ⏳ | ⚠️ | 2026-09-11 | 與本次審查無關但擋 `git status` 乾淨 |
-| P3.5 | HYG | **`package-lock.json` 被 gitignore 卻存在於本地**：`.gitignore` 排除 lock 檔，可重現安裝無保障；`npm install` 每次解析浮動版本 | `.gitignore`、`package.json` | 二擇一並寫進 README：(a) 追蹤 lock（推薦，服務部署）；(b) 維持忽略並接受浮動 | ⏳ | ⚠️ | 2026-09-11 | `express ^4.21.0` 浮動範圍大，生產部署建議鎖定 |
+| P3.1 | REL | **fallback 快照會刊登死模型**：靜態快照陳舊，`/health` 無法區分 live/fallback。**已修正**：新增 `MODELS_ORIGIN`（live/fallback）+ `MODELS_LOADED_AT`（ISO 時間），`useDefaults()`/`applyRegistry()` 成功路徑分別賦值，`/health` 回傳兩欄位。**實測**：預設源 → `"live"` ✅；死源 → `"fallback"` ✅ | `server.mjs` + `/health` | 健康端點機器可讀化 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.1。監控可對 `fallback` 告警 |
+| P3.2 | FUNC | **Anthropic system 陣列拼接丟 `cache_control`**。**處置**：按建議不修（免費代理不計費，僅有效能差異），記錄備查結案 | — | 不修 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.2 |
+| P3.3 | OPS | **session 30 分鐘輪轉寫死**：現值工作正常。**處置**：依指示本輪不修改，保持現狀 | `server.mjs` | 不修 | ⏳ | — | 2026-09-11 | 保留，另立項再議 |
+| P3.4 | HYG | **倉庫根目錄雜物**（`gen_ppt.py` + `opencode_free_proxy_tech.pptx`）。**處置**：用戶已自行清理根目錄 + `.gitignore` 增 `review/*.mjs|*.py|*.pptx`；`git status` 乾淨 → 結案 | 倉庫根目錄、`review/`、`.gitignore` | 根目錄乾淨 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.4 |
+| P3.5 | HYG | **`package-lock.json` 被 gitignore**，可重現安裝無保障。**已修正**：`.gitignore` 移除該行，已 `git add` 追蹤（express 鎖 4.22.2） | `.gitignore`、`package-lock.json` | 追蹤 lock 檔 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.5。push 後 upstream 同步注意衝突 |
 | P3.6 | OPS | **EADDRINUSE 直接 `process.exit(1)`**：L829-838 端口佔用即退出，無重試；systemd 有 `Restart=always` 兜底但會空轉重啟 | `server.mjs` L829-838 | 可接受現狀；文件註明多開需換 `PROXY_PORT`（已有錯誤訊息指引 ✅） | ⏳ | ✅ | 2026-09-11 | 錯誤訊息本身寫得好，不需改 |
 
 ---
@@ -76,8 +76,8 @@
 |--------|------|-----------|-----------|-----------|------------|
 | P1 (高) | 5 | 0 | 0 | 0 | 5 |
 | P2 (中) | 7 | 0 | 0 | 0 | 7 |
-| P3 (低) | 6 | 6 | 0 | 0 | 0 |
-| **總計** | **18** | **6** | **0** | **0** | **12** |
+| P3 (低) | 6 | 1 | 0 | 0 | 5 |
+| **總計** | **18** | **1** | **0** | **0** | **17** |
 
 ### 審查結果分布
 
@@ -85,8 +85,8 @@
 |--------|------|---------|-----------|-----------|------------------|
 | P1 (高) | 5 | 5 | 0 | 0 | 0 |
 | P2 (中) | 7 | 7 | 0 | 0 | 0 |
-| P3 (低) | 6 | 1 | 3 | 0 | 2 |
-| **總計** | **18** | **13** | **3** | **0** | **2** |
+| P3 (低) | 6 | 5 | 0 | 0 | 1 |
+| **總計** | **18** | **17** | **0** | **0** | **1** |
 
 ---
 
@@ -233,3 +233,4 @@
 | 2026-09-11 | P1.4 修正驗證：`loadModels` 依 scheme 選 transport（+正確埠+querystring）；本地 HTTP 假源（`review/fake_models_source.mjs`）驗證修前 fallback → 修後出現標記模型；預設 https + chat smoke 無回歸 → ✅ | Mercury |
 | 2026-09-11 | P1.5 + P2.6 修正：README 模型表改現行快照 + live-list 聲明 + active-only 註解；curl/opencode.json/IDE 段落改 `muse-spark-1.2-contributor-free`；環境變數表補 3 項 → ✅ | Mercury |
 | 2026-09-11 | P2 全項修正驗證（6447 實例黑盒）：P2.5 畸形 JSON 修前 HTML→修後 JSON 400；P2.7 空 messages 修前上游 429 誤標→修後本地 400；P2.4 上游非 200 修前 429 誤標→修後真實狀態；P2.3 timingSafeEqual 後 401 正常；P2.1/P2.2 文件註明 → P2 7/7 ✅ | Mercury |
+| 2026-09-11 | P3 處置：P3.1 `/health` 加 models_source/models_loaded_at（live/死源雙驗）→ ✅；P3.2 不修備查 → ✅；P3.3 跳過；P3.4 用戶已清根目錄 → ✅；P3.5 追蹤 package-lock.json（express 4.22.2）→ ✅ | Mercury |

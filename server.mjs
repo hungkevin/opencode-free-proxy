@@ -65,6 +65,11 @@ const DEFAULT_MODELS = [
 
 let MODELS = [];
 
+// P3.1: track where the model list came from (live registry vs built-in
+// fallback snapshot) and when, so monitoring can alert on stale data.
+let MODELS_ORIGIN = "unknown";
+let MODELS_LOADED_AT = null;
+
 // Metadata per model id: { name, status, reasoning, toolCall, contextLimit, outputLimit, releaseDate }
 const MODEL_META = {};
 
@@ -73,6 +78,8 @@ const MODELS_SOURCE =
 
 function useDefaults(reason) {
   MODELS = [];
+  MODELS_ORIGIN = "fallback";
+  MODELS_LOADED_AT = new Date().toISOString();
   for (const m of DEFAULT_MODELS) {
     MODELS.push(m.id);
     MODEL_META[m.id] = {
@@ -119,6 +126,8 @@ function applyRegistry(models) {
   console.log(
     `[MODELS] Loaded ${MODELS.length} active zero-cost models from ${MODELS_SOURCE}`,
   );
+  MODELS_ORIGIN = "live";
+  MODELS_LOADED_AT = new Date().toISOString();
   return true;
 }
 
@@ -886,6 +895,7 @@ app.post("/v1/messages", async (req, res) => {
 // ── Health ──────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({
   status: "ok", version: `v${PROXY_VERSION}`, models: MODELS.length,
+  models_source: MODELS_ORIGIN, models_loaded_at: MODELS_LOADED_AT,
   endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
 }));
 

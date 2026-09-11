@@ -1,6 +1,5 @@
 node_modules/
 api-keys.json
-package-lock.json
 *.log
 .env
 
