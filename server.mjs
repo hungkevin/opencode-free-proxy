@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PROXY_PORT || 6446;
-const OC_VERSION = "1.15.0";
+const OC_VERSION = "1.18.30";
 const PROXY_VERSION = "9";
 
 // ── API Keys ───────────────────────────────────────────────────────
@@ -176,12 +176,19 @@ async function loadModels() {
   });
 }
 
-// Track sessions per user (rotate every 30 min)
+// Track sessions per user: each session lives 30min base + 0~15min random
+// jitter (re-drawn on every rotation), mimicking humans opening new
+// conversations at irregular intervals. SESSION_TTL_MS=0 disables rotation
+// (fresh session per request).
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS ?? "1800000", 10);
+const SESSION_JITTER_MS = 15 * 60 * 1000;
 const userSessions = {};
 function getSession(user) {
   const now = Date.now();
-  if (!userSessions[user] || now - userSessions[user].ts > 30 * 60 * 1000) {
-    userSessions[user] = { id: ocId("ses"), ts: now };
+  const s = userSessions[user];
+  if (!s || SESSION_TTL_MS <= 0 || now - s.ts > s.ttl) {
+    const ttl = SESSION_TTL_MS + Math.floor(Math.random() * (SESSION_JITTER_MS + 1));
+    userSessions[user] = { id: ocId("ses"), ts: now, ttl };
   }
   return userSessions[user].id;
 }

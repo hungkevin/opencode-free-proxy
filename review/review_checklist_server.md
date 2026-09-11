@@ -61,7 +61,7 @@
 |---|------|----------|------|----------|----------|----------|----------|----------|
 | P3.1 | REL | **fallback 快照會刊登死模型**：靜態快照陳舊，`/health` 無法區分 live/fallback。**已修正**：新增 `MODELS_ORIGIN`（live/fallback）+ `MODELS_LOADED_AT`（ISO 時間），`useDefaults()`/`applyRegistry()` 成功路徑分別賦值，`/health` 回傳兩欄位。**實測**：預設源 → `"live"` ✅；死源 → `"fallback"` ✅ | `server.mjs` + `/health` | 健康端點機器可讀化 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.1。監控可對 `fallback` 告警 |
 | P3.2 | FUNC | **Anthropic system 陣列拼接丟 `cache_control`**。**處置**：按建議不修（免費代理不計費，僅有效能差異），記錄備查結案 | — | 不修 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.2 |
-| P3.3 | OPS | **session 30 分鐘輪轉寫死**：現值工作正常。**處置**：依指示本輪不修改，保持現狀 | `server.mjs` | 不修 | ⏳ | — | 2026-09-11 | 保留，另立項再議 |
+| P3.3 | OPS | **session 30 分鐘輪轉寫死**。**已修正（2026-09-11，opencode 源碼已更新至 1.18.30，機制未變）**：TTL 改為 30 分鐘 base + 每次輪轉重抽 0~15 分鐘 jitter（存於該 session 的 `ttl` 欄位）；新增 `SESSION_TTL_MS` 環境開關（預設 1800000，`0` = 每請求新 session）；`User-Agent` 跟進 `1.15.0` → `1.18.30`。**驗證**：`node --check` ✅；輪轉邏輯白盒抽測（29 分鐘不換、ttl 分布 1800000~2700000、`0` 每次換）✅；6447 實機 chat smoke 200 ✅ | `server.mjs` `getSession()` + `OC_VERSION` | jitter 輪轉 + env 開關 + UA 跟進 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.3 |
 | P3.4 | HYG | **倉庫根目錄雜物**（`gen_ppt.py` + `opencode_free_proxy_tech.pptx`）。**處置**：用戶已自行清理根目錄 + `.gitignore` 增 `review/*.mjs|*.py|*.pptx`；`git status` 乾淨 → 結案 | 倉庫根目錄、`review/`、`.gitignore` | 根目錄乾淨 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.4 |
 | P3.5 | HYG | **`package-lock.json` 被 gitignore**，可重現安裝無保障。**已修正**：`.gitignore` 移除該行，已 `git add` 追蹤（express 鎖 4.22.2） | `.gitignore`、`package-lock.json` | 追蹤 lock 檔 | ✅🔄 | ✅ | 2026-09-11 | 見 §P3.5。push 後 upstream 同步注意衝突 |
 | P3.6 | OPS | **EADDRINUSE 直接 `process.exit(1)`**：L829-838 端口佔用即退出，無重試；systemd 有 `Restart=always` 兜底但會空轉重啟 | `server.mjs` L829-838 | 可接受現狀；文件註明多開需換 `PROXY_PORT`（已有錯誤訊息指引 ✅） | ⏳ | ✅ | 2026-09-11 | 錯誤訊息本身寫得好，不需改 |
@@ -76,8 +76,8 @@
 |--------|------|-----------|-----------|-----------|------------|
 | P1 (高) | 5 | 0 | 0 | 0 | 5 |
 | P2 (中) | 7 | 0 | 0 | 0 | 7 |
-| P3 (低) | 6 | 1 | 0 | 0 | 5 |
-| **總計** | **18** | **1** | **0** | **0** | **17** |
+| P3 (低) | 6 | 0 | 0 | 0 | 6 |
+| **總計** | **18** | **0** | **0** | **0** | **18** |
 
 ### 審查結果分布
 
@@ -85,8 +85,8 @@
 |--------|------|---------|-----------|-----------|------------------|
 | P1 (高) | 5 | 5 | 0 | 0 | 0 |
 | P2 (中) | 7 | 7 | 0 | 0 | 0 |
-| P3 (低) | 6 | 5 | 0 | 0 | 1 |
-| **總計** | **18** | **17** | **0** | **0** | **1** |
+| P3 (低) | 6 | 6 | 0 | 0 | 0 |
+| **總計** | **18** | **18** | **0** | **0** | **0** |
 
 ---
 
@@ -205,6 +205,23 @@
 ### P3.3 — session TTL 寫死（OPS，極低）
 
 - **現狀**：`x-opencode-session` 30 分鐘輪轉的語意上游未公開，現值工作正常。抽環境變數一行修，列入順手清單。
+- **官方源碼對照（2026-09-11 實地驗證，`c:/work/opencode`）**：
+  - 誕生地：`packages/opencode/src/session/llm/request.ts` L187-201（`LLMRequestPrep.prepare` 回傳 headers，僅 opencode provider 帶此組）。
+  - `x-opencode-session = input.sessionID`：**對話會話 ID**，`Session.create` 建一次（`ses_` 前綴，`core/src/id/id.ts` 時序編碼），存 DB、可活數天，**官方從不按時間輪轉**。另有 `x-parent-session-id` 給 fork 鏈。
+  - `x-opencode-request = input.user.id`：**當輪 user message 的 ID**（`msg_` 前綴）。`PrepareInput.user` 是最新一條 user message —— 同輪重試不換值，下一輪發言才換新。粒度是「輪」不是「HTTP 請求」。
+  - `x-opencode-project`：真實 project UUID（無則省略）；`x-opencode-client`：`OPENCODE_CLIENT` 環境變數，預設 `cli`；`User-Agent`：`opencode/<版本>`（倉庫現 1.18.21，無後綴）。
+- **代理 vs 官方對照**：
+
+  | header | 官方語意 | 代理現狀 | 評價 |
+  |--------|---------|---------|------|
+  | session | 會話生命週期（建一次、活數天、不輪轉） | 每 key 30 分鐘輪轉 | 外觀同為合法 `ses_`，上游實測接受 |
+  | request | 當輪 user message ID（同輪重試不變） | 每 HTTP 請求全新 `msg_` | 外觀合法，上游實測接受 |
+  | project | 真實 UUID 或省略 | 固定 `"global"` | 假值，上游不校驗 |
+  | client | 預設 `cli` | `cli` | ✅ 一致 |
+  | UA | `opencode/1.18.21`（純） | `opencode/1.15.0` + ai-sdk/bun 後綴 | 版本落後 + 偽裝 bun（代理跑 node），上游不校驗 |
+- **結論修正**：「30 分鐘模仿官方指紋」說法不精確 —— 官方不輪轉，30 分鐘是代理自創的啟發式。但上游僅做分組/歸屬、不做嚴格校驗（`Bearer public` 匿名可用、`"global"` 假值照過），故無功能影響。最貼近官方的做法反而是 session 啟動生成一次長期持有，但同樣零收益。維持 ⏳ 保留；將來動指紋策略時可順手把 UA `1.15.0` 跟進到 `1.18.x`。
+- **後續處置（2026-09-11，用戶指示實作）**：TTL 改為 30min base + 0~15min jitter（每次輪轉重抽，存 `ttl` 欄位）；新增 `SESSION_TTL_MS` 環境開關（`0` = 每請求新 session）；`OC_VERSION` → `1.18.30`（opencode 源碼已更新至該版，header 機制未變）。驗證：`node --check` ✅、白盒抽測 ✅、6447 chat smoke ✅。
+- **狀態**：✅（已修正並驗證）
 
 ### P3.4 — 倉庫根雜物（HYG，低）
 
@@ -234,3 +251,4 @@
 | 2026-09-11 | P1.5 + P2.6 修正：README 模型表改現行快照 + live-list 聲明 + active-only 註解；curl/opencode.json/IDE 段落改 `muse-spark-1.2-contributor-free`；環境變數表補 3 項 → ✅ | Mercury |
 | 2026-09-11 | P2 全項修正驗證（6447 實例黑盒）：P2.5 畸形 JSON 修前 HTML→修後 JSON 400；P2.7 空 messages 修前上游 429 誤標→修後本地 400；P2.4 上游非 200 修前 429 誤標→修後真實狀態；P2.3 timingSafeEqual 後 401 正常；P2.1/P2.2 文件註明 → P2 7/7 ✅ | Mercury |
 | 2026-09-11 | P3 處置：P3.1 `/health` 加 models_source/models_loaded_at（live/死源雙驗）→ ✅；P3.2 不修備查 → ✅；P3.3 跳過；P3.4 用戶已清根目錄 → ✅；P3.5 追蹤 package-lock.json（express 4.22.2）→ ✅ | Mercury |
+| 2026-09-11 | P3.3 實作：TTL 改 30min + 0~15min jitter（每次輪轉重抽）+ SESSION_TTL_MS 開關；OC_VERSION → 1.18.30（opencode 源碼已更新，機制未變）；node 白盒 + 6447 smoke 驗證 → ✅；全報告 18/18 ✅ | Mercury |
