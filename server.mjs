@@ -1128,18 +1128,24 @@ function fmtTokens(n) {
   return String(n);
 }
 
+// Which endpoints serve this model (mirrors the B2/P2.9 local enforcement:
+// muse-spark* only on /v1/responses; everything else on chat/completions+messages).
+function modelEndpoints(id) {
+  return isSparkModel(id) ? "responses" : "chat+messages";
+}
+
 function printModels() {
-  const line = "-".repeat(96);
+  const line = "-".repeat(123);
   console.log("");
   console.log(`  Free models (active, cost=0): ${MODELS.length}`);
   console.log(`  ${line}`);
   console.log(
-    `  ${"MODEL ID".padEnd(34)}${"NAME".padEnd(32)}${"CONTEXT".padEnd(10)}${"OUTPUT".padEnd(10)}${"REASON".padEnd(8)}${"TOOLS".padEnd(7)}RELEASE`,
+    `  ${"MODEL ID".padEnd(34)}${"NAME".padEnd(32)}${"CONTEXT".padEnd(10)}${"OUTPUT".padEnd(10)}${"REASON".padEnd(8)}${"TOOLS".padEnd(7)}${"ENDPOINTS".padEnd(15)}RELEASE`,
   );
   for (const id of MODELS) {
     const m = MODEL_META[id] || {};
     console.log(
-      `  ${id.padEnd(34)}${(m.name || "-").padEnd(32)}${fmtTokens(m.contextLimit).padEnd(10)}${fmtTokens(m.outputLimit).padEnd(10)}${(m.reasoning ? "yes" : "no").padEnd(8)}${(m.toolCall ? "yes" : "no").padEnd(7)}${m.releaseDate || "-"}`,
+      `  ${id.padEnd(34)}${(m.name || "-").padEnd(32)}${fmtTokens(m.contextLimit).padEnd(10)}${fmtTokens(m.outputLimit).padEnd(10)}${(m.reasoning ? "yes" : "no").padEnd(8)}${(m.toolCall ? "yes" : "no").padEnd(7)}${modelEndpoints(id).padEnd(15)}${m.releaseDate || "-"}`,
     );
   }
   console.log(`  ${line}`);
