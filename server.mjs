@@ -1652,11 +1652,11 @@ function fmtTokens(n) {
 }
 
 // Which endpoints serve this model (mirrors local enforcement:
-// muse-spark* = all three since Phase 1 — chat/messages ride the Responses
-// translation; other models are chat/completions+messages, and /v1/responses
+// muse-spark* = native responses first; chat/messages ride the Responses
+// translation. Other models = native chat+messages; /v1/responses
 // 400s locally via nonSparkWrongEndpoint until Phase 2).
 function modelEndpoints(id) {
-  return isSparkModel(id) ? "chat+msg+resp" : "chat+messages";
+  return isSparkModel(id) ? "resp+chat+msg" : "chat+msg+resp";
 }
 
 function printModels() {
