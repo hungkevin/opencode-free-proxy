@@ -209,9 +209,11 @@ sudo systemctl enable --now opencode-proxy
 
 ### Log levels (`LOG_LEVEL`)
 
+```powershell
+$env:LOG_LEVEL="warn"; node server.mjs   # Windows PowerShell
+```
 ```bash
 LOG_LEVEL=warn node server.mjs   # Git Bash / Linux
-set LOG_LEVEL=warn && node server.mjs   # Windows CMD / PowerShell
 ```
 
 Set once at startup (changing it requires a restart). Case-insensitive;
