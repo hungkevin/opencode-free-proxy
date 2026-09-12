@@ -1184,23 +1184,30 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
     }
     const onEvent = (d) => {
       if (stopped) return;
-      sendHead();
+      // Q2: sendHead() lives in emitting branches only — unknown/stray events
+      // (response.created, late inline-error objects, ...) must not commit
+      // 200 headers, or a later error can only surface as silent empty success.
       const t = d.type;
       if (t === "response.output_item.added" && d.item?.type === "function_call") {
+        sendHead();
         const idx = toolCount++;
         argIdx.set(d.item.id, idx);
         emitChunk({ tool_calls: [{ index: idx, id: d.item.call_id || d.item.id, type: "function", function: { name: d.item.name || "", arguments: "" } }] });
       } else if (t === "response.function_call_arguments.delta") {
+        sendHead();
         const idx = argIdx.get(d.item_id) ?? Math.max(0, toolCount - 1);
         emitChunk({ tool_calls: [{ index: idx, function: { arguments: d.delta || "" } }] });
       } else if (t === "response.output_text.delta") {
+        sendHead();
         contentStarted = true;
         emitChunk({ content: d.delta || "" });
       } else if (t === "response.reasoning_summary_text.delta" || t === "response.reasoning_text.delta") {
+        sendHead();
         reasoningTokens += Math.ceil((d.delta || "").length / 4);
         emitChunk({ reasoning_content: d.delta || "" });
         if (!contentStarted && reasoningTokens > REASONING_CAP) stopForReasoningCap();
       } else if (t === "response.completed" || t === "response.incomplete" || t === "response.failed") {
+        sendHead();
         completed = true;
         const resp = d.response || {};
         const reason = toolCount > 0 ? "tool_calls" : resp.status === "incomplete" ? "length" : "stop";
@@ -1433,11 +1440,16 @@ function nonSparkWrongEndpoint(model) {
   return { message: `Model ${model} requires POST /v1/chat/completions or POST /v1/messages (only Muse Spark models are served on /v1/responses)`, type: "invalid_request_error", code: "wrong_endpoint" };
 }
 
-// P2.5: basic generation-param validation (garbage in → local 400,
-// not confusing upstream errors). Returns an error string or null.
+// P2.5/Q3: basic generation-param validation (garbage in → local 400,
+// not confusing upstream errors). Covers all three routes: chat sends
+// max_tokens, responses sends max_output_tokens, messages sends max_tokens
+// (Anthropic required). Returns an error string or null.
 function validateGenParams(b) {
   if (b.max_tokens !== undefined && (!Number.isInteger(b.max_tokens) || b.max_tokens <= 0)) {
     return "max_tokens must be a positive integer";
+  }
+  if (b.max_output_tokens !== undefined && (!Number.isInteger(b.max_output_tokens) || b.max_output_tokens <= 0)) {
+    return "max_output_tokens must be a positive integer";
   }
   if (b.temperature !== undefined && (typeof b.temperature !== "number" || b.temperature < 0 || b.temperature > 2)) {
     return "temperature must be a number in [0, 2]";
@@ -1524,6 +1536,11 @@ app.post("/v1/responses", (req, res) => {
       (Array.isArray(req.body.input) && req.body.input.length === 0)) {
     return res.status(400).json({ error: { message: "input must be a non-empty string or array", type: "invalid_request_error" } });
   }
+  // Q3: generation-param validation (was chat-route only).
+  {
+    const perr = validateGenParams(req.body);
+    if (perr) return res.status(400).json({ error: { message: perr, type: "invalid_request_error" } });
+  }
 
   const sessionId = getSession(user);
   console.log("[RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync");
@@ -1562,6 +1579,17 @@ app.post("/v1/messages", async (req, res) => {
       type: "error",
       error: { type: "invalid_request_error", message: "messages must be a non-empty array" },
     });
+  }
+  // Q3: generation-param validation (was chat-route only; Anthropic sends
+  // max_tokens/temperature/top_p which forward to chat upstream).
+  {
+    const perr = validateGenParams(req.body);
+    if (perr) {
+      return res.status(400).json({
+        type: "error",
+        error: { type: "invalid_request_error", message: perr },
+      });
+    }
   }
   const inputTokens = JSON.stringify(messages).length / 4 | 0;
 
@@ -1653,10 +1681,11 @@ function fmtTokens(n) {
 
 // Which endpoints serve this model (mirrors local enforcement:
 // muse-spark* = native responses first; chat/messages ride the Responses
-// translation. Other models = native chat+messages; /v1/responses
-// 400s locally via nonSparkWrongEndpoint until Phase 2).
+// translation. Other models = native chat (+msg via translation);
+// /v1/responses 400s locally via nonSparkWrongEndpoint until Phase 2
+// implements universal translation — do NOT advertise resp before then).
 function modelEndpoints(id) {
-  return isSparkModel(id) ? "resp+chat+msg" : "chat+msg+resp";
+  return isSparkModel(id) ? "resp+chat+msg" : "chat+msg";
 }
 
 function printModels() {
