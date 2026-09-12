@@ -1254,7 +1254,9 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
         // B-Q3: tool calls count as progress too — a long think followed by a
         // legitimate function_call must not be killed by the fuse.
         if (!contentStarted && toolCount === 0 && reasoningTokens > REASONING_CAP) stopForReasoningCap();
-      } else if (t === "response.completed" || t === "response.incomplete" || t === "response.failed") {
+      } else if ((t === "response.completed" || t === "response.incomplete" || t === "response.failed") && !completed) {
+        // R1: idempotent — upstream may repeat the terminal event (same class
+        // as the repeated finish_reason seen on chat SSE); first one wins.
         sendHead();
         completed = true;
         const resp = d.response || {};
@@ -1430,7 +1432,9 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
           sendHeaders();
           finishUp("max_tokens", reasoningTokens);
         }
-      } else if (t === "response.completed" || t === "response.incomplete" || t === "response.failed") {
+      } else if ((t === "response.completed" || t === "response.incomplete" || t === "response.failed") && !completed) {
+        // R1: idempotent — upstream may repeat the terminal event (same class
+        // as the repeated finish_reason seen on chat SSE); first one wins.
         completed = true;
         const resp = d.response || {};
         outputTokens = resp.usage?.output_tokens || 0;
