@@ -1044,6 +1044,11 @@ function chatToResponsesRequest(c) {
   for (const k of ["max_tokens", "temperature", "top_p"]) {
     if (c[k] !== undefined) out[k] = c[k];
   }
+  // B-Q4: chat clients may cap length via max_completion_tokens (which
+  // zenRequest forwards on the native chat path) — don't drop it for Spark.
+  if (out.max_tokens === undefined && c.max_completion_tokens !== undefined) {
+    out.max_tokens = c.max_completion_tokens;
+  }
   return out;
 }
 
@@ -1266,8 +1271,19 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
     let firstChunk = null;
     let errBuffering = false;
     const errChunks = [];
+    let rawAccum = "";
+    // B-Q5: report a 200-with-error JSON body (both the first-chunk fast path
+    // and the split-across-chunks case caught only by the accumulated tail).
+    function reportInlineError(raw) {
+      let msg = "Rate limit";
+      try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
+      const limited = raw.includes("FreeUsageLimitError");
+      console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, String(msg).slice(0, 200));
+      res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
+    }
     zenRes.on("data", (c) => {
       rxBytes += c.length;
+      rawAccum = rawAccum.length >= 16384 ? rawAccum.slice(-8192) + c.toString() : rawAccum + c.toString();
       if (stopped) return;
       if (firstChunk === null) {
         firstChunk = c;
@@ -1284,17 +1300,14 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
     });
     zenRes.on("end", () => {
       if (errBuffering) {
-        const raw = Buffer.concat(errChunks).toString();
-        let msg = "Rate limit";
-        try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
-        const limited = raw.includes("FreeUsageLimitError");
-        console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502}]`, String(msg).slice(0, 200));
-        return res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
+        return reportInlineError(Buffer.concat(errChunks).toString());
       }
       // Abnormal upstream close without response.completed → synthesize a
-      // finish (parity with pipeZenResponse's no-finish_reason handling).
+      // finish (parity with pipeZenResponse's no-finish_reason handling) —
+      // unless the raw tail is actually a split error body.
       if (!completed && !stopped) {
-        console.log("[ZEN RESPONSES ABORT] stream ended without response.completed");
+        if (responsesFirstChunkIsError(rawAccum)) return reportInlineError(rawAccum);
+        console.log(`[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
         finishUp(toolCount > 0 ? "tool_calls" : "stop");
       }
     });
@@ -1431,8 +1444,20 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
     let firstChunk = null;
     let errBuffering = false;
     const errChunks = [];
+    let rawAccum = "";
+    // B-Q5 (Anthropic side): split-across-chunks error bodies evade the
+    // first-chunk sniff — the accumulated raw tail is the backstop.
+    function reportInlineError(raw) {
+      let msg = "Rate limit";
+      try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
+      const limited = raw.includes("FreeUsageLimitError");
+      console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, String(msg).slice(0, 200));
+      if (res.headersSent) return res.end();
+      return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
+    }
     zenRes.on("data", (c) => {
       rxBytes += c.length;
+      rawAccum = rawAccum.length >= 16384 ? rawAccum.slice(-8192) + c.toString() : rawAccum + c.toString();
       if (stopped) return;
       if (firstChunk === null) {
         firstChunk = c;
@@ -1449,16 +1474,11 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
     });
     zenRes.on("end", () => {
       if (errBuffering) {
-        const raw = Buffer.concat(errChunks).toString();
-        let msg = "Rate limit";
-        try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
-        const limited = raw.includes("FreeUsageLimitError");
-        console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502}]`, String(msg).slice(0, 200));
-        if (res.headersSent) return res.end();
-        return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
+        return reportInlineError(Buffer.concat(errChunks).toString());
       }
       if (!completed && !stopped) {
-        console.log("[ZEN RESPONSES ABORT] stream ended without response.completed");
+        if (responsesFirstChunkIsError(rawAccum)) return reportInlineError(rawAccum);
+        console.log(`[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
         sendHeaders();
         finishUp(anyTool ? "tool_use" : "end_turn", outputTokens);
       }
