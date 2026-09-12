@@ -11,6 +11,17 @@ const PORT = process.env.PROXY_PORT || 6446;
 const OC_VERSION = "1.18.30";
 const PROXY_VERSION = "9";
 
+// ── Log levels ─────────────────────────────────────────────────────
+// LOG_LEVEL=debug|info|warn|error|silent (default info). Runtime request
+// chatter is info; degradation/abort notices are warn; upstream HTTP and
+// socket failures are error. Boot banner always prints.
+// Example: LOG_LEVEL=warn node server.mjs  → requests hidden, problems shown.
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3, silent: 4 };
+const LOG_LEVEL = LOG_LEVELS[String(process.env.LOG_LEVEL || "info").toLowerCase()] ?? 1;
+function log(level, ...args) {
+  if ((LOG_LEVELS[level] ?? 1) >= LOG_LEVEL) console.log(...args);
+}
+
 // ── API Keys ───────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
 let apiKeys = {};
@@ -65,6 +76,31 @@ function netCause(e) {
     EPIPE: "寫入已關閉的連線",
   }[e && e.code];
   return hint ? `${msg}（${hint}）` : msg;
+}
+
+// Upstream HTTP-error diagnostics: map status + message patterns to an
+// actionable cause for the console log (companion to netCause, which covers
+// socket-level failures; this one covers HTTP error bodies).
+function upstreamCause(status, msg) {
+  const m = String(msg || "");
+  if (status === 429 || /FreeUsageLimitError|rate limit|quota/i.test(m)) return "免費額度限流，稍後重試或換模型";
+  if (/temporarily overloaded|overloaded/i.test(m)) return "上游原廠過載（容量不足），稍後重試";
+  if (/Endpoint is unavailable|unavailable/i.test(m)) return "上游端點暫時下線，換模型";
+  if (status === 503) return "上游服務不可用，稍後重試或換模型";
+  if (status === 502) return "上游閘道錯誤，重試即可";
+  if (status === 500) return "上游內部錯誤，重試或換模型";
+  if (status === 504) return "上游閘道逾時（模型回太慢），縮小 max_tokens 或重試";
+  if (status === 400) return "請求被上游拒絕（參數/格式問題），檢查翻譯層";
+  if (status === 401 || status === 403) return "上游認證失敗，檢查指紋/金鑰";
+  if (status === 404) return "上游無此端點/模型，路由錯誤";
+  return "";
+}
+
+// Slice + append cause suffix for upstream-error log lines.
+function withCause(status, msg) {
+  const text = String(msg ?? "").slice(0, 200);
+  const cause = upstreamCause(status, msg);
+  return cause ? `${text}（${cause}）` : text;
 }
 
 // Active zero-cost model snapshot from https://models.opencode.ai/api.json → ["opencode"].models
@@ -288,7 +324,7 @@ function pipeZenResponse(zenOpts, body, stream, res) {
           const p = JSON.parse(Buffer.concat(chunks).toString());
           msg = p.error?.message || p.message || msg;
         } catch {}
-        console.log(`[ZEN UPSTREAM ${zenRes.statusCode} ${TAG}]`, String(msg).slice(0, 200));
+        log("error", `[ZEN UPSTREAM ${zenRes.statusCode} ${TAG}]`, withCause(zenRes.statusCode, msg));
         if (!res.headersSent) {
           res.status(zenRes.statusCode).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
         }
@@ -308,7 +344,7 @@ function pipeZenResponse(zenOpts, body, stream, res) {
     function stopForReasoningCap() {
       if (stopped) return;
       stopped = true;
-      console.log(`[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+      log("warn", `[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
       req.destroy();
       if (stream && headersSent && !res.writableEnded) {
         const fin = { choices: [{ index: 0, delta: {}, finish_reason: "length" }] };
@@ -355,7 +391,7 @@ function pipeZenResponse(zenOpts, body, stream, res) {
             const parsed = JSON.parse(str);
             if (parsed.error || parsed.type === "error") {
               const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
-              console.log("[ZEN RATE LIMITED]", errMsg);
+              log("error", "[ZEN RATE LIMITED]", withCause(429, errMsg));
               if (!res.headersSent) {
                 res.status(429).json({
                   error: { message: errMsg + " (free model rate limit)", type: "rate_limit_error", code: "rate_limit_exceeded" }
@@ -392,7 +428,7 @@ function pipeZenResponse(zenOpts, body, stream, res) {
 
     zenRes.on("end", () => {
       if (!headersSent && !firstChunk) {
-        console.log("[ZEN EMPTY] No response from Zen API");
+        log("warn", "[ZEN EMPTY] No response from Zen API");
         if (!res.headersSent) {
           res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
         }
@@ -401,16 +437,18 @@ function pipeZenResponse(zenOpts, body, stream, res) {
       // Upstream closed mid-stream without finish_reason/[DONE]: synthesize a
       // clean ending so OpenAI SDK clients don't hang on an unterminated SSE.
       if (stream && headersSent && !stopped && !finishSeen && !res.writableEnded) {
+        log("warn", `[ZEN ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] upstream closed mid-stream — synthesized ending`);
         res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "length" }] })}\n\n`);
         res.write("data: [DONE]\n\n");
       }
+      if (headersSent && !stopped) log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B${stream ? " stream" : " sync"}]`);
       if (headersSent && !res.writableEnded) res.end();
     });
   });
 
   req.on("error", (e) => {
     if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    console.log(`[ZEN ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
+    log("error", `[ZEN ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
     if (!res.headersSent) {
       res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
     }
@@ -418,7 +456,7 @@ function pipeZenResponse(zenOpts, body, stream, res) {
 
   req.on("timeout", () => {
     req.destroy();
-    console.log(`[ZEN TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
+    log("error", `[ZEN TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
     if (!res.headersSent) {
       res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
     }
@@ -461,7 +499,7 @@ function anthropicToolChoiceToOpenAI(tc) {
   if (tc.type === "tool" && tc.name) {
     return { type: "function", function: { name: tc.name } };
   }
-  console.log("[ANT] Unknown tool_choice type, dropping:", JSON.stringify(tc));
+  log("warn", "[ANT] Unknown tool_choice type, dropping:", JSON.stringify(tc));
   return undefined;
 }
 
@@ -614,7 +652,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
           404: "not_found_error",
           429: "rate_limit_error",
         })[zenRes.statusCode] || "api_error";
-        console.log(`[ZEN UPSTREAM ${zenRes.statusCode} ${TAG}]`, String(msg).slice(0, 200));
+        log("error", `[ZEN UPSTREAM ${zenRes.statusCode} ${TAG}]`, withCause(zenRes.statusCode, msg));
         if (!res.headersSent) {
           res.status(zenRes.statusCode).json({ type: "error", error: { type: errType, message: msg } });
         }
@@ -704,7 +742,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
         if (delta.reasoning_content) {
           reasoningTokens += Math.ceil(delta.reasoning_content.length / 4);
           if (reasoningTokens > REASONING_CAP && contentIdx === 0 && toolIdx === -1) {
-            console.log(`[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+            log("warn", `[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
             req.destroy();
             sendHeaders();
             sendSSE("message_delta", {
@@ -782,6 +820,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
             usage: { output_tokens: outputTokens },
           });
           sendSSE("message_stop", { type: "message_stop" });
+          log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
         }
       }
     });
@@ -797,6 +836,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
       // blocks and synthesize message_delta/message_stop so Anthropic SDK
       // clients don't hang waiting for a proper stream termination.
       if (!finishHandled && !res.writableEnded) {
+        log("warn", `[ZEN ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] upstream closed without finish_reason — synthesized ending`);
         const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
         for (let i = 0; i < totalBlocks; i++) {
           if (i === 0 && textBlockClosed) continue; // P1.1: same skip as finish handler
@@ -815,7 +855,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
 
   req.on("error", (e) => {
     if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    console.log(`[ZEN ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
+    log("error", `[ZEN ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
     if (!res.headersSent) {
       res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
     }
@@ -823,7 +863,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
 
   req.on("timeout", () => {
     req.destroy();
-    console.log(`[ZEN TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
+    log("error", `[ZEN TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
     if (!res.headersSent) {
       res.status(504).json({ type: "error", error: { type: "timeout_error", message: "Upstream timeout" } });
     }
@@ -895,7 +935,7 @@ function pipeZenResponses(zenOpts, body, stream, res) {
           const p = JSON.parse(Buffer.concat(chunks).toString());
           msg = p.error?.message || p.message || msg;
         } catch {}
-        console.log(`[ZEN RESPONSES UPSTREAM ${zenRes.statusCode} ${TAG}]`, String(msg).slice(0, 200));
+        log("error", `[ZEN RESPONSES UPSTREAM ${zenRes.statusCode} ${TAG}]`, withCause(zenRes.statusCode, msg));
         if (!res.headersSent) {
           res.status(zenRes.statusCode).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
         }
@@ -925,22 +965,24 @@ function pipeZenResponses(zenOpts, body, stream, res) {
     });
     zenRes.on("end", () => {
       if (!headersSent && !res.headersSent) {
+        log("warn", `[ZEN EMPTY ${TAG} +${Date.now() - t0}ms] No response from upstream`);
         res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
         return;
       }
+      if (headersSent) log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B${stream ? " stream" : " sync"}]`);
       if (headersSent && !res.writableEnded) res.end();
     });
   });
   req.on("error", (e) => {
     if (res.writableEnded) return; // self-induced destroy (timeout) already logged
-    console.log(`[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
+    log("error", `[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
     if (!res.headersSent) {
       res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
     }
   });
   req.on("timeout", () => {
     req.destroy();
-    console.log(`[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
+    log("error", `[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
     if (!res.headersSent) {
       res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
     }
@@ -1035,7 +1077,7 @@ function chatToResponsesRequest(c) {
     if (want && Array.isArray(out.tools)) out.tools = out.tools.filter((t) => t.name === want);
     if (out.tools && out.tools.length) {
       out.tool_choice = "auto";
-      console.log("[RES-DEGRADE] tool_choice", JSON.stringify(tc), "→ auto (upstream supports only auto)");
+      log("warn", "[RES-DEGRADE] tool_choice", JSON.stringify(tc), "→ auto (upstream supports only auto)");
     } else {
       delete out.tools;
     }
@@ -1121,7 +1163,7 @@ function responsesNon200(zenRes, res, anthropicShape, tag) {
       const p = JSON.parse(Buffer.concat(chunks).toString());
       msg = p.error?.message || p.message || msg;
     } catch {}
-    console.log(`[ZEN RESPONSES UPSTREAM ${status} ${tag || "??"}]`, String(msg).slice(0, 200));
+    log("error", `[ZEN RESPONSES UPSTREAM ${status} ${tag || "??"}]`, withCause(status, msg));
     if (res.headersSent) return;
     if (anthropicShape) {
       const errType = ({ 400: "invalid_request_error", 401: "authentication_error", 403: "authentication_error", 404: "not_found_error", 429: "rate_limit_error" })[status] || "api_error";
@@ -1166,13 +1208,16 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
         try { d = JSON.parse(raw); } catch {}
         if (!d) {
           const frag = raw.slice(0, 200);
+          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
           return res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
         }
         if (d.error || d.type === "error") {
           const msg = d.error?.message || d.message || "Upstream error";
           const limited = raw.includes("FreeUsageLimitError");
+          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
           return res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
         }
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
         res.json(responsesObjectToChatResponse(d, chatModel));
       });
       return;
@@ -1224,7 +1269,7 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
     function stopForReasoningCap() {
       if (stopped) return;
       stopped = true;
-      console.log(`[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+      log("warn", `[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
       req.destroy();
       finishUp("length");
     }
@@ -1265,7 +1310,7 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
           streamUsage = { prompt_tokens: u.input_tokens || 0, completion_tokens: u.output_tokens || 0, total_tokens: u.total_tokens || (u.input_tokens || 0) + (u.output_tokens || 0) };
         }
         const reason = toolCount > 0 ? "tool_calls" : resp.status === "incomplete" ? "length" : "stop";
-        if (t === "response.failed") console.log("[ZEN RESPONSES FAILED]", String(resp.error?.message || "").slice(0, 200));
+        if (t === "response.failed") log("warn", "[ZEN RESPONSES FAILED]", String(resp.error?.message || "").slice(0, 200));
         finishUp(reason, streamUsage);
       }
     };
@@ -1280,7 +1325,7 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
       let msg = "Rate limit";
       try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
       const limited = raw.includes("FreeUsageLimitError");
-      console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, String(msg).slice(0, 200));
+      log("error", `[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, withCause(limited ? 429 : 502, msg));
       res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
     }
     zenRes.on("data", (c) => {
@@ -1309,19 +1354,21 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
       // unless the raw tail is actually a split error body.
       if (!completed && !stopped) {
         if (responsesFirstChunkIsError(rawAccum)) return reportInlineError(rawAccum);
-        console.log(`[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
+        log("warn", `[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
         finishUp(toolCount > 0 ? "tool_calls" : "stop");
+      } else if (completed && !stopped) {
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
       }
     });
   });
   req.on("error", (e) => {
     if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    console.log(`[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
+    log("error", `[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
     if (!res.headersSent) res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
   });
   req.on("timeout", () => {
     req.destroy();
-    console.log(`[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
+    log("error", `[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
     if (!res.headersSent) res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
   });
   req.write(body);
@@ -1345,13 +1392,16 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
         try { d = JSON.parse(raw); } catch {}
         if (!d) {
           const frag = raw.slice(0, 200);
+          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
           return res.status(502).json({ type: "error", error: { type: "upstream_error", message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response" } });
         }
         if (d.error || d.type === "error") {
           const msg = d.error?.message || d.message || "Upstream error";
           const limited = raw.includes("FreeUsageLimitError");
+          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
           return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
         }
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
         res.json(openAIToAnthropic(responsesObjectToChatResponse(d, chatModel), chatModel, inputTokens));
       });
       return;
@@ -1427,7 +1477,7 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
         reasoningTokens += Math.ceil((d.delta || "").length / 4);
         if (!anyTool && reasoningTokens > REASONING_CAP && !textOpen) {
           stopped = true;
-          console.log(`[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+          log("warn", `[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
           req.destroy();
           sendHeaders();
           finishUp("max_tokens", reasoningTokens);
@@ -1438,7 +1488,7 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
         completed = true;
         const resp = d.response || {};
         outputTokens = resp.usage?.output_tokens || 0;
-        if (t === "response.failed") console.log("[ZEN RESPONSES FAILED]", String(resp.error?.message || "").slice(0, 200));
+        if (t === "response.failed") log("warn", "[ZEN RESPONSES FAILED]", String(resp.error?.message || "").slice(0, 200));
         const stop = anyTool ? "tool_use" : resp.status === "incomplete" ? "max_tokens" : "end_turn";
         sendHeaders();
         finishUp(stop, outputTokens);
@@ -1455,7 +1505,7 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
       let msg = "Rate limit";
       try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
       const limited = raw.includes("FreeUsageLimitError");
-      console.log(`[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, String(msg).slice(0, 200));
+      log("error", `[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, withCause(limited ? 429 : 502, msg));
       if (res.headersSent) return res.end();
       return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
     }
@@ -1482,20 +1532,22 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
       }
       if (!completed && !stopped) {
         if (responsesFirstChunkIsError(rawAccum)) return reportInlineError(rawAccum);
-        console.log(`[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
+        log("warn", `[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
         sendHeaders();
         finishUp(anyTool ? "tool_use" : "end_turn", outputTokens);
+      } else if (completed && !stopped) {
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
       }
     });
   });
   req.on("error", (e) => {
     if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    console.log(`[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
+    log("error", `[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
     if (!res.headersSent) res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
   });
   req.on("timeout", () => {
     req.destroy();
-    console.log(`[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
+    log("error", `[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
     if (!res.headersSent) res.status(504).json({ type: "error", error: { type: "timeout_error", message: "Upstream timeout" } });
   });
   req.write(body);
@@ -1582,14 +1634,14 @@ app.post("/v1/chat/completions", (req, res) => {
 
   if (isSparkModel(model)) {
     // Spark home endpoint is upstream /zen/v1/responses — translate chat ⇄ responses.
-    console.log("[OAI→RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
+    log("info", "[OAI→RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
     const respBody = chatToResponsesRequest(req.body);
     const { body, options } = zenResponsesRequest(respBody, sessionId);
     options._tag = `OAI→RES ${user} ${model}`;
     return pipeResponsesAsChat(options, body, !!stream, res, model);
   }
 
-  console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
+  log("info", "[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
 
   const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId, req.body);
   options._tag = `OAI ${user} ${model}`;
@@ -1623,7 +1675,7 @@ app.post("/v1/responses", (req, res) => {
   }
 
   const sessionId = getSession(user);
-  console.log("[RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync");
+  log("info", "[RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync");
 
   const { body, options } = zenResponsesRequest(req.body, sessionId);
   options._tag = `RES ${user} ${model}`;
@@ -1679,7 +1731,7 @@ app.post("/v1/messages", async (req, res) => {
 
   if (isSparkModel(model)) {
     // Spark home endpoint is upstream /zen/v1/responses — translate.
-    console.log("[ANT→RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
+    log("info", "[ANT→RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
     const chatReq = { model, messages, stream: !!stream };
     if (tools?.length) chatReq.tools = tools;
     if (mappedChoice) chatReq.tool_choice = mappedChoice;
@@ -1693,7 +1745,7 @@ app.post("/v1/messages", async (req, res) => {
     return pipeResponsesAsAnthropic(options, body, !!stream, res, model, inputTokens);
   }
 
-  console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
+  log("info", "[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
 
   const { body, options } = zenRequest(model, messages, stream, tools, mappedChoice, sessionId, req.body);
   options._tag = `ANT ${user} ${model}`;
@@ -1702,9 +1754,13 @@ app.post("/v1/messages", async (req, res) => {
     pipeZenAsAnthropic(options, body, model, res, inputTokens);
   } else {
     try {
+      const t0 = Date.now();
+      const TAG = options._tag || "??";
       const zenResp = await zenRequestFull(options, body);
+      const rxLen = typeof zenResp.raw === "string" ? zenResp.raw.length : 0;
       if (zenResp.status === 429) {
         const errMsg = zenResp.data?.error?.message || "Rate limit exceeded";
+        log("error", `[ZEN UPSTREAM 429 ${TAG} +${Date.now() - t0}ms rx=${rxLen}B]`, withCause(429, errMsg));
         return res.status(429).json({
           type: "error", error: { type: "rate_limit_error", message: errMsg + " (free model rate limit)" },
         });
@@ -1718,6 +1774,7 @@ app.post("/v1/messages", async (req, res) => {
           403: "authentication_error",
           404: "not_found_error",
         })[zenResp.status] || "api_error";
+        log("error", `[ZEN UPSTREAM ${zenResp.status} ${TAG} +${Date.now() - t0}ms rx=${rxLen}B]`, withCause(zenResp.status, zenResp.data.error?.message));
         return res.status(zenResp.status >= 400 ? zenResp.status : 502).json({
           type: "error", error: { type: errType, message: zenResp.data.error?.message || "Upstream error" },
         });
@@ -1726,13 +1783,15 @@ app.post("/v1/messages", async (req, res) => {
         // P1.2: data null means upstream sent non-JSON (e.g. HTML error page) —
         // surface the raw fragment instead of a misleading canned message.
         const rawFrag = typeof zenResp.raw === "string" ? zenResp.raw.slice(0, 200) : "";
+        log("error", `[ZEN UPSTREAM ${zenResp.status} ${TAG} +${Date.now() - t0}ms rx=${rxLen}B]`, withCause(zenResp.status, rawFrag || "Invalid upstream response"));
         return res.status(502).json({
           type: "error", error: { type: "upstream_error", message: rawFrag ? `Invalid upstream response: ${rawFrag}` : "Invalid upstream response" },
         });
       }
+      log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxLen}B sync]`);
       res.json(openAIToAnthropic(zenResp.data, model, inputTokens));
     } catch (e) {
-      console.log("[ZEN ERROR]", netCause(e));
+      log("error", "[ZEN ERROR]", netCause(e));
       res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
     }
   }

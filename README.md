@@ -205,6 +205,7 @@ sudo systemctl enable --now opencode-proxy
 | `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | Model registry URL (http allowed, e.g. LAN mirror) |
 | `REASONING_CAP` | `65536` | Stream reasoning-token fuse before force-stop; `0` disables |
 | `MAX_TOKENS_DEFAULT` | `32768` | Injected `max_tokens` when client sends no length cap; `0` disables |
+| `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 
 ## How it works
 
