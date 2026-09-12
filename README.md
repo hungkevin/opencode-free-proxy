@@ -207,6 +207,49 @@ sudo systemctl enable --now opencode-proxy
 | `MAX_TOKENS_DEFAULT` | `32768` | Injected `max_tokens` when client sends no length cap; `0` disables |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 
+### Log levels (`LOG_LEVEL`)
+
+```bash
+LOG_LEVEL=warn node server.mjs   # Git Bash / Linux
+set LOG_LEVEL=warn && node server.mjs   # Windows CMD / PowerShell
+```
+
+Set once at startup (changing it requires a restart). Case-insensitive;
+unknown values fall back to `info`.
+
+| Level | Shows | For |
+|-------|-------|-----|
+| `debug` | Same as `info` for now (reserved) | — |
+| `info` (default) | Everything: request lines + success lines + warnings + errors | Daily dev, debugging |
+| `warn` | Warnings and above: degrades, reasoning-cap force-stops, aborted-stream synthesis, upstream errors | **Daily watch**: no flood, lines appear only when something is wrong |
+| `error` | Errors only: upstream 4xx/5xx, connection failures, timeouts | Only the bad news |
+| `silent` | Nothing (boot banner still prints, so you know it started) | Background runs |
+
+What each line looks like:
+
+```
+# info — two lines per request, success shows latency + bytes received
+[ANT] 2026-09-12T02:14:32.200Z admin nemotron-3.5-lightning-free sync msgs: 2
+[REQ DONE ANT admin nemotron-3.5-lightning-free +3210ms rx=52KB sync]
+
+# warn — degradation / fuse / synthesized endings
+[RES-DEGRADE] tool_choice {...} → auto (upstream supports only auto)
+[ZEN REASONING CAP] 70000 reasoning tokens, no content → force stop
+[ZEN ABORT OAI admin mimo-v2.5-free +8120ms rx=1832B] upstream closed mid-stream — synthesized ending
+
+# error — every line carries a Chinese cause suffix
+[ZEN UPSTREAM 503 OAI admin ling-3.0-flash-fin-free] ...Endpoint is unavailable.（上游端點暫時下線，換模型）
+[ZEN TIMEOUT ANT admin nemotron-3.5-lightning-free +120045ms rx=0B] 上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）
+[ZEN ERROR OAI admin xxx +320ms rx=0B] connect ECONNREFUSED 127.0.0.1:443（連線被拒（上游服務 down 或位址/埠錯誤））
+```
+
+Reading the suffix: `+120045ms` = elapsed, `rx=0B` = nothing received
+(never connected) vs `rx=52KB` = broke mid-transfer.
+
+Recommendation: run `LOG_LEVEL=warn` for daily use, switch back to
+default `info` when tracing a single issue (request→completion pairs),
+`error` when you only want failures.
+
 ## How it works
 
 ```
