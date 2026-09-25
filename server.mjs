@@ -8,8 +8,8 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PROXY_PORT || 6446;
-const OC_VERSION = "1.18.30";
-const PROXY_VERSION = "9";
+const OC_VERSION = "1.18.31";
+const PROXY_VERSION = "10";
 
 // ── Log levels ─────────────────────────────────────────────────────
 // LOG_LEVEL=debug|info|warn|error|silent (default info). Runtime request
@@ -60,6 +60,49 @@ function ocId(prefix) {
   const ts = Date.now().toString(16);
   const rnd = crypto.randomBytes(12).toString("base64url").slice(0, 16);
   return `${prefix}_${ts}${rnd}`;
+}
+
+// ── Zen free-tier fingerprint (upstream gate, verified 2026-09-25) ─
+// The Zen free tier now only answers requests that look like they came
+// from inside OpenCode; anything else gets
+//   403 {"type":"error","error":{"type":"FreeTierError",
+//        "message":"... OpenCode's free tier can only be used from within OpenCode"}}
+// Differential probes (review/probe_freetier*.mjs, probe_responses_*.mjs)
+// isolated three NECESSARY conditions — violating any single one → 403:
+//   1. x-opencode-session must be `ses_` + exactly 26 lowercase hex chars
+//      (a timestamp+base64url id, missing header, wrong length or case → 403)
+//   2. tools must contain all five OpenCode built-in names
+//      bash / edit / glob / grep / read (names only — schemas and
+//      descriptions are irrelevant; extra user tools may coexist;
+//      1, 2, 4 tools or five unrelated names → 403)
+//   3. the upstream request must be `stream: true` (stream:false → 403),
+//      on BOTH /zen/v1/chat/completions and /zen/v1/responses
+// x-opencode-client cli|desktop, User-Agent and Accept are NOT checked.
+// Reference implementation that keeps working: oc2api/server/zen.js.
+const ZEN_COMPAT_TOOL_NAMES = ["bash", "edit", "glob", "grep", "read"];
+const ZEN_COMPAT_TOOL_DESCRIPTION =
+  "Compatibility marker only. Do not call or select this function. Use tools explicitly supplied by the user instead.";
+
+function appendZenCompatTools(tools, shape) {
+  const out = Array.isArray(tools) ? tools.filter((t) => t && typeof t === "object") : [];
+  const nameOf = (t) => (shape === "responses" ? t.name || t.function?.name : t.function?.name);
+  const seen = new Set(out.map(nameOf).filter(Boolean));
+  for (const name of ZEN_COMPAT_TOOL_NAMES) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(
+      shape === "responses"
+        ? { type: "function", name, description: ZEN_COMPAT_TOOL_DESCRIPTION, parameters: { type: "object", properties: {} } }
+        : { type: "function", function: { name, description: ZEN_COMPAT_TOOL_DESCRIPTION, parameters: { type: "object", properties: {} } } },
+    );
+  }
+  return out;
+}
+
+// Zen free layer requires ses_ + 26 lowercase hex (oc2api's zenSessionID).
+// The old ocId("ses") (timestamp + base64url) is rejected by the gate.
+function zenSessionId() {
+  return "ses_" + crypto.randomBytes(13).toString("hex");
 }
 
 // Connection diagnostics: translate Node socket errors into an actionable
@@ -240,7 +283,7 @@ function getSession(user) {
   const s = userSessions[user];
   if (!s || SESSION_TTL_MS <= 0 || now - s.ts > s.ttl) {
     const ttl = SESSION_TTL_MS + Math.floor(Math.random() * (SESSION_JITTER_MS + 1));
-    userSessions[user] = { id: ocId("ses"), ts: now, ttl };
+    userSessions[user] = { id: zenSessionId(), ts: now, ttl };
   }
   return userSessions[user].id;
 }
@@ -266,9 +309,16 @@ const REASONING_CAP = parseInt(process.env.REASONING_CAP || "65536", 10);
 const DEFAULT_MAX_TOKENS = parseInt(process.env.MAX_TOKENS_DEFAULT || "32768", 10);
 
 function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extra = {}) {
-  const reqBody = { model, messages, stream: !!stream };
-  if (tools?.length) reqBody.tools = tools;
-  if (tool_choice) reqBody.tool_choice = tool_choice;
+  // Free-tier fingerprint (see Zen free-tier note above): upstream is ALWAYS
+  // asked to stream — a sync client request is aggregated to JSON locally
+  // (pipeZenResponse sync branch / zenRequestFull) — and the five OpenCode
+  // built-in tools are always present. When the client sent no tools of its
+  // own, tool_choice:"none" keeps the model from picking the compat markers.
+  const reqBody = { model, messages, stream: true, stream_options: { include_usage: true } };
+  const hadUserTools = Array.isArray(tools) && tools.length > 0;
+  reqBody.tools = appendZenCompatTools(tools, "chat");
+  if (!hadUserTools) reqBody.tool_choice = "none";
+  else if (tool_choice) reqBody.tool_choice = tool_choice;
   // Forward client-side generation controls to Zen (was dropped before,
   // which let reasoning models think forever with no max_tokens cap).
   for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "seed"]) {
@@ -295,6 +345,7 @@ function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extr
       headers: {
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(body),
+        "Accept": "text/event-stream",
         "Authorization": "Bearer public",
         "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
         "x-opencode-client": "cli",
@@ -307,8 +358,128 @@ function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extr
   };
 }
 
+// ── SSE → JSON aggregation (sync clients, stream:true upstream) ────
+// The upstream free tier only answers stream:true requests, so a client
+// that wants a single JSON reply gets the SSE aggregated here instead.
+
+// Accumulate an OpenAI chat SSE transcript into one chat.completion object.
+function aggregateChatSSE(raw) {
+  let id = "", created = 0, model = "", finish = null, usage = null;
+  let content = "", reasoning = "";
+  const toolCalls = new Map();
+  let sawChoices = false;
+  for (const line of String(raw || "").split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let p;
+    try { p = JSON.parse(payload); } catch { continue; }
+    if (p.id && !id) id = p.id;
+    if (p.created && !created) created = p.created;
+    if (p.model && !model) model = p.model;
+    if (p.usage) usage = p.usage;
+    if (!Array.isArray(p.choices) || !p.choices.length) continue; // usage/cost chunks
+    sawChoices = true;
+    for (const ch of p.choices) {
+      if (!ch || typeof ch !== "object") continue;
+      if (ch.finish_reason) finish = ch.finish_reason;
+      const d = ch.delta || {};
+      if (typeof d.content === "string") content += d.content;
+      if (typeof d.reasoning_content === "string") reasoning += d.reasoning_content;
+      if (!Array.isArray(d.tool_calls)) continue;
+      for (const tc of d.tool_calls) {
+        if (!tc || typeof tc !== "object") continue;
+        const idx = Number.isInteger(tc.index) ? tc.index : toolCalls.size;
+        if (!toolCalls.has(idx)) toolCalls.set(idx, { id: "", type: "", name: "", args: "" });
+        const cur = toolCalls.get(idx);
+        if (tc.id) cur.id = tc.id;
+        if (tc.type) cur.type = tc.type;
+        if (tc.function?.name) cur.name = tc.function.name;
+        if (typeof tc.function?.arguments === "string") cur.args += tc.function.arguments;
+      }
+    }
+  }
+  if (!sawChoices) return null;
+  const message = { role: "assistant", content };
+  if (reasoning) message.reasoning_content = reasoning;
+  if (toolCalls.size) {
+    message.tool_calls = [...toolCalls.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, t]) => ({
+        id: t.id || ocId("toolu"),
+        type: t.type || "function",
+        function: { name: t.name, arguments: t.args },
+      }));
+  }
+  const out = {
+    id: id || ocId("chatcmpl"),
+    object: "chat.completion",
+    created: created || Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, finish_reason: finish || (toolCalls.size ? "tool_calls" : "stop") }],
+  };
+  if (usage) out.usage = usage;
+  return out;
+}
+
+// Accumulate a Responses-API SSE transcript; the terminal event carries the
+// complete response object (output, usage, status).
+function aggregateResponsesSSE(raw) {
+  let terminal = null;
+  for (const line of String(raw || "").split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let p;
+    try { p = JSON.parse(payload); } catch { continue; }
+    if ((p.type === "response.completed" || p.type === "response.incomplete" || p.type === "response.failed") && p.response) {
+      terminal = p.response;
+    }
+  }
+  return terminal;
+}
+
+// First error-shaped payload inside an SSE transcript (200-with-inline-error).
+function sseErrorPayload(raw) {
+  for (const line of String(raw || "").split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let p;
+    try { p = JSON.parse(payload); } catch { continue; }
+    if (p.error || p.type === "error") return p;
+  }
+  return null;
+}
+
+// Buffer → { json } (chat.completion / error object) | {} when unusable.
+function coerceChatSyncBody(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return {};
+  if (t.startsWith("{")) {
+    try { return { json: JSON.parse(raw) }; } catch { return {}; }
+  }
+  const data = aggregateChatSSE(raw);
+  if (data) return { json: data };
+  const err = sseErrorPayload(raw);
+  return err ? { json: err } : {};
+}
+
+// Buffer → { json } (Responses object / error object) | {} when unusable.
+function coerceResponsesSyncBody(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return {};
+  if (t.startsWith("{")) {
+    try { return { json: JSON.parse(raw) }; } catch { return {}; }
+  }
+  const data = aggregateResponsesSSE(raw);
+  if (data) return { json: data };
+  const err = sseErrorPayload(raw);
+  return err ? { json: err } : {};
+}
+
 // Pipe Zen response to client (OpenAI format passthrough)
-function pipeZenResponse(zenOpts, body, stream, res) {
+function pipeZenResponse(zenOpts, body, stream, res, model) {
   const TAG = zenOpts._tag || "??";
   const t0 = Date.now();
   let rxBytes = 0;
@@ -328,6 +499,44 @@ function pipeZenResponse(zenOpts, body, stream, res) {
         if (!res.headersSent) {
           res.status(zenRes.statusCode).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
         }
+      });
+      return;
+    }
+    // Sync client + stream:true upstream (free-tier fingerprint): buffer the
+    // whole SSE transcript and answer with one aggregated JSON object.
+    if (!stream) {
+      const chunks = [];
+      zenRes.on("data", (c) => { rxBytes += c.length; chunks.push(c); });
+      zenRes.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        const { json } = coerceChatSyncBody(raw);
+        if (json && (json.error || json.type === "error")) {
+          const msg = json.error?.message || json.message || "Upstream error";
+          const limited = raw.includes("FreeUsageLimitError");
+          const status = limited ? 429 : 502;
+          log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
+          if (!res.headersSent) {
+            res.status(status).json({
+              error: {
+                message: limited ? msg + " (free model rate limit)" : msg,
+                type: limited ? "rate_limit_error" : "upstream_error",
+                code: limited ? "rate_limit_exceeded" : "upstream_error",
+              },
+            });
+          }
+          return;
+        }
+        if (!json) {
+          const frag = raw.slice(0, 200);
+          log("error", `[ZEN SYNC ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, withCause(502, frag || "Invalid upstream response"));
+          if (!res.headersSent) {
+            res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
+          }
+          return;
+        }
+        if (model) json.model = model;
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B sync]`);
+        res.json(json);
       });
       return;
     }
@@ -466,7 +675,10 @@ function pipeZenResponse(zenOpts, body, stream, res) {
   req.end();
 }
 
-// Collect full Zen response (non-streaming) and return parsed JSON
+// Collect full Zen response (non-streaming client) and return parsed JSON.
+// Upstream now always streams (free-tier fingerprint), so the SSE transcript
+// is aggregated into a chat.completion object; plain-JSON bodies (upstream
+// errors, legacy sync replies) still parse as before.
 function zenRequestFull(zenOpts, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(zenOpts, (zenRes) => {
@@ -474,11 +686,8 @@ function zenRequestFull(zenOpts, body) {
       zenRes.on("data", (c) => chunks.push(c));
       zenRes.on("end", () => {
         const raw = Buffer.concat(chunks).toString();
-        try {
-          resolve({ status: zenRes.statusCode, data: JSON.parse(raw), raw });
-        } catch {
-          resolve({ status: zenRes.statusCode, data: null, raw });
-        }
+        const { json } = coerceChatSyncBody(raw);
+        resolve({ status: zenRes.statusCode, data: json ?? null, raw });
       });
     });
     req.on("error", reject);
@@ -895,6 +1104,27 @@ function zenResponsesRequest(clientBody, sessionId) {
     }
   }
   delete reqBody.max_tokens;
+  // Free-tier fingerprint (see Zen free-tier note): upstream is always asked
+  // to stream — sync clients are aggregated locally (pipeZenResponses sync
+  // branch / pipeResponsesAsChat / pipeResponsesAsAnthropic) — and the five
+  // OpenCode built-in tools are always present. Upstream accepts ONLY
+  // tool_choice "auto" here (probe Q1: none/required/named → 400), so any
+  // other choice is degraded to auto before the compat tools are merged in.
+  if (reqBody.tool_choice !== undefined && reqBody.tool_choice !== "auto") {
+    const tc = reqBody.tool_choice;
+    if (tc === "none") {
+      delete reqBody.tools;
+    } else if (tc && typeof tc === "object") {
+      const want = tc.function?.name || tc.name;
+      if (want && Array.isArray(reqBody.tools)) {
+        reqBody.tools = reqBody.tools.filter((t) => (t.name || t.function?.name) === want);
+      }
+    }
+    delete reqBody.tool_choice;
+    log("warn", "[RES-DEGRADE] tool_choice", JSON.stringify(tc), "→ auto (upstream Responses supports only auto)");
+  }
+  reqBody.stream = true;
+  reqBody.tools = appendZenCompatTools(reqBody.tools, "responses");
   const body = JSON.stringify(reqBody);
   const requestId = ocId("msg");
   return {
@@ -907,6 +1137,7 @@ function zenResponsesRequest(clientBody, sessionId) {
       headers: {
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(body),
+        "Accept": "text/event-stream",
         "Authorization": "Bearer public",
         "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
         "x-opencode-client": "cli",
@@ -942,23 +1173,50 @@ function pipeZenResponses(zenOpts, body, stream, res) {
       });
       return;
     }
+    // Sync client + stream:true upstream (free-tier fingerprint): buffer the
+    // Responses SSE transcript and answer with the terminal response object.
+    if (!stream) {
+      const chunks = [];
+      zenRes.on("data", (c) => { rxBytes += c.length; chunks.push(c); });
+      zenRes.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        const { json } = coerceResponsesSyncBody(raw);
+        if (json && (json.error || json.type === "error")) {
+          const msg = json.error?.message || json.message || "Upstream error";
+          const limited = raw.includes("FreeUsageLimitError");
+          const status = limited ? 429 : 502;
+          log("error", `[ZEN RESPONSES UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
+          if (!res.headersSent) {
+            res.status(status).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_exceeded" : "upstream_error" } });
+          }
+          return;
+        }
+        if (!json) {
+          const frag = raw.slice(0, 200);
+          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, withCause(502, frag || "Invalid upstream response"));
+          if (!res.headersSent) {
+            res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
+          }
+          return;
+        }
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B sync]`);
+        res.json(json);
+      });
+      return;
+    }
     let headersSent = false;
     zenRes.on("data", (chunk) => {
       rxBytes += chunk.length;
       if (!headersSent) {
         headersSent = true;
-        if (stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Transfer-Encoding": "chunked",
-          });
-          res.flushHeaders();
-        } else {
-          res.writeHead(zenRes.statusCode, { "Content-Type": "application/json" });
-        }
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no",
+          "Transfer-Encoding": "chunked",
+        });
+        res.flushHeaders();
       }
       res.write(chunk);
       if (res.flush) res.flush();
@@ -1204,8 +1462,9 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
       zenRes.on("data", (c) => chunks.push(c));
       zenRes.on("end", () => {
         const raw = Buffer.concat(chunks).toString();
-        let d = null;
-        try { d = JSON.parse(raw); } catch {}
+        // Upstream always streams now (free-tier fingerprint) — coerce the
+        // SSE transcript back into a Responses object for the sync client.
+        const { json: d } = coerceResponsesSyncBody(raw);
         if (!d) {
           const frag = raw.slice(0, 200);
           log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
@@ -1388,8 +1647,9 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
       zenRes.on("data", (c) => chunks.push(c));
       zenRes.on("end", () => {
         const raw = Buffer.concat(chunks).toString();
-        let d = null;
-        try { d = JSON.parse(raw); } catch {}
+        // Upstream always streams now (free-tier fingerprint) — coerce the
+        // SSE transcript back into a Responses object for the sync client.
+        const { json: d } = coerceResponsesSyncBody(raw);
         if (!d) {
           const frag = raw.slice(0, 200);
           log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
@@ -1645,7 +1905,7 @@ app.post("/v1/chat/completions", (req, res) => {
 
   const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId, req.body);
   options._tag = `OAI ${user} ${model}`;
-  pipeZenResponse(options, body, stream, res);
+  pipeZenResponse(options, body, stream, res, model);
 });
 
 // ── Routes: Responses API (B1) ───────────────────────────────────────

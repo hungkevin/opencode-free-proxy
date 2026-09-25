@@ -22,22 +22,22 @@ models from `https://models.opencode.ai/api.json` at startup
 (filter: `cost.input === 0 && cost.output === 0 && status !== "deprecated"`).
 Always check `GET /v1/models` for the live list; the table below is a snapshot.
 
-| Model (snapshot 2026-09-11) | What it is | Reliability |
+| Model (snapshot 2026-09-25) | What it is | Reliability |
 |-------|-----------|-------------|
+| `space-bunny-free` | Space Bunny Free | new |
+| `mimo-v2.6-flash-free` | MiMo V2.6 Flash (**image input**) | new |
 | `muse-spark-1.3-contributor-free` | Muse Spark 1.3 (**responses only**) | Solid |
-| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 (**responses only**) | Solid |
+| `ling-3.0-flash-fin-free` | Ling 3.0 Flash | Intermittent |
 | `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning | Solid |
 | `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | Hit or miss |
-| `mimo-v2.5-free` | MiMo V2.5 | Solid |
-| `ling-3.0-flash-fin-free` | Ling 3.0 Flash | Intermittent |
 | `big-pickle` | Big Pickle (alias, name has no `free`) | Solid |
 
 All models support streaming, tool calls, and system messages.
 
 > Note: some models are usable upstream but excluded here on purpose —
-> e.g. `deepseek-v4-flash-free` still answers on `opencode.ai/zen/v1` but is
-> marked `deprecated` in the registry, so this proxy's active-only filter
-> rejects it with `400 Unknown model`. See `free_model.md` §2 for the rationale.
+> e.g. models marked `deprecated` in the registry are rejected locally with
+> `400 Unknown model` even though the endpoint still serves a few of them.
+> See `free_model.md` §2 for the rationale.
 
 ## API
 
@@ -86,11 +86,12 @@ curl http://localhost:6446/v1/responses \
 > `muse-spark*` models work on **all three endpoints** — chat/completions and
 > messages are served via automatic translation to the upstream Responses API
 > (their home endpoint). Note: upstream accepts `tool_choice: "auto"` only —
-> `"none"` drops the tools, `"required"`/named-function choices degrade to
-> auto (named keeps just that tool). All other models are served on
-> `/v1/chat/completions` and `/v1/messages` (they 500 upstream on
-> `/v1/responses`, which returns `400 wrong_endpoint` pointing at the right
-> one — Responses-for-everyone is Phase 2).
+> `"none"` drops the *user* tools (the mandatory OpenCode compat markers stay,
+> see “Zen free-tier gate” below), `"required"`/named-function choices degrade
+> to auto (named keeps just that tool, plus the compat markers). All other
+> models are served on `/v1/chat/completions` and `/v1/messages` (they 500
+> upstream on `/v1/responses`, which returns `400 wrong_endpoint` pointing at
+> the right one — Responses-for-everyone is Phase 2).
 
 ### Other endpoints
 
@@ -266,15 +267,43 @@ Your tool (Cursor, CLI, curl, etc.)
 
 The proxy adds `x-opencode-*` authentication headers that the Zen API requires. These were discovered by reverse engineering the opencode binary — without them, even `Authorization: Bearer public` gets rejected with `AuthError`.
 
+### Zen free-tier gate (403 `FreeTierError`)
+
+Since 2026-09 the Zen free tier only answers requests that look like they
+came from inside OpenCode — otherwise it returns:
+
+```
+403 {"type":"error","error":{"type":"FreeTierError",
+     "message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"}}
+```
+
+Differential probes (`review/probe_freetier*.mjs`, `review/probe_responses_*.mjs`)
+isolated three **necessary** conditions — breaking any single one → 403:
+
+1. `x-opencode-session` must be `ses_` + exactly **26 lowercase hex chars**
+   (missing header, wrong length, uppercase, non-hex → 403)
+2. `tools` must contain all five OpenCode built-in names
+   **`bash` / `edit` / `glob` / `grep` / `read`** — names only, schemas and
+   descriptions are irrelevant; extra user tools may coexist; 1/2/4 tools or
+   five unrelated names → 403
+3. the upstream request must be **`stream: true`** — on both
+   `/zen/v1/chat/completions` and `/zen/v1/responses` (`stream:false` → 403)
+
+`x-opencode-client` (`cli`/`desktop`), `User-Agent` and `Accept` are *not*
+checked. This proxy satisfies all three (same approach as `oc2api`), and
+since every upstream request streams, sync client requests are aggregated
+back into a single JSON object locally.
+
 ### Zen API auth headers (for the curious)
 
 ```
 Authorization: Bearer public
-User-Agent: opencode/1.15.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13
+User-Agent: opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13
+Accept: text/event-stream
 x-opencode-client: cli
 x-opencode-project: global
 x-opencode-request: msg_<unique_id>
-x-opencode-session: ses_<unique_id>
+x-opencode-session: ses_<26 lowercase hex chars>
 ```
 
 ## License

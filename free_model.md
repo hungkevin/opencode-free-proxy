@@ -80,6 +80,34 @@ Fallback:內建 7 模型快照(DEFAULT_MODELS,含完整 metadata)
 
 ---
 
+## 5. 免費層指紋閘門（2026-09-25 實測）
+
+Zen 免費層新增伺服器端閘門：不像 OpenCode 客戶端的請求一律回
+
+```
+403 {"type":"error","error":{"type":"FreeTierError",
+     "message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"}}
+```
+
+以差分探針（`review/probe_freetier*.mjs`、`review/probe_responses_freetier.mjs`、
+`review/probe_responses_tc.mjs`）逐一變因實測，下列三項皆為**必要條件**，
+破壞任一項即 403（三項全對 = 200）：
+
+| # | 條件 | 驗證過的反例 |
+|---|------|-------------|
+| 1 | `x-opencode-session` = `ses_` + **恰好 26 位小寫十六進位** | 缺 header、13/25/27 位、大寫、非 hex 字元、`ocId("ses")` 的 timestamp+base64url → 403 |
+| 2 | `tools` 必含 OpenCode 內建五件組名稱 `bash`/`edit`/`glob`/`grep`/`read` | 0 個、1/2/4 個、五個隨機名 → 403；schema/description 不驗，用戶工具可並存 |
+| 3 | 上游請求 `stream: true` | `stream: false` → 403（`/zen/v1/chat/completions` 與 `/zen/v1/responses` 皆同） |
+
+- `x-opencode-client`（cli/desktop）、`User-Agent`、`Accept` **不**驗證。
+- `tool_choice`：chat 端點接受 `"none"`（無用戶工具時遮蔽相容工具）；
+  responses 端點**只接受 `"auto"`**，`none`/`required`/具名 → 400（Q1 實測）。
+- 對照參考：`oc2api/server/zen.js`（一直照此三條件發送，故未受閘門影響）。
+- 對策見 `server.mjs`：session 改 `zenSessionId()`、一律 `stream:true` +
+  相容工具注入，同步請求在本機把 SSE 聚合回 JSON。
+
+---
+
 ## 附錄 A:opencode-go 端點(`/zen/go/v1`)
 
 > API:`https://opencode.ai/zen/go/v1` · 認證:**需真實 API key**(`Bearer public` 回 `401 AuthError`)
