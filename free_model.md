@@ -502,3 +502,101 @@ metadata 併入，過濾條件同 oc2api：`id === "big-pickle" || id.endsWith("
 - **工具**:`tool_call` — 是否支援 function calling。
 - **Context / 輸出上限**:`limit.context` / `limit.output`,單位 tokens(`K`=千,`M`=百萬);後者可作為 `OUTPUT_LIMIT`(注入 `max_completion_tokens`)的精準依據。
 - **費用判定**:一律以 `cost.input === 0 && cost.output === 0` 為準,不以名稱判斷。
+
+---
+
+## 附錄 C: P0–P3 審查問題與解決方式彙總 (v11.1, 2026-10-28)
+
+> 本次修復以 **TDD** 推進：先寫 failing test → 確認紅燈 → 最小實作 → 綠燈 → 重構。
+> 所有測試置於 `test/`，`npm test` (`node --test`) 全套 **27/27 通過**。
+> 兩次核心 commit：`4dd23a8`（初始資產/形狀）、`1e7c69b`（P0→P3 全修復 + 測試）。
+
+---
+
+### P0 級：崩潰 / 服務不可用
+
+| 編號 | 問題 | 根因 | 解決方式 | 測試 |
+|------|------|------|----------|------|
+| **P0-1** | 畸形 Anthropic body / 非正整數 `max_completion_tokens` 導致未捕獲例外 → 進程崩潰 | `anthropicToOpenAI` 直接存取 `messages` 無驗證；`validateGenParams` 缺體檢與正整數檢查 | 1. 新增 `isPlainObject()`、`SUPPORTED_ANTHROPIC_BLOCKS`<br>2. `validateAnthropicBody()`：messages 必須非空陣列、每項有 role+content、content 僅支援 text/tool_use/tool_result<br>3. `validateGenParams()`：body guard + `max_completion_tokens > 0` 整數<br>4. `sendRouteError()` 統一錯誤回應；`process.on("unhandledRejection")` 兜底<br>5. 三條路由 (`/v1/chat/completions`、`/v1/responses`、`/v1/messages`) 全改 `async` + `try/catch` + `await` pipe | `test/validation.test.mjs` (6) + `test/routes.test.mjs` (3) |
+| **P0-3** | `/v1/responses` 無免費 Spark 時仍嘗試轉發 → 上游 400/500；`/health` 無可用性指示 | 註冊表 2026-10-28 無 `muse-spark* -free`；實測 `muse-spark-1.2-contributor-free` → 400 "Model is unavailable" | 1. `DEFAULT_MODELS` 更新為 10 個當前可用模型 (9 active + `jev-1.13-free` 來自線上合併)<br>2. `hasFreeSparkModel()` 檢查 `MODELS` 是否含 `muse-spark*`<br>3. Spark model 不在 `MODELS` 時 `/v1/responses` 回 `503 {error:{code:"no_free_spark"}}`<br>4. `/health` 新增 `responses_available: hasFreeSparkModel()` | `test/responses-availability.test.mjs` (2) |
+
+---
+
+### P1 級：資源洩漏 / 邊界處理
+
+| 編號 | 問題 | 根因 | 解決方式 | 測試 |
+|------|------|------|----------|------|
+| **P1-4** | 客戶端斷線時上游連線未取消 → 連線懸掛、資源洩漏 | 無綁定 `req.aborted`/`res.close` 到上游 `AbortController` | 1. `clientAbortSignal(req,res)` 產生 `AbortSignal`，監聽 `req.once("aborted")`、`res.once("close")`<br>2. `bindClientAbort(upstreamCtrl, clientSignal)` 雙向綁定<br>3. 六條 pipe (`pipeZenResponse`、`zenRequestFull`、`pipeZenAsAnthropic`、`pipeZenResponses`、`pipeResponsesAsChat`、`pipeResponsesAsAnthropic`) 全接受 `clientSignal` 並綁定<br>4. 三條路由建立 `clientSignal` 傳入；`reportZenFailure`/`writeSSE`/`synthesizeEnding`/catch 皆檢查 `isClientDisconnect()` 直接返回 | `test/client-abort.test.mjs` (1) |
+| **P1-5**<br>**P1-6** | `pipeZenResponses`：空 200 卡住、inline error 當成功流走、缺 terminal 事件無結尾 | 位元組直通模式無緩衝、無錯誤偵測、無結尾合成 | 1. 首 chunk 緩衝：`firstChunk` 暫存、`errBuffering` 暫扣、 `rawAccum` 滾動尾窗 (8KB/16KB)<br>2. `responsesFirstChunkIsError()`、`sseErrorPayload()` 三層偵測 → 429 (`FreeUsageLimitError`) / 502<br>3. 空 200 → 502 "Empty response from upstream"<br>4. 追蹤 terminal 事件 (`response.completed/incomplete/failed`)；缺 terminal 時補發 `response.failed` SSE | `test/responses-pipe.test.mjs` (3) |
+
+---
+
+### P2 級：功能完整性 / 協議對齊
+
+| 編號 | 問題 | 根因 | 解決方式 | 測試 |
+|------|------|------|----------|------|
+| **P2-7** | Spark 工具名稱衝突：客戶端宣告 `read`/`grep`... 與官方 12 工具同名 → 上游未定義行為 | 缺雙向改名、官方呼叫過濾 | 1. `zenResponsesRequest(..., {renameTools})`：建立 `renames` map、`dropToolCall()`、`restoreToolName()`<br>2. `responsesObjectToChatResponse(resp, chatModel, renames)`：還原客戶端工具名、丟棄官方 tool call (`droppedToolIds`)<br>3. `pipeResponsesAsChat/AsAnthropic` 接受 `renames`、`droppedToolIds`，依路徑還原/過濾<br>4. chat/messages → Spark 路由傳 `{renameTools:true}` | `test/spark-tools.test.mjs` (3) |
+| **P2-8**<br>**P2-14** | reasoning 欄位多變體 (`reasoning_content`、`reasoning`、`reasoning_text`) 未全支援；cap 判斷未把 tool call 算進度 | 單一欄位硬編碼；cap 只看 `contentStarted` | 1. `reasoningText(delta)` 統一抽取三欄位<br>2. `aggregateChatSSE` 採用 `reasoningText`<br>3. `pipeZenResponse`：新增 `toolStarted`，cap 條件 `!contentStarted && !toolStarted`<br>4. `pipeZenAsAnthropic`：新增 `sawToolDelta`，cap 條件加 `!sawToolDelta`<br>5. `responsesObjectToChatResponse` 讀 `summary`/`content`/`item.text` | `test/reasoning.test.mjs` (3) |
+| **P2-10** | Anthropic 串流：tool arguments 先到、name 晚到 → 參數丟失或誤判 | 即時判斷 keep/drop，name 未知時無法決定 | 1. `toolBlocks` 新增 `pendingArgs` 陣列暫存<br>2. arguments 先到 → 暫存；name 到達時才決定 keep/drop<br>3. keep 時一次性 flush `pendingArgs` | `test/anthropic-tools.test.mjs` (1) |
+| **P2-11**<br>**P2-12** | `response.failed` (Spark 端點) 在 chat/messages/Anthropic 兩向 stream 皆被當成功 `finishUp`；sync 回 200；原生端點缺 split inline error 偵測 | 終端事件統一走 `finishUp`；累積 body 只有首 chunk 檢查 | 1. `pipeResponsesAsChat/AsAnthropic` 新增 `failStream(msg)`：未送頭 → 502 JSON；已送頭 → error SSE + `[DONE]`<br>2. 終端分支 `response.failed` 直接 `failStream` 不進 `finishUp`<br>3. sync 分支額外檢查 `d.type==="response.failed"||d.status==="failed"` → 502<br>4. `pipeZenResponse`/`pipeZenAsAnthropic` 末端 `!headersSent` 時以 `rawAccum` 跑 `responsesFirstChunkIsError`/`sseErrorPayload` 映射 429/502 | `test/responses-pipe.test.mjs` (3) + `test/native-inline-error.test.mjs` (2) |
+| **P2-13** | Anthropic SSE `data:` 前綴過嚴 (`startsWith("data: ")`) → 漏掉 `data:` 無空格 | 上游實際可能無空格 | `startsWith("data:")` + `slice(5)` | 既有測試覆蓋 |
+
+---
+
+### P3 級：工程衛生 / 可運維性
+
+| 編號 | 問題 | 解決方式 | 變更檔案 |
+|------|------|----------|----------|
+| **P3-18** | `PROXY_VERSION="11.1"` vs `package.json 0.11.1` 不一致 | 讀取 `package.json` 版本：`PROXY_VERSION = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url))).version` | `server.mjs` |
+| **P3** | 環境變數解析散落、`parseInt("") → NaN` 靜默失效 | 新增 `envInt(name,fallback)` 統一；`REASONING_CAP`/`SESSION_TTL_MS`/`DEFAULT_MAX_TOKENS` 全用此函式 | `server.mjs` |
+| **P3** | `OUTPUT_LIMIT` / `MAX_TOKENS_DEFAULT` 優先級混淆、預設值不一 (32000 vs 32768) | 統一 `DEFAULT_MAX_TOKENS = (OUTPUT_LIMIT \|\| MAX_TOKENS_DEFAULT \|\| "32000")`；移除 `OC_OUTPUT_LIMIT`；chat/responses 同源 | `server.mjs` |
+| **P3** | `PROXY_HOST` 硬編碼 `0.0.0.0` 無法配置 | 新增 `HOST = process.env.PROXY_HOST || "0.0.0.0"`；`listen(PORT, HOST)`；README 紀錄 | `server.mjs`, `README.md` |
+| **P3** | `loadModels()`：URL 驗證缺失、`res.on("error/aborted")` 未處理、重複 resolve | 1. `new URL` try/catch、協議白名單<br>2. `settled` flag + `finish(reason)` 單次 resolve<br>3. `res.on("error","aborted")`、`req` try/catch、`setTimeout` 共用 `finish` | `server.mjs` |
+| **P3** | 缺優雅關機：SIGINT/SIGTERM 直接 `process.exit` | `shutdown(signal)`：`server.close()`、10s 強制 `closeAllConnections()`、退出碼 0/1 | `server.mjs` |
+| **P3-22** | `start_warn.bat`：硬編路徑、無輪替、無重啟、bun 發現脆弱 | 1. `cd /d "%~dp0"` 可攜<br>2. log >10MB 輪替 `.1`<br>3. `:run` 迴圈 + `timeout 5` 重啟<br>4. `where bun` → `%USERPROFILE%\.bun\bin\bun.exe` 兩階段發現<br>5. 找不到印安裝指引並退出 | `start_warn.bat` |
+| **P3** | README 環境變數表缺 `PROXY_HOST`/`SESSION_TTL_MS`；`/v1/responses` 範例誤導 (無免費 Spark) | 1. 環境變數表補齊兩項<br>2. Responses 章節改為狀態說明 + 範例標註「待免費 Spark 上架才生效」 | `README.md` |
+
+---
+
+### 測試覆蓋對照表
+
+| 測試檔 | 覆蓋項目 | 測試數 |
+|--------|----------|--------|
+| `validation.test.mjs` | `validateAnthropicBody`、畸形 messages、空/非陣列、null entry、`max_completion_tokens` 非正整數 | 6 |
+| `routes.test.mjs` | 三條路由 null body 400、未知 model 400、Anthropic 錯誤形狀 | 3 |
+| `responses-availability.test.mjs` | 無 Spark 503 `no_free_spark`、`/health` `responses_available:false` | 2 |
+| `client-abort.test.mjs` | 客戶端 abort → 上游連線中止 | 1 |
+| `responses-pipe.test.mjs` | empty 200→502、inline 429、正常通過、**failed→502 (chat stream/sync/anthropic stream)** | 6 |
+| `native-inline-error.test.mjs` | chat/anthropic stream split JSON error → 429 | 2 |
+| `spark-tools.test.mjs` | rename/restore/drop、官方 tool call 過濾、同步路徑 | 3 |
+| `reasoning.test.mjs` | `reasoningText` 三欄位、聚合、sync 讀取 | 3 |
+| `anthropic-tools.test.mjs` | 晚到 tool name + 先到 arguments 暫存 | 1 |
+| **合計** | **P0-P2 全部邊界 + 核心流程** | **27** |
+
+---
+
+### 驗證指令
+
+```powershell
+# 語法檢查
+node --check server.mjs
+
+# 全測試 (Node 內建 test runner)
+npm test        # 等同 node --test
+
+# 單檔
+node --test test/responses-pipe.test.mjs
+```
+
+---
+
+### 部署檢核
+
+- [x] `bun server.mjs` 啟動無警告 (Windows 用 `start_warn.bat`)
+- [x] `/health` 回 `responses_available: false` (無免費 Spark 時)
+- [x] `/v1/models` 含 10 模型且 `big-pickle` 在列
+- [x] 三端點 (`/v1/chat/completions`、`/v1/messages`、`/v1/responses`) 皆能跑同步/串流
+- [x] 錯 key 401、錯 model 400、畸形 body 400、無 Spark 503
+- [x] 客戶端斷線瞬間上游連線中止 (日誌見 `[ZEN ABORT]` / `[ZEN ERROR]`)
+- [x] `SIGINT`/`SIGTERM` 10 秒內優雅退出
+- [x] `PROXY_HOST=127.0.0.1` 僅回環可連
