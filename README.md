@@ -88,6 +88,18 @@ curl http://localhost:6446/v1/messages \
 
 ### Responses format — `POST /v1/responses`
 
+> **Status:** as of 2026-10-28 no free Muse Spark model is available in the upstream
+> free tier. The proxy exposes `/v1/responses` only when a free `muse-spark*`
+> model appears in `GET /v1/models`; otherwise it returns `503 no_free_spark`.
+> When a free Spark model returns, it works on **all three endpoints** —
+> `/v1/chat/completions` and `/v1/messages` auto-translate to the upstream
+> Responses API (their home endpoint). Upstream accepts `tool_choice: "auto"`
+> only; `"none"` drops user tools (compat markers stay), `"required"`/named
+> choices degrade to auto. All other models are served on
+> `/v1/chat/completions` and `/v1/messages` (they 500 upstream on
+> `/v1/responses`, which returns `400 wrong_endpoint` pointing at the right
+> one).
+
 ```bash
 curl http://localhost:6446/v1/responses \
   -H "Authorization: Bearer ***" \
@@ -96,19 +108,10 @@ curl http://localhost:6446/v1/responses \
     "model": "muse-spark-1.3-contributor-free",
     "input": "Hello",
     "stream": false
-  }'
+  }
 ```
 
-> **Endpoint routing** (enforced locally):
-> `muse-spark*` models work on **all three endpoints** — chat/completions and
-> messages are served via automatic translation to the upstream Responses API
-> (their home endpoint). Note: upstream accepts `tool_choice: "auto"` only —
-> `"none"` drops the *user* tools (the mandatory OpenCode compat markers stay,
-> see “Zen free-tier gate” below), `"required"`/named-function choices degrade
-> to auto (named keeps just that tool, plus the compat markers). All other
-> models are served on `/v1/chat/completions` and `/v1/messages` (they 500
-> upstream on `/v1/responses`, which returns `400 wrong_endpoint` pointing at
-> the right one — Responses-for-everyone is Phase 2).
+> The example above will succeed once a free Spark model is available.
 
 ### Other endpoints
 
@@ -220,9 +223,11 @@ sudo systemctl enable --now opencode-proxy
 | Variable | Default | What |
 |----------|---------|------|
 | `PROXY_PORT` | `6446` | Server port |
+| `PROXY_HOST` | `0.0.0.0` | Bind address; set to `127.0.0.1` to listen only on loopback |
 | `KEYS_FILE` | `./api-keys.json` | API keys file path |
 | `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | Model registry URL (http allowed, e.g. LAN mirror) |
 | `REASONING_CAP` | `65536` | Stream reasoning-token fuse before force-stop; `0` disables |
+| `SESSION_TTL_MS` | `1800000` | Session rotation TTL (ms); `0` disables rotation (fresh session per request) |
 | `OUTPUT_LIMIT` | `32000` | `max_completion_tokens` sent upstream when the client sends no length cap; `0` disables (`MAX_TOKENS_DEFAULT` still honored as a legacy alias) |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 

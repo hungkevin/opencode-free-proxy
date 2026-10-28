@@ -7,7 +7,8 @@
   "scripts": {
     "start": "bun server.mjs",
     "start:node": "node server.mjs",
-    "dev": "bun --watch server.mjs"
+    "dev": "bun --watch server.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.21.0"
