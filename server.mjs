@@ -8,8 +8,9 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PROXY_PORT || 6446;
-const OC_VERSION = "1.18.31";
-const PROXY_VERSION = "10";
+const OC_VERSION = "1.18.31"; // only used for the models.opencode.ai registry fetch (not gated)
+const PROXY_VERSION = "11.1";
+const RUNTIME = globalThis.Bun ? "bun" : "node";
 
 // ── Log levels ─────────────────────────────────────────────────────
 // LOG_LEVEL=debug|info|warn|error|silent (default info). Runtime request
@@ -62,47 +63,253 @@ function ocId(prefix) {
   return `${prefix}_${ts}${rnd}`;
 }
 
-// ── Zen free-tier fingerprint (upstream gate, verified 2026-09-25) ─
-// The Zen free tier now only answers requests that look like they came
-// from inside OpenCode; anything else gets
-//   403 {"type":"error","error":{"type":"FreeTierError",
-//        "message":"... OpenCode's free tier can only be used from within OpenCode"}}
-// Differential probes (review/probe_freetier*.mjs, probe_responses_*.mjs)
-// isolated three NECESSARY conditions — violating any single one → 403:
-//   1. x-opencode-session must be `ses_` + exactly 26 lowercase hex chars
-//      (a timestamp+base64url id, missing header, wrong length or case → 403)
-//   2. tools must contain all five OpenCode built-in names
-//      bash / edit / glob / grep / read (names only — schemas and
-//      descriptions are irrelevant; extra user tools may coexist;
-//      1, 2, 4 tools or five unrelated names → 403)
-//   3. the upstream request must be `stream: true` (stream:false → 403),
-//      on BOTH /zen/v1/chat/completions and /zen/v1/responses
-// x-opencode-client cli|desktop, User-Agent and Accept are NOT checked.
-// Reference implementation that keeps working: oc2api/server/zen.js.
-const ZEN_COMPAT_TOOL_NAMES = ["bash", "edit", "glob", "grep", "read"];
-const ZEN_COMPAT_TOOL_DESCRIPTION =
-  "Compatibility marker only. Do not call or select this function. Use tools explicitly supplied by the user instead.";
+// ── OpenCode upstream fingerprint (transport + shape) ──────────────
+// 2026-10: the free tier gates on BOTH layers. Verified 2026-10-28 by
+// differential probes (review/probe_tls_fingerprint_node.mjs — Node gets 429,
+// review/probe_tls_fingerprint_bun.mjs — Bun gets 200, identical body):
+//
+// 1. TLS ClientHello fingerprint (transport). The upstream rejects
+//    OpenSSL-style hellos — Node.js, curl — with 429 FreeUsageLimitError
+//    no matter what the request contains. This server MUST run under Bun
+//    (`bun server.mjs`): Bun's BoringSSL hello is what OpenCode itself
+//    uses (identical body: Node → 429, Bun → 200). Version caveat found
+//    2026-10-28: bun 1.4+ regressed its node:https compat-layer hello to a
+//    REJECTED fingerprint (bun 1.4.4 node:https → 429) while native fetch
+//    stays correct on every version (1.3.11 and 1.4.4 both → 200) — so all
+//    upstream transport below goes through fetch, never node:https.
+//
+// 2. Request shape (application layer). Mirror of the working oc2api
+//    reference (oc2api/internal/shape + internal/zen):
+//    - POST /inference/v1/chat/completions (the old /zen/v1 path is dead)
+//    - UA `opencode/latest/2.1.1/cli`, project id hash, four session headers
+//    - official system prompt (oc-prompt.txt) first; client system messages
+//      appended after it
+//    - the 12 official OpenCode tools (oc-tools.json, descriptions replaced
+//      with a "do not call" marker) always present; client tools ride along
+//      renamed with an `oc2api_` prefix so they can never collide, names
+//      restored on the way back
+//    - always stream:true + stream_options.include_usage, and
+//      max_completion_tokens (never max_tokens, never tool_choice —
+//      clients that want "no tools" are handled by a system-prompt nudge)
+const OC_UA = "opencode/latest/2.1.1/cli";
+const OC_PROJECT = "3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787";
+const ZEN_HOST = "opencode.ai";
+const ZEN_CHAT_PATH = "/inference/v1/chat/completions";
+const ZEN_RESPONSES_PATH = "/inference/v1/responses";
+const ZEN_MODELS_PATH = "/inference/v1/models";
+const TOOL_PREFIX = "oc2api_";
+const RESERVED_TOOL_DESC =
+  "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead.";
+const NO_TOOLS_NUDGE =
+  "\n\nThe current client provides no tools. Answer directly in text and do not call any tool.";
+// Output cap sent upstream when the client gave none (oc2api outputLimit).
+// OUTPUT_LIMIT wins, then legacy MAX_TOKENS_DEFAULT, then 32000. 0 disables.
+const OC_OUTPUT_LIMIT = parseInt(process.env.OUTPUT_LIMIT || process.env.MAX_TOKENS_DEFAULT || "32000", 10);
 
-function appendZenCompatTools(tools, shape) {
-  const out = Array.isArray(tools) ? tools.filter((t) => t && typeof t === "object") : [];
-  const nameOf = (t) => (shape === "responses" ? t.name || t.function?.name : t.function?.name);
-  const seen = new Set(out.map(nameOf).filter(Boolean));
-  for (const name of ZEN_COMPAT_TOOL_NAMES) {
-    if (seen.has(name)) continue;
-    seen.add(name);
-    out.push(
-      shape === "responses"
-        ? { type: "function", name, description: ZEN_COMPAT_TOOL_DESCRIPTION, parameters: { type: "object", properties: {} } }
-        : { type: "function", function: { name, description: ZEN_COMPAT_TOOL_DESCRIPTION, parameters: { type: "object", properties: {} } } },
-    );
-  }
-  return out;
+const OC_PROMPT_TEMPLATE = fs.readFileSync(new URL("./oc-prompt.txt", import.meta.url), "utf8");
+const OFFICIAL_TOOLS = (() => {
+  const tools = JSON.parse(fs.readFileSync(new URL("./oc-tools.json", import.meta.url), "utf8"));
+  for (const t of tools) if (t?.function) t.function.description = RESERVED_TOOL_DESC;
+  return tools;
+})();
+const OFFICIAL_TOOL_NAMES = new Set(OFFICIAL_TOOLS.map((t) => t?.function?.name).filter(Boolean));
+
+const OC_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const OC_DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// "deepseek-v4.1-flash-free" → "Deepseek V4.1 Flash Free" (oc2api displayName).
+function displayName(model) {
+  return String(model || "")
+    .split("-")
+    .map((p) => (p ? p[0].toUpperCase() + p.slice(1) : p))
+    .join(" ");
 }
 
-// Zen free layer requires ses_ + 26 lowercase hex (oc2api's zenSessionID).
-// The old ocId("ses") (timestamp + base64url) is rejected by the gate.
+// Official system prompt with model/date/env substituted (oc2api parity).
+function officialPrompt(model) {
+  const d = new Date();
+  const date = `${OC_DAYS[d.getUTCDay()]} ${OC_MONTHS[d.getUTCMonth()]} ${String(d.getUTCDate()).padStart(2, "0")} ${d.getUTCFullYear()}`;
+  return OC_PROMPT_TEMPLATE.replaceAll("{{MODELNAME}}", displayName(model))
+    .replaceAll("{{MODEL}}", model)
+    .replaceAll("{{DATE}}", date)
+    .replaceAll("{{WORKDIR}}", "./")
+    .replaceAll("{{GIT}}", "yes");
+}
+
+// Session id in the official client's format: ses_ + 12 hex (bitwise NOT of
+// ms*0x1000 + in-ms counter, 48 bits) + 14 base62 chars (oc2api SessionID).
+// The in-ms counter must stay in 1..15: 0 encodes as 0xFFF in the low bits
+// and upstream answers 429.
+const SESSION_ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let sesLastMs = 0;
+let sesCounter = 0;
 function zenSessionId() {
-  return "ses_" + crypto.randomBytes(13).toString("hex");
+  const now = Date.now();
+  if (now !== sesLastMs) {
+    sesLastMs = now;
+    sesCounter = 0;
+  }
+  const counter = (sesCounter % 15) + 1;
+  sesCounter++;
+  const value = BigInt.asUintN(48, ~(BigInt(now) * 0x1000n + BigInt(counter)));
+  let hex = "";
+  for (let i = 0; i < 6; i++) hex += ((value >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, "0");
+  const rnd = crypto.randomBytes(14);
+  let tail = "";
+  for (let i = 0; i < 14; i++) tail += SESSION_ID_CHARS[rnd[i] % 62];
+  return "ses_" + hex + tail;
+}
+
+// ── Client-tool renames (oc2api parity) ────────────────────────────
+// Client tools go upstream renamed with an oc2api_ prefix so they can never
+// collide with the always-present official tools (an opencode CLI client
+// declares read/grep/edit/... — the same names). Responses restore the
+// original names and drop calls the client cannot execute (official tools
+// the model picked on its own).
+const UNSAFE_TOOL_CHARS = /[^A-Za-z0-9_-]/g;
+function newRenames() {
+  return { forward: new Map(), reverse: new Map() };
+}
+function renameTool(renames, name) {
+  if (!name) return name;
+  const mapped = renames.forward.get(name);
+  if (mapped) return mapped;
+  let base = TOOL_PREFIX + name.replace(UNSAFE_TOOL_CHARS, "_");
+  if (base.length > 64) base = base.slice(0, 64);
+  let candidate = base;
+  for (let i = 2; renames.reverse.has(candidate); i++) candidate = `${base}_${i}`;
+  renames.forward.set(name, candidate);
+  renames.reverse.set(candidate, name);
+  return candidate;
+}
+// Drop = official built-in AND not a renamed client tool. Unknown names pass
+// (better to forward a strange call than to empty out a valid answer).
+function dropToolCall(name, renames) {
+  if (!name) return false;
+  if (renames.forward.has(name) || renames.reverse.has(name)) return false;
+  return OFFICIAL_TOOL_NAMES.has(name);
+}
+function restoreToolName(name, renames) {
+  return renames.reverse.get(name) || name;
+}
+
+// Shared upstream headers (oc2api zen.UpstreamHeaders parity — deliberately
+// no x-opencode-request and no tool_choice anywhere).
+function zenHeaders(sessionId, body) {
+  return {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+    "Accept": "*/*",
+    "Authorization": "Bearer public",
+    "User-Agent": OC_UA,
+    "x-opencode-client": "cli",
+    "x-opencode-project": OC_PROJECT,
+    "x-opencode-session": sessionId,
+    "x-opencode-session-id": sessionId,
+    "x-session-affinity": sessionId,
+    "X-Session-Id": sessionId,
+  };
+}
+
+// ── Upstream transport (native fetch) ──────────────────────────────
+// Bun's native fetch carries the correct BoringSSL ClientHello on EVERY bun
+// version, but bun 1.4+ regressed its node:https compat-layer hello to a
+// fingerprint the gate rejects (verified 2026-10-28, same body: bun 1.4.4
+// fetch → 200 / bun 1.4.4 node:https → 429 / bun 1.3.11 node:https → 200).
+// All upstream calls therefore go through fetch, so the fingerprint no
+// longer depends on the bun version. (Node 18+ also has global fetch; Node
+// is rejected by the gate regardless — always start with bun.)
+const ZEN_IDLE_TIMEOUT_MS = 120000; // max silence for headers and between body chunks
+
+// One upstream request → web Response (res.status / res.body).
+// Timeout semantics preserved from the https.request era: no total-duration
+// limit on the body — only a header deadline plus an inter-chunk idle
+// deadline, so long answers are never cut off mid-stream. `controller` stays
+// usable afterwards: reasoning-cap / idle aborts reuse the same signal.
+async function zenFetchRaw(zenOpts, body, controller) {
+  const url = `https://${zenOpts.hostname}:${zenOpts.port}${zenOpts.path}`;
+  const headerTimer = setTimeout(
+    () => abortUpstream(controller, "upstream headers timeout"),
+    zenOpts.timeout || ZEN_IDLE_TIMEOUT_MS,
+  );
+  try {
+    return await fetch(url, {
+      method: zenOpts.method || "POST",
+      headers: zenOpts.headers,
+      body: body === undefined || zenOpts.method === "GET" ? undefined : body,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(headerTimer);
+  }
+}
+
+function abortUpstream(controller, why) {
+  if (!controller.signal.aborted) controller.abort(new Error(why));
+}
+
+// Read the whole upstream body (error pages / sync aggregation).
+async function collectZenBody(zenRes, controller, onChunk) {
+  const chunks = [];
+  let idle = setTimeout(() => abortUpstream(controller, "upstream idle timeout"), ZEN_IDLE_TIMEOUT_MS);
+  try {
+    for await (const c of zenRes.body) {
+      clearTimeout(idle);
+      idle = setTimeout(() => abortUpstream(controller, "upstream idle timeout"), ZEN_IDLE_TIMEOUT_MS);
+      if (onChunk) onChunk(c);
+      chunks.push(c);
+    }
+    clearTimeout(idle);
+  } catch (e) {
+    clearTimeout(idle);
+    throw e;
+  }
+  return Buffer.concat(chunks).toString();
+}
+
+// Feed an SSE stream chunk-by-chunk with the same idle deadline. Chunks are
+// normalized to Buffer: bun 1.4+ fetch yields plain Uint8Array whose
+// .toString() is a comma-joined byte list, NOT decoded text — every onData
+// handler below relies on Buffer semantics.
+async function pumpZenStream(zenRes, controller, onData) {
+  let idle = setTimeout(() => abortUpstream(controller, "upstream idle timeout"), ZEN_IDLE_TIMEOUT_MS);
+  try {
+    for await (const chunk of zenRes.body) {
+      clearTimeout(idle);
+      idle = setTimeout(() => abortUpstream(controller, "upstream idle timeout"), ZEN_IDLE_TIMEOUT_MS);
+      onData(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    }
+    clearTimeout(idle);
+  } catch (e) {
+    clearTimeout(idle);
+    throw e;
+  }
+}
+
+// Unified upstream failure log + client error. Covers the connect/headers
+// phase (fetch threw) and the body phase (network reset / idle timeout).
+// shape: "openai" (default) | "anthropic". `selfStopped` = our own
+// force-stop (reasoning cap) already synthesized the ending — stay silent.
+function reportZenFailure(e, controller, res, tag, t0, rxBytes, shape, selfStopped) {
+  if (res.writableEnded || selfStopped) return;
+  const reasonMsg = String(controller.signal?.reason?.message || "");
+  const timedOut = controller.signal.aborted && /timeout/i.test(reasonMsg);
+  const anthropic = shape === "anthropic";
+  if (timedOut) {
+    log("error", `[ZEN TIMEOUT ${tag} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
+    if (!res.headersSent) {
+      res.status(504).json(anthropic
+        ? { type: "error", error: { type: "timeout_error", message: "Upstream timeout" } }
+        : { error: { message: "Upstream timeout", type: "timeout_error" } });
+    }
+    return;
+  }
+  log("error", `[ZEN ERROR ${tag} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
+  if (!res.headersSent) {
+    res.status(502).json(anthropic
+      ? { type: "error", error: { type: "upstream_error", message: e.message } }
+      : { error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
+  }
 }
 
 // Connection diagnostics: translate Node socket errors into an actionable
@@ -271,6 +478,46 @@ async function loadModels() {
   });
 }
 
+// Best-effort merge of the live upstream model list
+// (GET /inference/v1/models — a plain GET, NOT TLS-gated: curl/Node work).
+// The marketing registry (models.opencode.ai) sometimes omits ids the
+// inference API actually serves (e.g. jev-1.13-free) and vice versa.
+function mergeUpstreamModels(list) {
+  let added = 0;
+  for (const m of Array.isArray(list) ? list : []) {
+    const id = m?.id;
+    if (!id || typeof id !== "string") continue;
+    if (id !== "big-pickle" && !id.endsWith("-free")) continue;
+    if (MODEL_META[id]) continue;
+    MODEL_META[id] = {
+      name: displayName(id),
+      status: "active",
+      reasoning: true,
+      toolCall: true,
+      contextLimit: 0,
+      outputLimit: 0,
+      releaseDate: "-",
+    };
+    MODELS.push(id);
+    added++;
+  }
+  if (added) console.log(`[MODELS] Merged ${added} extra id(s) from upstream ${ZEN_MODELS_PATH}`);
+}
+
+async function fetchUpstreamModels() {
+  try {
+    const res = await fetch(`https://${ZEN_HOST}${ZEN_MODELS_PATH}`, {
+      method: "GET",
+      headers: { "Accept": "application/json", "Authorization": "Bearer public", "User-Agent": OC_UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    const json = await res.json();
+    return json?.data || null;
+  } catch {
+    return null; // best-effort merge — registry alone is fine
+  }
+}
+
 // Track sessions per user: each session lives 30min base + 0~15min random
 // jitter (re-drawn on every rotation), mimicking humans opening new
 // conversations at irregular intervals. SESSION_TTL_MS=0 disables rotation
@@ -308,51 +555,78 @@ const REASONING_CAP = parseInt(process.env.REASONING_CAP || "65536", 10);
 // Set MAX_TOKENS_DEFAULT=0 to disable injection.
 const DEFAULT_MAX_TOKENS = parseInt(process.env.MAX_TOKENS_DEFAULT || "32768", 10);
 
-function zenRequest(model, messages, stream, tools, tool_choice, sessionId, extra = {}) {
-  // Free-tier fingerprint (see Zen free-tier note above): upstream is ALWAYS
-  // asked to stream — a sync client request is aggregated to JSON locally
-  // (pipeZenResponse sync branch / zenRequestFull) — and the five OpenCode
-  // built-in tools are always present. When the client sent no tools of its
-  // own, tool_choice:"none" keeps the model from picking the compat markers.
-  const reqBody = { model, messages, stream: true, stream_options: { include_usage: true } };
-  const hadUserTools = Array.isArray(tools) && tools.length > 0;
-  reqBody.tools = appendZenCompatTools(tools, "chat");
-  if (!hadUserTools) reqBody.tool_choice = "none";
-  else if (tool_choice) reqBody.tool_choice = tool_choice;
-  // Forward client-side generation controls to Zen (was dropped before,
-  // which let reasoning models think forever with no max_tokens cap).
-  for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "seed"]) {
-    if (extra[k] !== undefined) reqBody[k] = extra[k];
-  }
-  // Anthropic clients send stop_sequences; map it to OpenAI's stop.
-  if (reqBody.stop === undefined && extra.stop_sequences !== undefined) {
-    reqBody.stop = extra.stop_sequences;
-  }
-  // Safety net when the client specified no length cap.
-  if (DEFAULT_MAX_TOKENS > 0 && reqBody.max_tokens === undefined && reqBody.max_completion_tokens === undefined) {
-    reqBody.max_tokens = DEFAULT_MAX_TOKENS;
-  }
-  const body = JSON.stringify(reqBody);
-  const requestId = ocId("msg");
+// Build the upstream chat body in the official client's shape (oc2api
+// shape.Build parity). Returns { body, renames } — renames is needed by every
+// response path to restore client tool names / drop official-tool calls.
+function buildZenChatBody(model, messages, clientTools, extra = {}) {
+  const renames = newRenames();
 
+  // Pull system/developer messages out; they are appended to the official
+  // prompt instead of being sent as-is.
+  const clientSystem = [];
+  const rest = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (m && (m.role === "system" || m.role === "developer")) {
+      const t = chatContentText(m.content);
+      if (t) clientSystem.push(t);
+    } else {
+      rest.push(m);
+    }
+  }
+
+  let system = officialPrompt(model);
+  if (clientSystem.length) system += "\n\n" + clientSystem.join("\n\n");
+  const hasClientTools = Array.isArray(clientTools) && clientTools.some((t) => t?.function?.name || t?.name);
+  // Clients without tools must not have the model pick an official marker
+  // tool it cannot get executed — tell it directly (oc2api parity; upstream
+  // gets no tool_choice at all).
+  if (!hasClientTools) system += NO_TOOLS_NUDGE;
+
+  const tools = OFFICIAL_TOOLS.map((t) => ({ type: "function", function: { ...t.function } }));
+  if (Array.isArray(clientTools)) {
+    for (const t of clientTools) {
+      const fn = t?.function || t;
+      if (!fn?.name) continue;
+      tools.push({ type: "function", function: { ...fn, name: renameTool(renames, fn.name) } });
+    }
+  }
+
+  // Key order mirrors the official client: model, messages, tools, stream,
+  // stream_options, max_completion_tokens. temperature/top_p/stop/seed are
+  // NOT forwarded (oc2api doesn't either — unproven params risk a 400).
+  const body = {
+    model,
+    messages: [{ role: "system", content: system }, ...rest],
+    tools,
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+  // Client length cap wins over the default fuse; otherwise send the default.
+  if (extra.max_completion_tokens !== undefined) body.max_completion_tokens = extra.max_completion_tokens;
+  else if (extra.max_tokens !== undefined) body.max_completion_tokens = extra.max_tokens;
+  else if (OC_OUTPUT_LIMIT > 0) body.max_completion_tokens = OC_OUTPUT_LIMIT;
+
+  return { body: JSON.stringify(body), renames };
+}
+
+function zenRequest(model, messages, tools, sessionId, extra = {}) {
+  // Free-tier shape (see fingerprint note): official prompt + official tools +
+  // always-stream + max_completion_tokens. tool_choice is never sent —
+  // upstream only truly supports auto; a client asking for "no tools" is
+  // handled by the system-prompt nudge inside buildZenChatBody.
+  if (extra.tool_choice !== undefined) {
+    log("warn", "[ZEN-DEGRADE] tool_choice dropped (upstream has no tool_choice; no-tool clients handled by system nudge)");
+  }
+  const { body, renames } = buildZenChatBody(model, messages, tools, extra);
   return {
     body,
+    renames,
     options: {
-      hostname: "opencode.ai",
+      hostname: ZEN_HOST,
       port: 443,
-      path: "/zen/v1/chat/completions",
+      path: ZEN_CHAT_PATH,
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-        "Accept": "text/event-stream",
-        "Authorization": "Bearer public",
-        "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
-        "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": requestId,
-        "x-opencode-session": sessionId,
-      },
+      headers: zenHeaders(sessionId, body),
       timeout: 120000,
     },
   };
@@ -478,223 +752,347 @@ function coerceResponsesSyncBody(raw) {
   return err ? { json: err } : {};
 }
 
-// Pipe Zen response to client (OpenAI format passthrough)
-function pipeZenResponse(zenOpts, body, stream, res, model) {
+// Post-aggregation pass (sync replies): restore renamed client tool names,
+// drop official-tool calls the client cannot execute, and fix finish_reason
+// when every call was dropped (client would otherwise wait on a tool that
+// never existed for it).
+function rewriteAggregatedToolCalls(json, renames) {
+  const msg = json?.choices?.[0]?.message;
+  if (!msg || !Array.isArray(msg.tool_calls) || !msg.tool_calls.length) return json;
+  const kept = [];
+  for (const tc of msg.tool_calls) {
+    const name = tc?.function?.name || "";
+    if (dropToolCall(name, renames)) continue;
+    if (name) tc.function = { ...tc.function, name: restoreToolName(name, renames) };
+    kept.push(tc);
+  }
+  if (!kept.length) {
+    delete msg.tool_calls;
+    if (json.choices?.[0]?.finish_reason === "tool_calls") json.choices[0].finish_reason = "stop";
+  } else {
+    msg.tool_calls = kept;
+  }
+  return json;
+}
+
+// Chat SSE frame rewriter (oc2api protocol.Stream parity) for the streaming
+// passthrough: restore renamed client tool names, drop official-tool calls,
+// and hold frames whose tool name has not arrived yet (a delta can split the
+// name away from the arguments — the decision must wait for the name).
+// onFrame(text) receives each rewritten `data:` payload ("[DONE]" passes).
+function createChatStreamRewriter(renames, onFrame) {
+  const decisions = new Map(); // upstream tool index → keep?
+  let keptAny = false;
+  let buffered = [];
+
+  function classify(payload) {
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { return 0; }
+    let undecided = 0;
+    for (const ch of chunk.choices || []) {
+      const calls = ch?.delta?.tool_calls;
+      if (!Array.isArray(calls)) continue;
+      for (const tc of calls) {
+        if (!tc || typeof tc !== "object") continue;
+        const idx = Number.isInteger(tc.index) ? tc.index : 0;
+        if (decisions.has(idx)) continue;
+        const name = tc.function?.name || "";
+        if (!name) {
+          undecided++;
+          continue;
+        }
+        decisions.set(idx, !dropToolCall(name, renames));
+      }
+    }
+    return undecided;
+  }
+
+  function rewrite(payload, bufferedMode) {
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { return payload; }
+    for (const ch of chunk.choices || []) {
+      const delta = ch?.delta;
+      if (!delta) continue;
+      const calls = delta.tool_calls;
+      if (Array.isArray(calls)) {
+        const kept = [];
+        for (const tc of calls) {
+          if (!tc || typeof tc !== "object") continue;
+          const idx = Number.isInteger(tc.index) ? tc.index : 0;
+          const keep = decisions.has(idx) ? decisions.get(idx) : false;
+          if (!keep) continue;
+          if (tc.function?.name) tc.function = { ...tc.function, name: restoreToolName(tc.function.name, renames) };
+          kept.push(tc);
+          keptAny = true;
+        }
+        if (!kept.length) delete delta.tool_calls;
+        else delta.tool_calls = kept;
+      }
+    }
+    if (!keptAny) {
+      for (const ch of chunk.choices || []) {
+        if (ch?.finish_reason === "tool_calls") ch.finish_reason = "stop";
+      }
+    }
+    return JSON.stringify(chunk);
+  }
+
+  return {
+    feed(payload) {
+      if (payload === "[DONE]") {
+        buffered = []; // calls whose name never arrived are dropped
+        onFrame("[DONE]");
+        return;
+      }
+      if (classify(payload) > 0) {
+        buffered.push(payload); // hold the whole frame until names are known
+        return;
+      }
+      if (buffered.length) {
+        for (const b of buffered) {
+          const t = rewrite(b, true);
+          if (t) onFrame(t);
+        }
+        buffered = [];
+      }
+      const t = rewrite(payload, false);
+      if (t) onFrame(t);
+    },
+  };
+}
+
+// Pipe Zen response to client (OpenAI format; upstream tool names rewritten
+// on the way through — see createChatStreamRewriter / rewriteAggregatedToolCalls)
+async function pipeZenResponse(zenOpts, body, stream, res, model, renames) {
   const TAG = zenOpts._tag || "??";
   const t0 = Date.now();
   let rxBytes = 0;
-  const req = https.request(zenOpts, (zenRes) => {
-    // P2.4: upstream non-200 → buffer full body, return mapped error with the
-    // real status instead of streaming it as 200 / mislabeling as rate_limit.
-    if (zenRes.statusCode !== 200) {
-      const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
-      zenRes.on("end", () => {
-        let msg = "Upstream error";
-        try {
-          const p = JSON.parse(Buffer.concat(chunks).toString());
-          msg = p.error?.message || p.message || msg;
-        } catch {}
-        log("error", `[ZEN UPSTREAM ${zenRes.statusCode} ${TAG}]`, withCause(zenRes.statusCode, msg));
-        if (!res.headersSent) {
-          res.status(zenRes.statusCode).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
-        }
-      });
-      return;
-    }
-    // Sync client + stream:true upstream (free-tier fingerprint): buffer the
-    // whole SSE transcript and answer with one aggregated JSON object.
-    if (!stream) {
-      const chunks = [];
-      zenRes.on("data", (c) => { rxBytes += c.length; chunks.push(c); });
-      zenRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        const { json } = coerceChatSyncBody(raw);
-        if (json && (json.error || json.type === "error")) {
-          const msg = json.error?.message || json.message || "Upstream error";
-          const limited = raw.includes("FreeUsageLimitError");
-          const status = limited ? 429 : 502;
-          log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
-          if (!res.headersSent) {
-            res.status(status).json({
-              error: {
-                message: limited ? msg + " (free model rate limit)" : msg,
-                type: limited ? "rate_limit_error" : "upstream_error",
-                code: limited ? "rate_limit_exceeded" : "upstream_error",
-              },
-            });
-          }
-          return;
-        }
-        if (!json) {
-          const frag = raw.slice(0, 200);
-          log("error", `[ZEN SYNC ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, withCause(502, frag || "Invalid upstream response"));
-          if (!res.headersSent) {
-            res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
-          }
-          return;
-        }
-        if (model) json.model = model;
-        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B sync]`);
-        res.json(json);
-      });
-      return;
-    }
-    let firstChunk = null;
-    let headersSent = false;
-    // Reasoning sniffer: count reasoning_content tokens in the SSE stream.
-    // If a reasoning model thinks forever without emitting content, force-stop.
-    let sniffBuf = "";
-    let reasoningTokens = 0;
-    let contentStarted = false;
-    let stopped = false;
-    let finishSeen = false;
+  const controller = new AbortController();
 
-    function stopForReasoningCap() {
-      if (stopped) return;
-      stopped = true;
-      log("warn", `[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
-      req.destroy();
-      if (stream && headersSent && !res.writableEnded) {
-        const fin = { choices: [{ index: 0, delta: {}, finish_reason: "length" }] };
-        res.write(`data: ${JSON.stringify(fin)}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      } else if (!res.headersSent) {
-        res.status(502).json({ error: { message: "Upstream reasoning timeout", type: "timeout_error" } });
+  let zenRes;
+  try {
+    zenRes = await zenFetchRaw(zenOpts, body, controller);
+  } catch (e) {
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+    return;
+  }
+
+  // P2.4: upstream non-200 → buffer full body, return mapped error with the
+  // real status instead of streaming it as 200 / mislabeling as rate_limit.
+  if (zenRes.status !== 200) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller);
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+      return;
+    }
+    let msg = "Upstream error";
+    try {
+      const p = JSON.parse(raw);
+      msg = p.error?.message || p.message || msg;
+    } catch {}
+    log("error", `[ZEN UPSTREAM ${zenRes.status} ${TAG}]`, withCause(zenRes.status, msg));
+    if (!res.headersSent) {
+      res.status(zenRes.status).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
+    }
+    return;
+  }
+
+  // Sync client + stream:true upstream (free-tier fingerprint): buffer the
+  // whole SSE transcript and answer with one aggregated JSON object.
+  if (!stream) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller, (c) => { rxBytes += c.length; });
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+      return;
+    }
+    const { json } = coerceChatSyncBody(raw);
+    if (json && (json.error || json.type === "error")) {
+      const msg = json.error?.message || json.message || "Upstream error";
+      const limited = raw.includes("FreeUsageLimitError");
+      const status = limited ? 429 : 502;
+      log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
+      if (!res.headersSent) {
+        res.status(status).json({
+          error: {
+            message: limited ? msg + " (free model rate limit)" : msg,
+            type: limited ? "rate_limit_error" : "upstream_error",
+            code: limited ? "rate_limit_exceeded" : "upstream_error",
+          },
+        });
+      }
+      return;
+    }
+    if (!json) {
+      const frag = raw.slice(0, 200);
+      log("error", `[ZEN SYNC ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, withCause(502, frag || "Invalid upstream response"));
+      if (!res.headersSent) {
+        res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
+      }
+      return;
+    }
+    rewriteAggregatedToolCalls(json, renames);
+    if (model) json.model = model;
+    log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B sync]`);
+    res.json(json);
+    return;
+  }
+
+  // ── stream: SSE passthrough WITH tool-name rewriting ──
+  // Upstream frames are re-lineated and rewritten (restore client tool
+  // names / drop official-tool calls). Headers stay lazy on the first
+  // outbound frame so a 200-with-inline-error body can still surface as a
+  // clean 429/502 instead of ERR_HTTP_HEADERS_SENT.
+  let headersSent = false;
+  let lineBuf = "";
+  let firstChunkChecked = false;
+  // Reasoning sniffer: count reasoning_content tokens in the SSE stream.
+  // If a reasoning model thinks forever without emitting content, force-stop.
+  let reasoningTokens = 0;
+  let contentStarted = false;
+  let stopped = false;
+  let finishSeen = false;
+  // writeSSE is a hoisted function declaration — safe to capture here.
+  const rewriter = createChatStreamRewriter(renames, writeSSE);
+
+  function writeSSE(payload) {
+    if (res.writableEnded) return;
+    if (!headersSent) {
+      headersSent = true;
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Transfer-Encoding": "chunked",
+      });
+      res.flushHeaders();
+    }
+    res.write(payload === "[DONE]" ? "data: [DONE]\n\n" : `data: ${payload}\n\n`);
+    if (res.flush) res.flush();
+  }
+
+  function stopForReasoningCap() {
+    if (stopped) return;
+    stopped = true;
+    log("warn", `[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+    abortUpstream(controller, "reasoning cap force stop");
+    if (headersSent && !res.writableEnded) {
+      writeSSE(JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "length" }] }));
+      writeSSE("[DONE]");
+      res.end();
+    } else if (!res.headersSent) {
+      res.status(502).json({ error: { message: "Upstream reasoning timeout", type: "timeout_error" } });
+    }
+  }
+
+  function synthesizeEnding() {
+    // Upstream closed mid-stream without finish_reason/[DONE]: synthesize a
+    // clean ending so OpenAI SDK clients don't hang on an unterminated SSE.
+    log("warn", `[ZEN ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] upstream closed mid-stream — synthesized ending`);
+    writeSSE(JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "length" }] }));
+    writeSSE("[DONE]");
+  }
+
+  function onData(chunk) {
+    rxBytes += chunk.length;
+    lineBuf += chunk.toString();
+
+    // First raw chunk may be an inline error JSON (200-with-error, P2.3).
+    if (!firstChunkChecked) {
+      firstChunkChecked = true;
+      const str = lineBuf.trim();
+      if (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes('"error"') || str.includes('"type":"error"') || str.includes('"type": "error"'))) {
+        try {
+          const parsed = JSON.parse(str);
+          if (parsed.error || parsed.type === "error") {
+            const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
+            log("error", "[ZEN RATE LIMITED]", withCause(429, errMsg));
+            if (!res.headersSent) {
+              res.status(429).json({
+                error: { message: errMsg + " (free model rate limit)", type: "rate_limit_error", code: "rate_limit_exceeded" }
+              });
+            }
+            abortUpstream(controller, "inline error, stop reading");
+            stopped = true; // do not synthesize anything further
+            return;
+          }
+        } catch {}
       }
     }
+    if (stopped) return;
 
-    zenRes.on("data", (chunk) => {
-      rxBytes += chunk.length;
-      if (stream && !stopped) {
-        sniffBuf += chunk.toString();
-        const lines = sniffBuf.split("\n");
-        sniffBuf = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const payload = line.slice(6).trim();
-          if (payload === "[DONE]") { finishSeen = true; continue; }
-          let p;
-          try { p = JSON.parse(payload); } catch { continue; }
-          const delta = p.choices?.[0]?.delta;
-          if (!delta) continue;
-          if (p.choices?.[0]?.finish_reason) finishSeen = true;
+    const lines = lineBuf.split("\n");
+    lineBuf = lines.pop() || "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (!payload) continue;
+
+      // Reasoning sniffer (unchanged semantics from the old passthrough).
+      if (payload === "[DONE]") {
+        finishSeen = true;
+      } else {
+        let p;
+        try { p = JSON.parse(payload); } catch { p = null; }
+        if (p) {
+          const ch0 = p.choices?.[0];
+          if (ch0?.finish_reason) finishSeen = true;
+          const delta = ch0?.delta || {};
           if (delta.content) contentStarted = true;
           if (delta.reasoning_content) reasoningTokens += Math.ceil(delta.reasoning_content.length / 4);
         }
-        if (!contentStarted && reasoningTokens > REASONING_CAP) {
-          stopForReasoningCap();
-          return;
-        }
       }
-
-      if (!firstChunk) {
-        firstChunk = chunk;
-        const str = chunk.toString().trim();
-
-        // P2.3: also catch {"type":"error",...} shaped bodies, not just
-        // FreeUsageLimitError / "error" substrings.
-        if (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes('"error"') || str.includes('"type":"error"') || str.includes('"type": "error"'))) {
-          try {
-            const parsed = JSON.parse(str);
-            if (parsed.error || parsed.type === "error") {
-              const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
-              log("error", "[ZEN RATE LIMITED]", withCause(429, errMsg));
-              if (!res.headersSent) {
-                res.status(429).json({
-                  error: { message: errMsg + " (free model rate limit)", type: "rate_limit_error", code: "rate_limit_exceeded" }
-                });
-              }
-              zenRes.resume();
-              return;
-            }
-          } catch {}
-        }
-
-        headersSent = true;
-        if (stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Transfer-Encoding": "chunked",
-          });
-          res.flushHeaders();
-        } else {
-          res.writeHead(zenRes.statusCode, { "Content-Type": "application/json" });
-        }
-        res.write(firstChunk);
-        if (res.flush) res.flush();
+      if (!contentStarted && reasoningTokens > REASONING_CAP) {
+        stopForReasoningCap();
         return;
       }
-      if (headersSent) {
-        res.write(chunk);
-        if (res.flush) res.flush();
-      }
-    });
 
-    zenRes.on("end", () => {
-      if (!headersSent && !firstChunk) {
-        log("warn", "[ZEN EMPTY] No response from Zen API");
-        if (!res.headersSent) {
-          res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
-        }
-        return;
-      }
-      // Upstream closed mid-stream without finish_reason/[DONE]: synthesize a
-      // clean ending so OpenAI SDK clients don't hang on an unterminated SSE.
-      if (stream && headersSent && !stopped && !finishSeen && !res.writableEnded) {
-        log("warn", `[ZEN ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] upstream closed mid-stream — synthesized ending`);
-        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "length" }] })}\n\n`);
-        res.write("data: [DONE]\n\n");
-      }
-      if (headersSent && !stopped) log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B${stream ? " stream" : " sync"}]`);
-      if (headersSent && !res.writableEnded) res.end();
-    });
-  });
-
-  req.on("error", (e) => {
-    if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    log("error", `[ZEN ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
-    if (!res.headersSent) {
-      res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
+      // Rewrite + forward (rewriter may buffer the frame when a tool name
+      // has not arrived yet; [DONE] flush-drops still-unnamed calls).
+      rewriter.feed(payload);
     }
-  });
+  }
 
-  req.on("timeout", () => {
-    req.destroy();
-    log("error", `[ZEN TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
-    if (!res.headersSent) {
-      res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
+  try {
+    await pumpZenStream(zenRes, controller, onData);
+    if (stopped) return; // reasoning cap / inline error already handled
+    if (!headersSent) {
+      log("warn", "[ZEN EMPTY] No response from Zen API");
+      if (!res.headersSent) {
+        res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
+      }
+      return;
     }
-  });
-
-  req.write(body);
-  req.end();
+    if (!finishSeen && !res.writableEnded) synthesizeEnding();
+    log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
+    if (!res.writableEnded) res.end();
+  } catch (e) {
+    if (stopped) return; // our own force-stop already handled the client
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+    // Mid-stream failure after headers went out: still end the SSE cleanly
+    // instead of leaving the client on a dangling connection.
+    if (headersSent && !res.writableEnded) {
+      if (!finishSeen) synthesizeEnding();
+      res.end();
+    }
+  }
 }
 
 // Collect full Zen response (non-streaming client) and return parsed JSON.
 // Upstream now always streams (free-tier fingerprint), so the SSE transcript
 // is aggregated into a chat.completion object; plain-JSON bodies (upstream
 // errors, legacy sync replies) still parse as before.
-function zenRequestFull(zenOpts, body) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(zenOpts, (zenRes) => {
-      const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
-      zenRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        const { json } = coerceChatSyncBody(raw);
-        resolve({ status: zenRes.statusCode, data: json ?? null, raw });
-      });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-    req.write(body);
-    req.end();
-  });
+async function zenRequestFull(zenOpts, body) {
+  const controller = new AbortController();
+  const zenRes = await zenFetchRaw(zenOpts, body, controller);
+  const raw = await collectZenBody(zenRes, controller);
+  const { json } = coerceChatSyncBody(raw);
+  return { status: zenRes.status, data: json ?? null, raw };
 }
 
 // Anthropic tool_choice → OpenAI tool_choice mapping.
@@ -835,251 +1233,265 @@ function openAIToAnthropic(oaiResp, model, inputTokens) {
   };
 }
 
-// Stream OpenAI SSE → Anthropic SSE
-function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
+// Stream OpenAI SSE → Anthropic SSE (upstream tool names rewritten: client
+// tools restored to their declared names, official-tool calls the client
+// cannot execute dropped along with their delta blocks).
+async function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, renames) {
   const msgId = ocId("msg");
   const TAG = zenOpts._tag || "??";
   const t0 = Date.now();
   let rxBytes = 0;
+  const controller = new AbortController();
 
-  const req = https.request(zenOpts, (zenRes) => {
-    // P2.4: upstream non-200 → buffer full body, return Anthropic-format error
-    // with mapped type (mirrors the sync-path mapping below).
-    if (zenRes.statusCode !== 200) {
-      const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
-      zenRes.on("end", () => {
-        let msg = "Upstream error";
-        try {
-          const p = JSON.parse(Buffer.concat(chunks).toString());
-          msg = p.error?.message || p.message || msg;
-        } catch {}
-        const errType = ({
-          400: "invalid_request_error",
-          401: "authentication_error",
-          403: "authentication_error",
-          404: "not_found_error",
-          429: "rate_limit_error",
-        })[zenRes.statusCode] || "api_error";
-        log("error", `[ZEN UPSTREAM ${zenRes.statusCode} ${TAG}]`, withCause(zenRes.statusCode, msg));
-        if (!res.headersSent) {
-          res.status(zenRes.statusCode).json({ type: "error", error: { type: errType, message: msg } });
-        }
-      });
+  let zenRes;
+  try {
+    zenRes = await zenFetchRaw(zenOpts, body, controller);
+  } catch (e) {
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
+    return;
+  }
+
+  // P2.4: upstream non-200 → buffer full body, return Anthropic-format error
+  // with mapped type (mirrors the sync-path mapping below).
+  if (zenRes.status !== 200) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller);
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
       return;
     }
-    let headersSent = false;
-    let buffer = "";
-    let outputTokens = 0;
-    let reasoningTokens = 0;
-    let contentIdx = 0;
-    let toolIdx = -1;
-    // P1.1: track text-block closure so finish handler never re-stops index 0.
-    let textBlockClosed = false;
-    let firstChunkHandled = false;
-    let finishHandled = false;
-
-    function sendSSE(event, data) {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-      if (res.flush) res.flush();
+    let msg = "Upstream error";
+    try {
+      const p = JSON.parse(raw);
+      msg = p.error?.message || p.message || msg;
+    } catch {}
+    const errType = ({
+      400: "invalid_request_error",
+      401: "authentication_error",
+      403: "authentication_error",
+      404: "not_found_error",
+      429: "rate_limit_error",
+    })[zenRes.status] || "api_error";
+    log("error", `[ZEN UPSTREAM ${zenRes.status} ${TAG}]`, withCause(zenRes.status, msg));
+    if (!res.headersSent) {
+      res.status(zenRes.status).json({ type: "error", error: { type: errType, message: msg } });
     }
+    return;
+  }
 
-    function sendHeaders() {
-      if (headersSent) return;
-      headersSent = true;
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.flushHeaders();
+  let headersSent = false;
+  let buffer = "";
+  let outputTokens = 0;
+  let reasoningTokens = 0;
+  let nextBlock = 0; // next Anthropic content_block index to allocate
+  let textIndex = -1;
+  let textOpen = false;
+  const openBlocks = []; // indices of blocks still needing content_block_stop
+  const toolBlocks = new Map(); // upstream tool index → { blockIdx, keep, opened }
+  let anyKeptTool = false;
+  let firstChunkHandled = false;
+  let finishHandled = false;
+  let selfStopped = false; // inline error / reasoning cap already handled the client
 
-      sendSSE("message_start", {
-        type: "message_start",
-        message: {
-          id: msgId, type: "message", role: "assistant", content: [],
-          model, stop_reason: null,
-          usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-        },
-      });
-    }
+  function sendSSE(event, data) {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (res.flush) res.flush();
+  }
 
-    zenRes.on("data", (chunk) => {
-      rxBytes += chunk.length;
-      const str = chunk.toString();
+  function sendHeaders() {
+    if (headersSent) return;
+    headersSent = true;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders();
 
-      // Check for errors on first chunk (P2.3: also {"type":"error"} shape)
-      if (!firstChunkHandled) {
-        firstChunkHandled = true;
-        const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes('"error"') || trimmed.includes('"type":"error"') || trimmed.includes('"type": "error"'))) {
-          try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed.error || parsed.type === "error") {
-              const errMsg = parsed.error?.message || parsed.message || "Rate limit";
-              if (!res.headersSent) {
-                res.writeHead(429, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({
-                  type: "error",
-                  error: { type: "rate_limit_error", message: errMsg + " (free model rate limit)" },
-                }));
-              }
-              zenRes.resume();
-              return;
+    sendSSE("message_start", {
+      type: "message_start",
+      message: {
+        id: msgId, type: "message", role: "assistant", content: [],
+        model, stop_reason: null,
+        usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    });
+  }
+
+  function closeBlock(index) {
+    sendSSE("content_block_stop", { type: "content_block_stop", index });
+    const i = openBlocks.indexOf(index);
+    if (i >= 0) openBlocks.splice(i, 1);
+  }
+
+  function finishUp(stopReason, outTok) {
+    if (res.writableEnded) return;
+    sendHeaders();
+    for (const idx of [...openBlocks]) closeBlock(idx);
+    sendSSE("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: outTok },
+    });
+    sendSSE("message_stop", { type: "message_stop" });
+    res.end();
+  }
+
+  function onData(chunk) {
+    rxBytes += chunk.length;
+    const str = chunk.toString();
+
+    // Check for errors on first chunk (P2.3: also {"type":"error"} shape)
+    if (!firstChunkHandled) {
+      firstChunkHandled = true;
+      const trimmed = str.trim();
+      if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes('"error"') || trimmed.includes('"type":"error"') || trimmed.includes('"type": "error"'))) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed.error || parsed.type === "error") {
+            const errMsg = parsed.error?.message || parsed.message || "Rate limit";
+            if (!res.headersSent) {
+              res.writeHead(429, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                type: "error",
+                error: { type: "rate_limit_error", message: errMsg + " (free model rate limit)" },
+              }));
             }
-          } catch {}
-        }
-      }
-
-      buffer += str;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const payload = line.slice(6).trim();
-        if (payload === "[DONE]") continue;
-
-        let parsed;
-        try { parsed = JSON.parse(payload); } catch { continue; }
-        const delta = parsed.choices?.[0]?.delta;
-        if (!delta) continue;
-
-        // Reasoning sniffer (Anthropic path): count reasoning_content tokens.
-        // If the model thinks forever without content/tools, force-stop.
-        if (delta.reasoning_content) {
-          reasoningTokens += Math.ceil(delta.reasoning_content.length / 4);
-          if (reasoningTokens > REASONING_CAP && contentIdx === 0 && toolIdx === -1) {
-            log("warn", `[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
-            req.destroy();
-            sendHeaders();
-            sendSSE("message_delta", {
-              type: "message_delta",
-              delta: { stop_reason: "max_tokens" },
-              usage: { output_tokens: outputTokens + reasoningTokens },
-            });
-            sendSSE("message_stop", { type: "message_stop" });
-            res.end();
+            abortUpstream(controller, "inline error, stop reading");
+            selfStopped = true;
             return;
           }
-        }
+        } catch {}
+      }
+    }
 
-        sendHeaders();
+    buffer += str;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
 
-        // Text content
-        if (delta.content) {
-          if (contentIdx === 0 && toolIdx === -1) {
-            sendSSE("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-            contentIdx = 1;
-          }
-          sendSSE("content_block_delta", {
-            type: "content_block_delta", index: 0,
-            delta: { type: "text_delta", text: delta.content },
-          });
-          outputTokens += Math.ceil(delta.content.length / 4);
-        }
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (payload === "[DONE]") continue;
 
-        // Tool calls
-        if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index ?? 0;
-            if (idx > toolIdx) {
-              // Close previous text block if open
-              if (toolIdx === -1 && contentIdx > 0) {
-                sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
-                textBlockClosed = true;
-              }
-              toolIdx = idx;
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_start", {
-                type: "content_block_start", index: blockIdx,
-                content_block: { type: "tool_use", id: tc.id || ocId("toolu"), name: tc.function?.name || "" },
-              });
-            }
-            if (tc.function?.arguments) {
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_delta", {
-                type: "content_block_delta", index: blockIdx,
-                delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-              });
-              outputTokens += Math.ceil(tc.function.arguments.length / 4);
-            }
-          }
-        }
+      let parsed;
+      try { parsed = JSON.parse(payload); } catch { continue; }
+      const delta = parsed.choices?.[0]?.delta;
+      if (!delta) continue;
 
-        // Finish (idempotent: upstream may repeat finish_reason — P1.1)
-        if (parsed.choices?.[0]?.finish_reason && !finishHandled) {
-          finishHandled = true;
-          const fr = parsed.choices[0].finish_reason;
-          // Close open blocks (skip index 0 if already closed on tool arrival — P1.1)
-          const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-          for (let i = 0; i < totalBlocks; i++) {
-            if (i === 0 && textBlockClosed) continue;
-            sendSSE("content_block_stop", { type: "content_block_stop", index: i });
-          }
-
-          let stopReason = "end_turn";
-          if (fr === "tool_calls") stopReason = "tool_use";
-          else if (fr === "length") stopReason = "max_tokens";
-
-          sendSSE("message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: stopReason },
-            usage: { output_tokens: outputTokens },
-          });
-          sendSSE("message_stop", { type: "message_stop" });
-          log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
+      // Reasoning sniffer (Anthropic path): count reasoning_content tokens.
+      // If the model thinks forever without content/tools, force-stop.
+      if (delta.reasoning_content) {
+        reasoningTokens += Math.ceil(delta.reasoning_content.length / 4);
+        if (reasoningTokens > REASONING_CAP && !textOpen && !anyKeptTool) {
+          log("warn", `[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
+          abortUpstream(controller, "reasoning cap force stop");
+          selfStopped = true;
+          finishUp("max_tokens", outputTokens + reasoningTokens);
+          return;
         }
       }
-    });
 
-    zenRes.on("end", () => {
-      if (!headersSent) {
-        if (!res.headersSent) {
-          res.status(502).json({ type: "error", error: { type: "upstream_error", message: "Empty response" } });
+      sendHeaders();
+
+      // Text content
+      if (delta.content) {
+        if (!textOpen) {
+          textIndex = nextBlock++;
+          textOpen = true;
+          openBlocks.push(textIndex);
+          sendSSE("content_block_start", { type: "content_block_start", index: textIndex, content_block: { type: "text", text: "" } });
         }
-        return;
-      }
-      // Upstream closed without finish_reason (abnormal cut): close open
-      // blocks and synthesize message_delta/message_stop so Anthropic SDK
-      // clients don't hang waiting for a proper stream termination.
-      if (!finishHandled && !res.writableEnded) {
-        log("warn", `[ZEN ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] upstream closed without finish_reason — synthesized ending`);
-        const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-        for (let i = 0; i < totalBlocks; i++) {
-          if (i === 0 && textBlockClosed) continue; // P1.1: same skip as finish handler
-          sendSSE("content_block_stop", { type: "content_block_stop", index: i });
-        }
-        sendSSE("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: "end_turn" },
-          usage: { output_tokens: outputTokens },
+        sendSSE("content_block_delta", {
+          type: "content_block_delta", index: textIndex,
+          delta: { type: "text_delta", text: delta.content },
         });
-        sendSSE("message_stop", { type: "message_stop" });
+        outputTokens += Math.ceil(delta.content.length / 4);
       }
-      res.end();
-    });
-  });
 
-  req.on("error", (e) => {
-    if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    log("error", `[ZEN ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
-    if (!res.headersSent) {
-      res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
+      // Tool calls — hold each upstream tool index until its name arrives,
+      // then decide keep (client tool → restore name) / drop (official
+      // tool the client cannot execute). Dropped calls swallow their deltas.
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          if (!tc || typeof tc !== "object") continue;
+          const idx = tc.index ?? 0;
+          let st = toolBlocks.get(idx);
+          if (!st) {
+            st = { blockIdx: -1, keep: false, opened: false };
+            toolBlocks.set(idx, st);
+          }
+          if (!st.opened) {
+            const upName = tc.function?.name || "";
+            if (!upName) continue; // name not in this delta yet — hold
+            st.keep = !dropToolCall(upName, renames);
+            st.opened = true;
+            if (st.keep) {
+              if (textOpen) {
+                closeBlock(textIndex); // close the text block before tools
+                textOpen = false;
+              }
+              st.blockIdx = nextBlock++;
+              openBlocks.push(st.blockIdx);
+              anyKeptTool = true;
+              sendSSE("content_block_start", {
+                type: "content_block_start", index: st.blockIdx,
+                content_block: { type: "tool_use", id: tc.id || ocId("toolu"), name: restoreToolName(upName, renames), input: {} },
+              });
+            }
+          }
+          if (!st.keep) continue;
+          if (tc.function?.arguments) {
+            sendSSE("content_block_delta", {
+              type: "content_block_delta", index: st.blockIdx,
+              delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+            });
+            outputTokens += Math.ceil(tc.function.arguments.length / 4);
+          }
+        }
+      }
+
+      // Finish (idempotent: upstream may repeat finish_reason — P1.1)
+      if (parsed.choices?.[0]?.finish_reason && !finishHandled) {
+        finishHandled = true;
+        const fr = parsed.choices[0].finish_reason;
+
+        let stopReason = "end_turn";
+        if (fr === "tool_calls") stopReason = anyKeptTool ? "tool_use" : "end_turn";
+        else if (fr === "length") stopReason = "max_tokens";
+
+        finishUp(stopReason, outputTokens);
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
+      }
     }
-  });
+  }
 
-  req.on("timeout", () => {
-    req.destroy();
-    log("error", `[ZEN TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
-    if (!res.headersSent) {
-      res.status(504).json({ type: "error", error: { type: "timeout_error", message: "Upstream timeout" } });
+  try {
+    await pumpZenStream(zenRes, controller, onData);
+    if (selfStopped) return;
+    if (!headersSent) {
+      if (!res.headersSent) {
+        res.status(502).json({ type: "error", error: { type: "upstream_error", message: "Empty response" } });
+      }
+      return;
     }
-  });
-
-  req.write(body);
-  req.end();
+    // Upstream closed without finish_reason (abnormal cut): close open
+    // blocks and synthesize message_delta/message_stop so Anthropic SDK
+    // clients don't hang waiting for a proper stream termination.
+    if (!finishHandled && !res.writableEnded) {
+      log("warn", `[ZEN ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] upstream closed without finish_reason — synthesized ending`);
+      finishUp(anyKeptTool ? "tool_use" : "end_turn", outputTokens);
+    }
+  } catch (e) {
+    if (selfStopped) return; // our own force-stop already handled the client
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
+    // Mid-stream failure after headers went out: still end the SSE cleanly.
+    if (headersSent && !res.writableEnded && !finishHandled) {
+      finishUp(anyKeptTool ? "tool_use" : "end_turn", outputTokens);
+    }
+  }
 }
 
 // ── Responses API transport (B1) ─────────────────────────────────────
@@ -1124,27 +1536,25 @@ function zenResponsesRequest(clientBody, sessionId) {
     log("warn", "[RES-DEGRADE] tool_choice", JSON.stringify(tc), "→ auto (upstream Responses supports only auto)");
   }
   reqBody.stream = true;
-  reqBody.tools = appendZenCompatTools(reqBody.tools, "responses");
+  // Official tools in Responses shape (flat {type,name,description,parameters}).
+  // Dormant path (no muse-spark models in the current registry) — client tools
+  // pass through unrenamed here.
+  const officialResponsesTools = OFFICIAL_TOOLS.map((t) => ({
+    type: "function",
+    name: t.function.name,
+    description: RESERVED_TOOL_DESC,
+    parameters: t.function.parameters,
+  }));
+  reqBody.tools = [...(Array.isArray(reqBody.tools) ? reqBody.tools : []), ...officialResponsesTools];
   const body = JSON.stringify(reqBody);
-  const requestId = ocId("msg");
   return {
     body,
     options: {
-      hostname: "opencode.ai",
+      hostname: ZEN_HOST,
       port: 443,
-      path: "/zen/v1/responses",
+      path: ZEN_RESPONSES_PATH,
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-        "Accept": "text/event-stream",
-        "Authorization": "Bearer public",
-        "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
-        "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": requestId,
-        "x-opencode-session": sessionId,
-      },
+      headers: zenHeaders(sessionId, body),
       timeout: 120000,
     },
   };
@@ -1152,60 +1562,77 @@ function zenResponsesRequest(clientBody, sessionId) {
 
 // Byte-passthrough pipe for the Responses API (sync JSON + SSE stream).
 // Same non-200分流 as the chat pipes: buffer + mapped error, never 200-dirty.
-function pipeZenResponses(zenOpts, body, stream, res) {
+async function pipeZenResponses(zenOpts, body, stream, res) {
   const TAG = zenOpts._tag || "??";
   const t0 = Date.now();
   let rxBytes = 0;
-  const req = https.request(zenOpts, (zenRes) => {
-    if (zenRes.statusCode !== 200) {
-      const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
-      zenRes.on("end", () => {
-        let msg = "Upstream error";
-        try {
-          const p = JSON.parse(Buffer.concat(chunks).toString());
-          msg = p.error?.message || p.message || msg;
-        } catch {}
-        log("error", `[ZEN RESPONSES UPSTREAM ${zenRes.statusCode} ${TAG}]`, withCause(zenRes.statusCode, msg));
-        if (!res.headersSent) {
-          res.status(zenRes.statusCode).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
-        }
-      });
+  const controller = new AbortController();
+
+  let zenRes;
+  try {
+    zenRes = await zenFetchRaw(zenOpts, body, controller);
+  } catch (e) {
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+    return;
+  }
+
+  if (zenRes.status !== 200) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller);
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
       return;
     }
-    // Sync client + stream:true upstream (free-tier fingerprint): buffer the
-    // Responses SSE transcript and answer with the terminal response object.
-    if (!stream) {
-      const chunks = [];
-      zenRes.on("data", (c) => { rxBytes += c.length; chunks.push(c); });
-      zenRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        const { json } = coerceResponsesSyncBody(raw);
-        if (json && (json.error || json.type === "error")) {
-          const msg = json.error?.message || json.message || "Upstream error";
-          const limited = raw.includes("FreeUsageLimitError");
-          const status = limited ? 429 : 502;
-          log("error", `[ZEN RESPONSES UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
-          if (!res.headersSent) {
-            res.status(status).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_exceeded" : "upstream_error" } });
-          }
-          return;
-        }
-        if (!json) {
-          const frag = raw.slice(0, 200);
-          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, withCause(502, frag || "Invalid upstream response"));
-          if (!res.headersSent) {
-            res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
-          }
-          return;
-        }
-        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B sync]`);
-        res.json(json);
-      });
+    let msg = "Upstream error";
+    try {
+      const p = JSON.parse(raw);
+      msg = p.error?.message || p.message || msg;
+    } catch {}
+    log("error", `[ZEN RESPONSES UPSTREAM ${zenRes.status} ${TAG}]`, withCause(zenRes.status, msg));
+    if (!res.headersSent) {
+      res.status(zenRes.status).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
+    }
+    return;
+  }
+
+  // Sync client + stream:true upstream (free-tier fingerprint): buffer the
+  // Responses SSE transcript and answer with the terminal response object.
+  if (!stream) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller, (c) => { rxBytes += c.length; });
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
       return;
     }
-    let headersSent = false;
-    zenRes.on("data", (chunk) => {
+    const { json } = coerceResponsesSyncBody(raw);
+    if (json && (json.error || json.type === "error")) {
+      const msg = json.error?.message || json.message || "Upstream error";
+      const limited = raw.includes("FreeUsageLimitError");
+      const status = limited ? 429 : 502;
+      log("error", `[ZEN RESPONSES UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
+      if (!res.headersSent) {
+        res.status(status).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_exceeded" : "upstream_error" } });
+      }
+      return;
+    }
+    if (!json) {
+      const frag = raw.slice(0, 200);
+      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, withCause(502, frag || "Invalid upstream response"));
+      if (!res.headersSent) {
+        res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
+      }
+      return;
+    }
+    log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B sync]`);
+    res.json(json);
+    return;
+  }
+
+  let headersSent = false;
+  try {
+    await pumpZenStream(zenRes, controller, (chunk) => {
       rxBytes += chunk.length;
       if (!headersSent) {
         headersSent = true;
@@ -1221,32 +1648,16 @@ function pipeZenResponses(zenOpts, body, stream, res) {
       res.write(chunk);
       if (res.flush) res.flush();
     });
-    zenRes.on("end", () => {
-      if (!headersSent && !res.headersSent) {
-        log("warn", `[ZEN EMPTY ${TAG} +${Date.now() - t0}ms] No response from upstream`);
-        res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
-        return;
-      }
-      if (headersSent) log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B${stream ? " stream" : " sync"}]`);
-      if (headersSent && !res.writableEnded) res.end();
-    });
-  });
-  req.on("error", (e) => {
-    if (res.writableEnded) return; // self-induced destroy (timeout) already logged
-    log("error", `[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
-    if (!res.headersSent) {
-      res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
+    if (headersSent) log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
+    if (headersSent && !res.writableEnded) res.end();
+  } catch (e) {
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+    if (!headersSent && !res.headersSent) {
+      res.status(502).json({ error: { message: "Empty response from upstream", type: "upstream_error" } });
+    } else if (headersSent && !res.writableEnded) {
+      res.end();
     }
-  });
-  req.on("timeout", () => {
-    req.destroy();
-    log("error", `[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
-    if (!res.headersSent) {
-      res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
-    }
-  });
-  req.write(body);
-  req.end();
+  }
 }
 
 // ── Chat → Responses translation (Phase 1: Spark on chat/messages) ──
@@ -1411,25 +1822,22 @@ function responsesSSEParser(onEvent) {
   };
 }
 
-function responsesNon200(zenRes, res, anthropicShape, tag) {
-  const chunks = [];
-  zenRes.on("data", (c) => chunks.push(c));
-  zenRes.on("end", () => {
-    let msg = "Upstream error";
-    let status = zenRes.statusCode;
-    try {
-      const p = JSON.parse(Buffer.concat(chunks).toString());
-      msg = p.error?.message || p.message || msg;
-    } catch {}
-    log("error", `[ZEN RESPONSES UPSTREAM ${status} ${tag || "??"}]`, withCause(status, msg));
-    if (res.headersSent) return;
-    if (anthropicShape) {
-      const errType = ({ 400: "invalid_request_error", 401: "authentication_error", 403: "authentication_error", 404: "not_found_error", 429: "rate_limit_error" })[status] || "api_error";
-      res.status(status >= 400 ? status : 502).json({ type: "error", error: { type: errType, message: msg } });
-    } else {
-      res.status(status >= 400 ? status : 502).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
-    }
-  });
+// Upstream non-200 for the Spark translation paths. `raw` is the full body
+// text (caller collects it via collectZenBody).
+function responsesNon200Raw(raw, status, res, anthropicShape, tag) {
+  let msg = "Upstream error";
+  try {
+    const p = JSON.parse(raw);
+    msg = p.error?.message || p.message || msg;
+  } catch {}
+  log("error", `[ZEN RESPONSES UPSTREAM ${status} ${tag || "??"}]`, withCause(status, msg));
+  if (res.headersSent) return;
+  if (anthropicShape) {
+    const errType = ({ 400: "invalid_request_error", 401: "authentication_error", 403: "authentication_error", 404: "not_found_error", 429: "rate_limit_error" })[status] || "api_error";
+    res.status(status >= 400 ? status : 502).json({ type: "error", error: { type: errType, message: msg } });
+  } else {
+    res.status(status >= 400 ? status : 502).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
+  }
 }
 
 // Shared: detect upstream 200-with-inline-error bodies (FreeUsageLimitError
@@ -1450,37 +1858,56 @@ function responsesFirstChunkIsError(s) {
 
 // Spark branch of /v1/chat/completions: translate the chat request upstream
 // to the Responses API, translate the reply back to chat (sync + stream).
-function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
+async function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
   const TAG = zenOpts._tag || "??";
   const t0 = Date.now();
   let rxBytes = 0;
-  const req = https.request(zenOpts, (zenRes) => {
-    if (zenRes.statusCode !== 200) return responsesNon200(zenRes, res, false, TAG);
+  const controller = new AbortController();
 
-    if (!stream) {
-      const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
-      zenRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        // Upstream always streams now (free-tier fingerprint) — coerce the
-        // SSE transcript back into a Responses object for the sync client.
-        const { json: d } = coerceResponsesSyncBody(raw);
-        if (!d) {
-          const frag = raw.slice(0, 200);
-          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
-          return res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
-        }
-        if (d.error || d.type === "error") {
-          const msg = d.error?.message || d.message || "Upstream error";
-          const limited = raw.includes("FreeUsageLimitError");
-          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
-          return res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
-        }
-        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
-        res.json(responsesObjectToChatResponse(d, chatModel));
-      });
+  let zenRes;
+  try {
+    zenRes = await zenFetchRaw(zenOpts, body, controller);
+  } catch (e) {
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+    return;
+  }
+  if (zenRes.status !== 200) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller);
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
       return;
     }
+    responsesNon200Raw(raw, zenRes.status, res, false, TAG);
+    return;
+  }
+
+  if (!stream) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller, (c) => { rxBytes += c.length; });
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+      return;
+    }
+    // Upstream always streams now (free-tier fingerprint) — coerce the
+    // SSE transcript back into a Responses object for the sync client.
+    const { json: d } = coerceResponsesSyncBody(raw);
+    if (!d) {
+      const frag = raw.slice(0, 200);
+      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
+      return res.status(502).json({ error: { message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response", type: "upstream_error" } });
+    }
+    if (d.error || d.type === "error") {
+      const msg = d.error?.message || d.message || "Upstream error";
+      const limited = raw.includes("FreeUsageLimitError");
+      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
+      return res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
+    }
+    log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
+    return res.json(responsesObjectToChatResponse(d, chatModel));
+  }
 
     // ── stream: Responses event machine → chat chunks ──
     // Headers are written lazily on the first non-error upstream chunk (same
@@ -1529,7 +1956,7 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
       if (stopped) return;
       stopped = true;
       log("warn", `[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
-      req.destroy();
+      abortUpstream(controller, "reasoning cap force stop");
       finishUp("length");
     }
     const onEvent = (d) => {
@@ -1581,13 +2008,14 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
     // B-Q5: report a 200-with-error JSON body (both the first-chunk fast path
     // and the split-across-chunks case caught only by the accumulated tail).
     function reportInlineError(raw) {
+      if (res.headersSent) return res.end(); // stream already committed — nothing else to do
       let msg = "Rate limit";
       try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
       const limited = raw.includes("FreeUsageLimitError");
       log("error", `[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, withCause(limited ? 429 : 502, msg));
       res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
     }
-    zenRes.on("data", (c) => {
+    function onData(c) {
       rxBytes += c.length;
       rawAccum = rawAccum.length >= 16384 ? rawAccum.slice(-8192) + c.toString() : rawAccum + c.toString();
       if (stopped) return;
@@ -1603,69 +2031,84 @@ function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel) {
         return;
       }
       parser(c);
-    });
-    zenRes.on("end", () => {
+    }
+
+    try {
+      await pumpZenStream(zenRes, controller, onData);
+      if (stopped) return; // our own force-stop already handled the client
       if (errBuffering) {
-        return reportInlineError(Buffer.concat(errChunks).toString());
+        reportInlineError(Buffer.concat(errChunks).toString());
+        return;
       }
       // Abnormal upstream close without response.completed → synthesize a
       // finish (parity with pipeZenResponse's no-finish_reason handling) —
       // unless the raw tail is actually a split error body.
-      if (!completed && !stopped) {
+      if (!completed) {
         if (responsesFirstChunkIsError(rawAccum)) return reportInlineError(rawAccum);
         log("warn", `[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
         finishUp(toolCount > 0 ? "tool_calls" : "stop");
-      } else if (completed && !stopped) {
+      } else {
         log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
       }
-    });
-  });
-  req.on("error", (e) => {
-    if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    log("error", `[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
-    if (!res.headersSent) res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
-  });
-  req.on("timeout", () => {
-    req.destroy();
-    log("error", `[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
-    if (!res.headersSent) res.status(504).json({ error: { message: "Upstream timeout", type: "timeout_error" } });
-  });
-  req.write(body);
-  req.end();
-}
+    } catch (e) {
+      if (stopped) return; // our own force-stop already handled the client
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
+      // Mid-stream failure after headers went out: still end the SSE cleanly.
+      if (headSent && !res.writableEnded && !completed) finishUp(toolCount > 0 ? "tool_calls" : "stop");
+    }
+  }
 
 // Spark branch of /v1/messages: Responses upstream → Anthropic SSE/JSON.
-function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTokens) {
+async function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTokens) {
   const TAG = zenOpts._tag || "??";
   const t0 = Date.now();
   let rxBytes = 0;
-  const req = https.request(zenOpts, (zenRes) => {
-    if (zenRes.statusCode !== 200) return responsesNon200(zenRes, res, true, TAG);
+  const controller = new AbortController();
 
-    if (!stream) {
-      const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
-      zenRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        // Upstream always streams now (free-tier fingerprint) — coerce the
-        // SSE transcript back into a Responses object for the sync client.
-        const { json: d } = coerceResponsesSyncBody(raw);
-        if (!d) {
-          const frag = raw.slice(0, 200);
-          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
-          return res.status(502).json({ type: "error", error: { type: "upstream_error", message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response" } });
-        }
-        if (d.error || d.type === "error") {
-          const msg = d.error?.message || d.message || "Upstream error";
-          const limited = raw.includes("FreeUsageLimitError");
-          log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
-          return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
-        }
-        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
-        res.json(openAIToAnthropic(responsesObjectToChatResponse(d, chatModel), chatModel, inputTokens));
-      });
+  let zenRes;
+  try {
+    zenRes = await zenFetchRaw(zenOpts, body, controller);
+  } catch (e) {
+    reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
+    return;
+  }
+  if (zenRes.status !== 200) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller);
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
       return;
     }
+    responsesNon200Raw(raw, zenRes.status, res, true, TAG);
+    return;
+  }
+
+  if (!stream) {
+    let raw = "";
+    try {
+      raw = await collectZenBody(zenRes, controller, (c) => { rxBytes += c.length; });
+    } catch (e) {
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
+      return;
+    }
+    // Upstream always streams now (free-tier fingerprint) — coerce the
+    // SSE transcript back into a Responses object for the sync client.
+    const { json: d } = coerceResponsesSyncBody(raw);
+    if (!d) {
+      const frag = raw.slice(0, 200);
+      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(502, frag || "Invalid upstream response"));
+      return res.status(502).json({ type: "error", error: { type: "upstream_error", message: frag ? `Invalid upstream response: ${frag}` : "Invalid upstream response" } });
+    }
+    if (d.error || d.type === "error") {
+      const msg = d.error?.message || d.message || "Upstream error";
+      const limited = raw.includes("FreeUsageLimitError");
+      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
+      return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
+    }
+    log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
+    return res.json(openAIToAnthropic(responsesObjectToChatResponse(d, chatModel), chatModel, inputTokens));
+  }
 
     // ── stream: Responses event machine → Anthropic SSE ──
     let headSent = false;
@@ -1738,7 +2181,7 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
         if (!anyTool && reasoningTokens > REASONING_CAP && !textOpen) {
           stopped = true;
           log("warn", `[ZEN RESPONSES REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
-          req.destroy();
+          abortUpstream(controller, "reasoning cap force stop");
           sendHeaders();
           finishUp("max_tokens", reasoningTokens);
         }
@@ -1769,7 +2212,7 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
       if (res.headersSent) return res.end();
       return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
     }
-    zenRes.on("data", (c) => {
+    function onData(c) {
       rxBytes += c.length;
       rawAccum = rawAccum.length >= 16384 ? rawAccum.slice(-8192) + c.toString() : rawAccum + c.toString();
       if (stopped) return;
@@ -1785,34 +2228,29 @@ function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, inputTo
         return;
       }
       parser(c);
-    });
-    zenRes.on("end", () => {
+    }
+
+    try {
+      await pumpZenStream(zenRes, controller, onData);
+      if (stopped) return; // our own force-stop already handled the client
       if (errBuffering) {
-        return reportInlineError(Buffer.concat(errChunks).toString());
+        reportInlineError(Buffer.concat(errChunks).toString());
+        return;
       }
-      if (!completed && !stopped) {
+      if (!completed) {
         if (responsesFirstChunkIsError(rawAccum)) return reportInlineError(rawAccum);
         log("warn", `[ZEN RESPONSES ABORT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B] stream ended without response.completed`);
-        sendHeaders();
         finishUp(anyTool ? "tool_use" : "end_turn", outputTokens);
-      } else if (completed && !stopped) {
+      } else {
         log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
       }
-    });
-  });
-  req.on("error", (e) => {
-    if (res.writableEnded) return; // self-induced destroy (timeout/reasoning-cap) already logged
-    log("error", `[ZEN RESPONSES ERROR ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, netCause(e));
-    if (!res.headersSent) res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
-  });
-  req.on("timeout", () => {
-    req.destroy();
-    log("error", `[ZEN RESPONSES TIMEOUT ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B]`, "上游 120 秒無回應（免費模型尖峰排隊常見，稍後重試）");
-    if (!res.headersSent) res.status(504).json({ type: "error", error: { type: "timeout_error", message: "Upstream timeout" } });
-  });
-  req.write(body);
-  req.end();
-}
+    } catch (e) {
+      if (stopped) return; // our own force-stop already handled the client
+      reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
+      // Mid-stream failure after headers went out: still end the SSE cleanly.
+      if (!res.writableEnded && !completed) finishUp(anyTool ? "tool_use" : "end_turn", outputTokens);
+    }
+  }
 
 // B2: Muse Spark routing helpers. B2's original "sparkWrongEndpoint" rejection
 // on chat/messages was retired in Phase 1 — Spark now rides the Chat →
@@ -1903,9 +2341,9 @@ app.post("/v1/chat/completions", (req, res) => {
 
   log("info", "[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
 
-  const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId, req.body);
+  const { body, options, renames } = zenRequest(model, messages, tools, sessionId, req.body);
   options._tag = `OAI ${user} ${model}`;
-  pipeZenResponse(options, body, stream, res, model);
+  pipeZenResponse(options, body, stream, res, model, renames);
 });
 
 // ── Routes: Responses API (B1) ───────────────────────────────────────
@@ -2007,11 +2445,11 @@ app.post("/v1/messages", async (req, res) => {
 
   log("info", "[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
 
-  const { body, options } = zenRequest(model, messages, stream, tools, mappedChoice, sessionId, req.body);
+  const { body, options, renames } = zenRequest(model, messages, tools, sessionId, req.body);
   options._tag = `ANT ${user} ${model}`;
 
   if (stream) {
-    pipeZenAsAnthropic(options, body, model, res, inputTokens);
+    pipeZenAsAnthropic(options, body, model, res, inputTokens, renames);
   } else {
     try {
       const t0 = Date.now();
@@ -2049,6 +2487,7 @@ app.post("/v1/messages", async (req, res) => {
         });
       }
       log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxLen}B sync]`);
+      rewriteAggregatedToolCalls(zenResp.data, renames);
       res.json(openAIToAnthropic(zenResp.data, model, inputTokens));
     } catch (e) {
       log("error", "[ZEN ERROR]", netCause(e));
@@ -2059,7 +2498,7 @@ app.post("/v1/messages", async (req, res) => {
 
 // ── Health ──────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({
-  status: "ok", version: `v${PROXY_VERSION}`, models: MODELS.length,
+  status: "ok", version: `v${PROXY_VERSION}`, runtime: RUNTIME, models: MODELS.length,
   models_source: MODELS_ORIGIN, models_loaded_at: MODELS_LOADED_AT,
   endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
 }));
@@ -2109,9 +2548,15 @@ function printModels() {
 
 // ── Start ──────────────────────────────────────────────────────────
 await loadModels();
+const upstreamList = await fetchUpstreamModels();
+if (upstreamList) mergeUpstreamModels(upstreamList);
 printModels();
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
+  console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT} (runtime: ${RUNTIME})`);
+  if (RUNTIME !== "bun") {
+    console.log("  [WARN] Running under Node.js — the upstream free tier REJECTS Node's TLS");
+    console.log("         fingerprint with 429 FreeUsageLimitError. Start with `bun server.mjs`.");
+  }
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");
   console.log("  Responses: POST /v1/responses  (Muse Spark home; chat/messages auto-translate Spark)");

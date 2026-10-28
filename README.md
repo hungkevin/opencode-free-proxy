@@ -7,29 +7,46 @@ One server — works with any tool that speaks OpenAI or Anthropic format: Curso
 ## 30-second setup
 
 ```bash
+# 1. Install Bun (the upstream free tier rejects Node.js at the TLS layer — see below)
+curl -fsSL https://bun.sh/install | bash        # macOS / Linux
+# powershell -c "irm bun.sh/install.ps1 | iex"  # Windows
+
+# 2. Run
 git clone https://github.com/bigdata2211it-web/opencode-free-proxy.git
 cd opencode-free-proxy
-npm install
-node server.mjs
+bun install
+bun server.mjs
 ```
 
 Done. Server is at `http://localhost:6446`. API keys are in `api-keys.json` (auto-generated on first run).
+
+> **Bun is required, not optional.** Since 2026-10 the upstream identifies
+> clients by TLS handshake fingerprint. Node.js (and curl) get
+> `429 FreeUsageLimitError` no matter what the request contains. Bun's TLS
+> hello is what OpenCode itself uses, so running the server under Bun passes.
+> If you start it with `node server.mjs` anyway, the proxy prints a warning
+> and every upstream call fails with a rate-limit error.
 
 ## What you get
 
 Model availability rotates — the proxy loads the currently-active zero-cost
 models from `https://models.opencode.ai/api.json` at startup
-(filter: `cost.input === 0 && cost.output === 0 && status !== "deprecated"`).
+(filter: `cost.input === 0 && cost.output === 0 && status !== "deprecated"`),
+then merges any extra ids served by the live inference endpoint
+(`GET https://opencode.ai/inference/v1/models`).
 Always check `GET /v1/models` for the live list; the table below is a snapshot.
 
-| Model (snapshot 2026-09-25) | What it is | Reliability |
+| Model (snapshot 2026-10-28) | What it is | Reliability |
 |-------|-----------|-------------|
-| `space-bunny-free` | Space Bunny Free | new |
-| `mimo-v2.6-flash-free` | MiMo V2.6 Flash (**image input**) | new |
-| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 (**responses only**) | Solid |
-| `ling-3.0-flash-fin-free` | Ling 3.0 Flash | Intermittent |
+| `flint-40b-free` | Flint 40B Free | new |
+| `nemotron-3.5-super-vl-free` | NVIDIA Nemotron 3.5 Super VL (**image input**) | new |
+| `beam-free` | Beam Free | new |
+| `mimo-v2.6-flash-free` | MiMo V2.6 Flash | Solid |
+| `deepseek-v4.1-flash-free` | DeepSeek V4.1 Flash | Solid |
+| `glm-5.3-flash-free` | GLM 5.3 Flash | Solid |
 | `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning | Solid |
 | `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | Hit or miss |
+| `jev-1.13-free` | Jev 1.13 (live endpoint only) | new |
 | `big-pickle` | Big Pickle (alias, name has no `free`) | Solid |
 
 All models support streaming, tool calls, and system messages.
@@ -48,7 +65,7 @@ curl http://localhost:6446/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "mimo-v2.5-free",
+    "model": "mimo-v2.6-flash-free",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
@@ -61,7 +78,7 @@ curl http://localhost:6446/v1/messages \
   -H "x-api-key: YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "mimo-v2.5-free",
+    "model": "mimo-v2.6-flash-free",
     "system": "You are helpful.",
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 1024,
@@ -130,9 +147,9 @@ Add to `~/.config/opencode/opencode.json`:
       "apiKey": "YOUR_KEY",
       "baseURL": "http://localhost:6446/v1",
       "models": {
-        "free/mimo-v2.5-free": {
-          "id": "mimo-v2.5-free",
-          "name": "free/mimo-v2.5-free",
+        "free/mimo-v2.6-flash-free": {
+          "id": "mimo-v2.6-flash-free",
+          "name": "free/mimo-v2.6-flash-free",
           "attachment": true,
           "reasoning": true
         }
@@ -146,7 +163,7 @@ Add to `~/.config/opencode/opencode.json`:
 
 - Base URL: `http://YOUR_HOST:6446/v1`
 - API Key: your key from `api-keys.json`
-- Model: `mimo-v2.5-free` (or any non-Spark ID from `GET /v1/models`; Spark models live on `/v1/responses`)
+- Model: `mimo-v2.6-flash-free` (or any non-Spark ID from `GET /v1/models`; Spark models live on `/v1/responses`)
 
 ### Claude Code (Anthropic format)
 
@@ -158,12 +175,13 @@ Add to `~/.config/opencode/opencode.json`:
 
 ```bash
 # On your VPS
+curl -fsSL https://bun.sh/install | bash     # install Bun (required)
 git clone https://github.com/bigdata2211it-web/opencode-free-proxy.git
 cd opencode-free-proxy
-npm install
-node server.mjs          # foreground
+bun install
+bun server.mjs          # foreground
 # or
-nohup node server.mjs > proxy.log 2>&1 &   # background
+nohup bun server.mjs > proxy.log 2>&1 &   # background
 ```
 
 If your VPS doesn't expose port 6446, use an SSH tunnel:
@@ -184,7 +202,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/opencode-proxy
-ExecStart=/usr/bin/node server.mjs
+ExecStart=/root/.bun/bin/bun server.mjs
 Restart=always
 RestartSec=5
 Environment=PROXY_PORT=6446
@@ -205,16 +223,21 @@ sudo systemctl enable --now opencode-proxy
 | `KEYS_FILE` | `./api-keys.json` | API keys file path |
 | `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | Model registry URL (http allowed, e.g. LAN mirror) |
 | `REASONING_CAP` | `65536` | Stream reasoning-token fuse before force-stop; `0` disables |
-| `MAX_TOKENS_DEFAULT` | `32768` | Injected `max_tokens` when client sends no length cap; `0` disables |
+| `OUTPUT_LIMIT` | `32000` | `max_completion_tokens` sent upstream when the client sends no length cap; `0` disables (`MAX_TOKENS_DEFAULT` still honored as a legacy alias) |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
+
+> Note: client `temperature`/`top_p`/`stop`/`seed`/`tool_choice` are **not**
+> forwarded upstream — the free tier only accepts the official client's
+> parameter set. A client that wants "no tools" gets a system-prompt nudge
+> instead of `tool_choice: "none"`.
 
 ### Log levels (`LOG_LEVEL`)
 
 ```powershell
-$env:LOG_LEVEL="warn"; node server.mjs   # Windows PowerShell
+$env:LOG_LEVEL="warn"; bun server.mjs   # Windows PowerShell
 ```
 ```bash
-LOG_LEVEL=warn node server.mjs   # Git Bash / Linux
+LOG_LEVEL=warn bun server.mjs   # Git Bash / Linux
 ```
 
 Set once at startup (changing it requires a restart). Case-insensitive;
@@ -238,7 +261,7 @@ What each line looks like:
 # warn — degradation / fuse / synthesized endings
 [RES-DEGRADE] tool_choice {...} → auto (upstream supports only auto)
 [ZEN REASONING CAP] 70000 reasoning tokens, no content → force stop
-[ZEN ABORT OAI admin mimo-v2.5-free +8120ms rx=1832B] upstream closed mid-stream — synthesized ending
+[ZEN ABORT OAI admin mimo-v2.6-flash-free +8120ms rx=1832B] upstream closed mid-stream — synthesized ending
 
 # error — every line carries a Chinese cause suffix
 [ZEN UPSTREAM 503 OAI admin ling-3.0-flash-fin-free] ...Endpoint is unavailable.（上游端點暫時下線，換模型）
@@ -259,51 +282,78 @@ default `info` when tracing a single issue (request→completion pairs),
 Your tool (Cursor, CLI, curl, etc.)
         │
         ▼
-  opencode-free-proxy        ← this server, translates formats
+  opencode-free-proxy        ← this server, translates formats (run under Bun)
         │
-        ▼  HTTPS
-  opencode.ai/zen/v1/       ← free tier API
+        ▼  HTTPS (Bun TLS fingerprint)
+  opencode.ai/inference/v1/  ← free tier API
 ```
 
-The proxy adds `x-opencode-*` authentication headers that the Zen API requires. These were discovered by reverse engineering the opencode binary — without them, even `Authorization: Bearer public` gets rejected with `AuthError`.
+The proxy adds the `x-opencode-*` authentication headers the API requires and
+shapes every request to look exactly like the official OpenCode client
+(official system prompt + official tool set + `max_completion_tokens`).
+Client-declared tools ride along renamed with an `oc2api_` prefix so they can
+never collide with the built-in tools; on the way back the proxy restores the
+original names and silently drops any built-in tool the model picked on its
+own (the client has no way to execute those).
 
-### Zen free-tier gate (403 `FreeTierError`)
+### The two-layer free-tier gate (429 `FreeUsageLimitError`)
 
-Since 2026-09 the Zen free tier only answers requests that look like they
-came from inside OpenCode — otherwise it returns:
+Since 2026-10 the free tier gates on **two layers at once** — verified
+2026-10-28 with differential probes (`review/probe_tls_fingerprint_*.mjs`;
+the identical request body sent from two runtimes):
 
-```
-403 {"type":"error","error":{"type":"FreeTierError",
-     "message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"}}
-```
+**Layer 1 — TLS handshake fingerprint (transport).** The upstream reads the
+TLS ClientHello and rejects anything that is not Bun's BoringSSL hello:
 
-Differential probes (`review/probe_freetier*.mjs`, `review/probe_responses_*.mjs`)
-isolated three **necessary** conditions — breaking any single one → 403:
+| Runtime | Same request body | Result |
+|---------|-------------------|--------|
+| Node.js v22 (`https.request`) | oc2api-shaped | **429 FreeUsageLimitError** |
+| curl | oc2api-shaped | **429 FreeUsageLimitError** |
+| Bun 1.3 (`fetch` **and** `node:https`) | oc2api-shaped | **200 stream** |
+| Bun 1.4 (`fetch`) | oc2api-shaped | **200 stream** |
+| Bun 1.4 (`node:https`) | oc2api-shaped | **429** — 1.4 regressed the compat layer |
 
-1. `x-opencode-session` must be `ses_` + exactly **26 lowercase hex chars**
-   (missing header, wrong length, uppercase, non-hex → 403)
-2. `tools` must contain all five OpenCode built-in names
-   **`bash` / `edit` / `glob` / `grep` / `read`** — names only, schemas and
-   descriptions are irrelevant; extra user tools may coexist; 1/2/4 tools or
-   five unrelated names → 403
-3. the upstream request must be **`stream: true`** — on both
-   `/zen/v1/chat/completions` and `/zen/v1/responses` (`stream:false` → 403)
+That is why this server must run under **Bun** — OpenCode itself is a Bun app,
+so Bun's hello is the fingerprint the gate expects. It is also why every
+upstream call goes through **native `fetch`**: bun 1.4 regressed its
+`node:https` compat-layer hello (1.3 passed, 1.4 gets 429), while `fetch`
+carries the correct fingerprint on every bun version — so upgrading bun no
+longer requires pinning anything. Node-based TLS spoofing
+libraries (e.g. `node-tls-client`) only offer Chrome/Firefox/Safari profiles —
+there is no Bun profile, so spoofing from Node is a gamble; using Bun is the
+exact answer.
 
-`x-opencode-client` (`cli`/`desktop`), `User-Agent` and `Accept` are *not*
-checked. This proxy satisfies all three (same approach as `oc2api`), and
-since every upstream request streams, sync client requests are aggregated
-back into a single JSON object locally.
+**Layer 2 — request shape (application).** Even with a correct fingerprint,
+the old shape fails. The request must mirror the official client (the working
+`oc2api` reference implementation):
 
-### Zen API auth headers (for the curious)
+- `POST /inference/v1/chat/completions` (the old `/zen/v1/*` paths are dead)
+- `User-Agent: opencode/latest/2.1.1/cli`, project-id hash in
+  `x-opencode-project`, four session headers (`x-opencode-session`,
+  `x-opencode-session-id`, `x-session-affinity`, `X-Session-Id`)
+- session id format `ses_` + 12 hex (bitwise-NOT of `ms*0x1000 + counter`) +
+  14 base62 chars; the in-millisecond counter must stay in `1..15`
+- the official system prompt (`oc-prompt.txt`) first, client system messages
+  appended after it
+- the 12 official OpenCode tools (`oc-tools.json`, descriptions replaced with
+  a "do not call" marker) always present, plus renamed client tools
+- always `stream: true` + `stream_options.include_usage` — sync client
+  requests are aggregated back into one JSON object locally
+- `max_completion_tokens` (never `max_tokens`), no `tool_choice`, and no
+  `temperature`/`top_p`/`stop`/`seed` forwarding
+
+### Upstream request headers (for the curious)
 
 ```
 Authorization: Bearer public
-User-Agent: opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13
-Accept: text/event-stream
+User-Agent: opencode/latest/2.1.1/cli
+Accept: */*
 x-opencode-client: cli
-x-opencode-project: global
-x-opencode-request: msg_<unique_id>
-x-opencode-session: ses_<26 lowercase hex chars>
+x-opencode-project: 3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787
+x-opencode-session:    ses_<12 hex + 14 base62>
+x-opencode-session-id: ses_<same>
+x-session-affinity:    ses_<same>
+X-Session-Id:          ses_<same>
 ```
 
 ## License

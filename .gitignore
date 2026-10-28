@@ -2,7 +2,10 @@ node_modules/
 api-keys.json
 *.log
 .env
+.tmp-bun144/
 
 review/*.mjs
+!review/probe_tls_fingerprint_node.mjs
+!review/probe_tls_fingerprint_bun.mjs
 review/*.py
 review/*.pptx

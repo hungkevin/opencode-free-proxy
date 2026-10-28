@@ -1,18 +1,20 @@
 {
   "name": "opencode-free-proxy",
-  "version": "0.10.0",
-  "description": "Proxy server for OpenCode free-tier AI models via Zen API",
+  "version": "0.11.1",
+  "description": "Proxy server for OpenCode free-tier AI models via Zen API (requires Bun — upstream gates on TLS fingerprint)",
   "type": "module",
   "main": "server.mjs",
   "scripts": {
-    "start": "node server.mjs",
-    "dev": "node --watch server.mjs"
+    "start": "bun server.mjs",
+    "start:node": "node server.mjs",
+    "dev": "bun --watch server.mjs"
   },
   "dependencies": {
     "express": "^4.21.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18",
+    "bun": ">=1.0"
   },
   "license": "MIT"
 }
