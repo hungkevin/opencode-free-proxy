@@ -230,6 +230,7 @@ sudo systemctl enable --now opencode-proxy
 | `SESSION_TTL_MS` | `1800000` | Session rotation TTL (ms); `0` disables rotation (fresh session per request) |
 | `OUTPUT_LIMIT` | `32000` | `max_completion_tokens` sent upstream when the client sends no length cap; `0` disables (`MAX_TOKENS_DEFAULT` still honored as a legacy alias) |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
+| `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 
 > Note: client `temperature`/`top_p`/`stop`/`seed`/`tool_choice` are **not**
 > forwarded upstream — the free tier only accepts the official client's

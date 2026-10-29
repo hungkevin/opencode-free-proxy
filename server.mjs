@@ -95,7 +95,11 @@ function setApiKeys(keys) {
 }
 
 // oc-<40 hex> → oc-<first 7>…<last 4>: enough to tell keys apart, useless if
-// the log leaks. Short/exotic values are masked wholesale.
+// the log leaks. Short/exotic values are masked wholesale. Keys print in full
+// by default (the banner targets the operator's own terminal); set MASK_KEYS=1
+// when stdout is redirected into a persistent log you don't want holding
+// credentials.
+const MASK_KEYS = /^(1|true)$/i.test(String(process.env.MASK_KEYS || "").trim());
 function maskKey(key) {
   const s = String(key);
   return s.length > 12 ? `${s.slice(0, 7)}…${s.slice(-4)}` : "…";
@@ -3082,12 +3086,12 @@ async function main() {
     console.log("  Responses: POST /v1/responses  (Muse Spark home; chat/messages auto-translate Spark)");
     console.log("  Models:    GET  /v1/models");
     console.log("  Health:    GET  /health");
-    // Keys are printed masked: stdout is frequently redirected into a
-    // persistent log file (start_warn.bat, README systemd/nohup examples), and
-    // a standing credential leak of the proxy's own key. Read api-keys.json
-    // for the real value.
+    // Keys print in full unless MASK_KEYS=1: stdout is frequently redirected
+    // into a persistent log file (start_warn.bat, README systemd/nohup
+    // examples), in which case set MASK_KEYS=1 to avoid a standing credential
+    // leak. Real values always live in api-keys.json.
     for (const [name, key] of Object.entries(apiKeys)) {
-      console.log(`  ${name.padEnd(15)} ${maskKey(key)}`);
+      console.log(`  ${name.padEnd(15)} ${MASK_KEYS ? maskKey(key) : key}`);
     }
   });
   server.on("error", (e) => {
