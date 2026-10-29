@@ -47,19 +47,58 @@ process.on("unhandledRejection", (e) => {
 // ── API Keys ───────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
 let apiKeys = {};
+// Only "name": "non-empty token" pairs are accepted. Anything else is dropped
+// rather than coerced: an empty value would make safeEqual("", "") match an
+// unauthenticated request (no header → ""), silently disabling auth, and a
+// top-level array/string turns Object.entries into index→char pairs so a
+// single character authenticates. Malformed entries are reported, not
+// silently ignored, so the operator can see the mistake.
+function normalizeKeys(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [name, key] of Object.entries(raw)) {
+    if (typeof key === "string" && key.length > 0) out[name] = key;
+    else log("warn", `[KEYS] Dropping "${name}": value must be a non-empty string`);
+  }
+  return out;
+}
+
 function loadKeys() {
-  try { apiKeys = JSON.parse(fs.readFileSync(keysFile, "utf8")); } catch {}
-  if (Object.keys(apiKeys).length === 0) {
+  let parsed = null;
+  try { parsed = JSON.parse(fs.readFileSync(keysFile, "utf8")); } catch {}
+  if (!parsed) {
+    // Missing file = first run (generate). Unreadable/invalid JSON is NOT
+    // silently replaced, or a typo in an edited keys file would rotate every
+    // key and lock out all clients without a word.
+    if (fs.existsSync(keysFile)) {
+      console.error(`[KEYS] ${keysFile} exists but is not valid JSON - refusing to overwrite it.`);
+      console.error("[KEYS] Fix the file, or delete it to regenerate new keys.");
+      process.exit(1);
+    }
+  }
+  const normalized = parsed ? normalizeKeys(parsed) : null;
+  if (!normalized || Object.keys(normalized).length === 0) {
+    if (parsed) log("warn", `[KEYS] ${keysFile} has no usable key - regenerating`);
     apiKeys = {
       admin: "oc-" + crypto.randomBytes(20).toString("hex"),
       "user-default": "oc-" + crypto.randomBytes(20).toString("hex"),
     };
     fs.writeFileSync(keysFile, JSON.stringify(apiKeys, null, 2));
     console.log("[INIT] Generated new API keys →", keysFile);
+    return;
   }
+  apiKeys = normalized;
 }
+
 function setApiKeys(keys) {
-  apiKeys = keys && typeof keys === "object" ? keys : {};
+  apiKeys = normalizeKeys(keys) || {};
+}
+
+// oc-<40 hex> → oc-<first 7>…<last 4>: enough to tell keys apart, useless if
+// the log leaks. Short/exotic values are masked wholesale.
+function maskKey(key) {
+  const s = String(key);
+  return s.length > 12 ? `${s.slice(0, 7)}…${s.slice(-4)}` : "…";
 }
 
 function auth(req) {
@@ -614,7 +653,14 @@ setInterval(() => {
 // tokens without producing any content, force-stop the stream.
 // Default 65536 (~262K chars) — DeepSeek V4 Flash supports up to 384K
 // output tokens total, so keep the fuse wide enough for long thinking.
-const REASONING_CAP = envInt("REASONING_CAP", 65536);
+// REASONING_CAP=0 disables the fuse. Infinity (not 0, not -1) is the switch-off
+// value: every site below tests `reasoningTokens > REASONING_CAP`, so a plain 0
+// would make the fuse fire on the FIRST reasoning token instead of never. A
+// negative value is a typo for 0 → treat it as disabled as well.
+const REASONING_CAP = (() => {
+  const n = envInt("REASONING_CAP", 65536);
+  return n > 0 ? n : Infinity;
+})();
 // Default output-token cap injected when the client sends none. Reasoning
 // models count thinking toward output tokens, so this bounds a runaway
 // thinker at the API level (covers sync requests the SSE sniffer can't see).
@@ -1733,6 +1779,10 @@ function zenResponsesRequest(clientBody, sessionId, opts = {}) {
     }
   }
   delete reqBody.max_tokens;
+  // Sampling params are never forwarded (oc2api shape.Build parity): the free
+  // tier takes only the official client's parameter set. This also covers the
+  // native /v1/responses passthrough, which hands req.body straight through.
+  for (const k of ["temperature", "top_p", "seed"]) delete reqBody[k];
   if (renameTools && Array.isArray(reqBody.tools)) {
     reqBody.tools = reqBody.tools.map((t) => {
       if (!t || typeof t !== "object") return t;
@@ -1750,9 +1800,15 @@ function zenResponsesRequest(clientBody, sessionId, opts = {}) {
   // OpenCode built-in tools are always present. Upstream accepts ONLY
   // tool_choice "auto" here (probe Q1: none/required/named → 400), so any
   // other choice is degraded to auto before the compat tools are merged in.
+  // NOTE: this runs BEFORE the official tools are merged in. The merge is
+  // unconditional on purpose (the free tier's shape gate requires the whole
+  // set), but "none" must still drop the CLIENT tools, so the merge below is
+  // applied to the client side only and the client's choice is recorded.
+  let clientToolChoice = "auto";
   if (reqBody.tool_choice !== undefined && reqBody.tool_choice !== "auto") {
     const tc = reqBody.tool_choice;
     if (tc === "none") {
+      clientToolChoice = "none";
       delete reqBody.tools;
     } else if (tc && typeof tc === "object") {
       const want = tc.function?.name || tc.name;
@@ -1775,7 +1831,28 @@ function zenResponsesRequest(clientBody, sessionId, opts = {}) {
     description: RESERVED_TOOL_DESC,
     parameters: t.function.parameters,
   }));
-  reqBody.tools = [...(Array.isArray(reqBody.tools) ? reqBody.tools : []), ...officialResponsesTools];
+  // Native /v1/responses passthrough does NOT rename client tools (renaming is
+  // only wired on the chat/messages translation paths, which restore the names
+  // on the way back). Without it a client tool may reuse an official marker
+  // name — upstream then sees two tools called `read`, and worse, a call for
+  // `read` is indistinguishable from the official marker at the response
+  // boundary, so the pipe cannot drop it and the client gets a phantom call.
+  // A shadowed client tool can never be invoked under its own name on this
+  // route, so dropping it is honest (the chat/messages paths are the fix: they
+  // rename it to oc2api_read and deliver it).
+  const clientResponsesTools = (Array.isArray(reqBody.tools) ? reqBody.tools : [])
+    .filter((t) => {
+      const name = t && (t.name || t.function?.name);
+      return !name || !OFFICIAL_TOOL_NAMES.has(name);
+    });
+  reqBody.tools = [...clientResponsesTools, ...officialResponsesTools];
+  // tool_choice "none" (chat path: chatToResponsesRequest already deleted the
+  // tools; native responses path: clientToolChoice here). The official set must
+  // stay in `tools` for the shape gate, so the "do not call" intent is carried
+  // by the same nudge the chat path appends to its system prompt.
+  if (clientToolChoice === "none") {
+    reqBody.instructions = reqBody.instructions ? reqBody.instructions + NO_TOOLS_NUDGE : NO_TOOLS_NUDGE.trim();
+  }
   const body = JSON.stringify(reqBody);
   return {
     body,
@@ -2054,7 +2131,11 @@ function chatToResponsesRequest(c) {
   if (tc === "auto") {
     out.tool_choice = "auto";
   } else if (tc === "none") {
-    delete out.tools; // no tools → cannot call any
+    delete out.tools; // no client tools → cannot call any
+    // Keep the intent visible to zenResponsesRequest: it must not re-open the
+    // door by merging the official tool set and silently answering with one
+    // of those calls (dropped response-side = empty answer for the client).
+    out.tool_choice = "none";
   } else if (tc === "required" || (tc && typeof tc === "object")) {
     const want = tc && typeof tc === "object" ? (tc.function?.name || tc.name) : null;
     if (want && Array.isArray(out.tools)) out.tools = out.tools.filter((t) => t.name === want);
@@ -2063,12 +2144,17 @@ function chatToResponsesRequest(c) {
       log("warn", "[RES-DEGRADE] tool_choice", JSON.stringify(tc), "→ auto (upstream supports only auto)");
     } else {
       delete out.tools;
+      // "required" with no tools, or a named choice that matched nothing: the
+      // client asked for a call we cannot provide. Same intent as "none" —
+      // keep the official markers from answering instead.
+      out.tool_choice = "none";
     }
   }
-  // Responses API has no stop/seed params — passing them 400s upstream.
-  for (const k of ["max_tokens", "temperature", "top_p"]) {
-    if (c[k] !== undefined) out[k] = c[k];
-  }
+  // Length cap only. temperature/top_p/stop/seed are deliberately NOT carried
+  // over: the free tier accepts only the official client's parameter set
+  // (oc2api shape.Build writes exactly these six keys and nothing else), and
+  // an unproven param risks a 400 from upstream.
+  if (c.max_tokens !== undefined) out.max_tokens = c.max_tokens;
   // B-Q4: chat clients may cap length via max_completion_tokens (which
   // zenRequest forwards on the native chat path) — don't drop it for Spark.
   if (out.max_tokens === undefined && c.max_completion_tokens !== undefined) {
@@ -2853,9 +2939,9 @@ app.post("/v1/messages", async (req, res) => {
     if (tools?.length) chatReq.tools = tools;
     if (mappedChoice) chatReq.tool_choice = mappedChoice;
     if (req.body.max_tokens !== undefined) chatReq.max_tokens = req.body.max_tokens;
-    if (req.body.temperature !== undefined) chatReq.temperature = req.body.temperature;
-    if (req.body.top_p !== undefined) chatReq.top_p = req.body.top_p;
-    // stop_sequences：Responses API 無 stop 參數，chatToResponsesRequest 不轉發（捨棄）。
+    // temperature / top_p / stop_sequences 一律不轉發：上游免費層只接受官方客戶端
+    // 的參數集（與 chat 路徑的「不轉發」規則一致）；responses 路由若收到這兩個
+    // 欄位會被 zenResponsesRequest 原樣透傳，反而可能觸發 400，故此處不搬運。
     const respBody = chatToResponsesRequest(chatReq);
     const { body, options, renames } = zenResponsesRequest(respBody, sessionId, { renameTools: true });
     options._tag = `ANT→RES ${user} ${model}`;
@@ -2996,8 +3082,12 @@ async function main() {
     console.log("  Responses: POST /v1/responses  (Muse Spark home; chat/messages auto-translate Spark)");
     console.log("  Models:    GET  /v1/models");
     console.log("  Health:    GET  /health");
+    // Keys are printed masked: stdout is frequently redirected into a
+    // persistent log file (start_warn.bat, README systemd/nohup examples), and
+    // a standing credential leak of the proxy's own key. Read api-keys.json
+    // for the real value.
     for (const [name, key] of Object.entries(apiKeys)) {
-      console.log(`  ${name.padEnd(15)} ${key}`);
+      console.log(`  ${name.padEnd(15)} ${maskKey(key)}`);
     }
   });
   server.on("error", (e) => {
