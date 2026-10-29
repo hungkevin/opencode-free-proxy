@@ -94,6 +94,38 @@ function setApiKeys(keys) {
   apiKeys = normalizeKeys(keys) || {};
 }
 
+// ── OC keys (upstream Console key) ─────────────────────────────────
+// oc-keys.json (optional): {"ockeys": ["oc_sk_...", ...]}. When a key is
+// present, upstream requests send "Authorization: Bearer <oc_sk_...>"
+// (OpenCode Console key, same inference endpoints). With none, upstream
+// keeps the official anonymous token "public" (opencode provider fallback
+// apiKey:"public"). A missing/broken file degrades to "public" — unlike
+// api-keys.json this file is optional, so it must never fail startup.
+const ocKeysFile = process.env.OC_KEYS_FILE || "./oc-keys.json";
+let ocKeys = [];
+
+function normalizeOcKeys(keys) {
+  return (Array.isArray(keys) ? keys : [])
+    .filter((k) => typeof k === "string" && k.trim())
+    .map((k) => k.trim());
+}
+
+function loadOcKeys() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(ocKeysFile, "utf8"));
+    ocKeys = normalizeOcKeys(parsed?.ockeys);
+  } catch {
+    ocKeys = [];
+  }
+  if (ocKeys.length) console.log(`[OCKEYS] Loaded ${ocKeys.length} upstream key(s) from ${ocKeysFile}`);
+}
+
+function setOcKeys(keys) {
+  ocKeys = normalizeOcKeys(keys);
+}
+
+const zenKey = () => ocKeys[0] || "public";
+
 // oc-<40 hex> → oc-<first 7>…<last 4>: enough to tell keys apart, useless if
 // the log leaks. Short/exotic values are masked wholesale. Keys print in full
 // by default (the banner targets the operator's own terminal); set MASK_KEYS=1
@@ -267,7 +299,7 @@ function zenHeaders(sessionId, body) {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
     "Accept": "*/*",
-    "Authorization": "Bearer public",
+    "Authorization": `Bearer ${zenKey()}`,
     "User-Agent": OC_UA,
     "x-opencode-client": "cli",
     "x-opencode-project": OC_PROJECT,
@@ -617,7 +649,7 @@ async function fetchUpstreamModels() {
   try {
     const res = await fetch(zenUrl(ZEN_MODELS_PATH), {
       method: "GET",
-      headers: { "Accept": "application/json", "Authorization": "Bearer public", "User-Agent": OC_UA },
+      headers: { "Accept": "application/json", "Authorization": `Bearer ${zenKey()}`, "User-Agent": OC_UA },
       signal: AbortSignal.timeout(15000),
     });
     const json = await res.json();
@@ -3071,6 +3103,7 @@ function isMainModule() {
 
 async function main() {
   loadKeys();
+  loadOcKeys();
   await loadModels();
   const upstreamList = await fetchUpstreamModels();
   if (upstreamList) mergeUpstreamModels(upstreamList);
@@ -3143,6 +3176,9 @@ export {
   SESSION_TTL_MS,
   loadKeys,
   setApiKeys,
+  loadOcKeys,
+  setOcKeys,
+  zenKey,
   zenUrl,
   zenHeaders,
   zenSessionId,

@@ -225,6 +225,7 @@ sudo systemctl enable --now opencode-proxy
 | `PROXY_PORT` | `6446` | Server port |
 | `PROXY_HOST` | `0.0.0.0` | Bind address; set to `127.0.0.1` to listen only on loopback |
 | `KEYS_FILE` | `./api-keys.json` | API keys file path |
+| `OC_KEYS_FILE` | `./oc-keys.json` | Optional upstream OpenCode Console key file (`{"ockeys": ["oc_sk_...", ...]}`); with a key, upstream gets `Bearer <oc_sk_...>` instead of the anonymous `Bearer public`. Missing/broken file silently falls back to `public` |
 | `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | Model registry URL (http allowed, e.g. LAN mirror) |
 | `REASONING_CAP` | `65536` | Stream reasoning-token fuse before force-stop; `0` disables |
 | `SESSION_TTL_MS` | `1800000` | Session rotation TTL (ms); `0` disables rotation (fresh session per request) |

@@ -1,5 +1,7 @@
 node_modules/
+wsl2/
 api-keys.json
+oc-keys.json
 *.log
 .env
 .tmp-bun144/
