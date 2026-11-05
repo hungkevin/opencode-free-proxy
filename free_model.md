@@ -299,7 +299,7 @@ oc2api v4.5.0 與官方 opencode 源碼後的再校正）：
 | User-Agent | `opencode/1.18.31 ai-sdk/... runtime/bun/1.3.13` | `opencode/latest/2.1.1/cli` | 同一 UA（`OC_UA` 可覆寫）也用於 models registry 抓取 |
 | `Authorization` | 客戶端 key | `oc_sk_*` | 免費模型一律 `Bearer public`（官方 opencode 匿名層語義，`provider/opencode.ts:429-451`）；付費模型才送 `oc_sk_*`。`oc-keys.json` 可設 `"FREE_USES_OC_KEY": 1` 讓免費模型也送 Console key（opt-in，官方客戶端不這樣做；預設 `0` = `public`） |
 | `x-opencode-project` | `global` | 固定 `3f3f7816...e1787` | **每請求隨機 40-hex**（oc2api v4.5.0 行為：固定值會讓所有部署共用同一配額桶）；`OC_PROJECT` 可釘選 |
-| `x-opencode-client` | `cli` | `cli` | `opencode`（官方送 `app.name`；`OC_CLIENT` 可覆寫回 `cli`） |
+| `x-opencode-client` | `cli` | `cli` | `cli`（官方 `app.name` = `process.env.OPENCODE_CLIENT ?? OPENCODE_ARTIFACT`，CLI artifact 為 `cli`，`cli/src/version.ts:10`）；由 `OC_UA` 末段推導，`OC_CLIENT` 可覆寫 |
 | `Accept` | `text/event-stream` | `*/*` | **不送**（oc2api v4.5.0 移除；形狀閘門對 header 存在敏感） |
 | `x-opencode-request` | `msg_<id>` | **不送**（oc2api 不送） | 不變 |
 | session 相關 header | 僅 `x-opencode-session` | 四個同值 header | 不變；session 改依「客戶端對話 header（`x-opencode-session`/`x-session-id`/`x-conversation-id`）→ API key」兩層鍵控，同一對話重用同一 `ses_` id |
@@ -307,8 +307,8 @@ oc2api v4.5.0 與官方 opencode 源碼後的再校正）：
 | 工具 | 5 個內建名（空 schema）+ 用戶工具 | 12 個官方工具 + 改名用戶工具 | **13 個**官方工具（補 `patch`；缺任一會被形狀閘門擋成 429） |
 | 長度上限 | `max_tokens` | `max_completion_tokens`（預設 32000，`OUTPUT_LIMIT` 可調） | 不變 |
 | `tool_choice` | 無工具時送 `"none"` | 不送；無工具客戶端靠 system 提示句勸退 | **chat 路徑白名單轉發**（named choice 經改名映射重寫）；`/v1/responses` 仍降級 auto（該端點僅接受 auto，實測 none/required/named → 400） |
-| 其他參數 | 轉發 temperature/top_p/stop/seed | 不轉發（6 個 key，鍵序照官方） | **白名單轉發**：`temperature`/`top_p`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice`（官方 `openai-chat.ts:889-894` 與 oc2api `shape.go` 皆轉發）；`FORWARD_PARAMS=0` 恢復舊行為；`stop`/`seed` 仍不轉發（實測 400 風險） |
-| 錯誤分類 | 200-inline 一律回 429 | — | 依**錯誤內容**分類（官方 `provider-error.ts` QUOTA 語義）：`FreeUsageLimitError`/quota 類 → 429 `rate_limit_error`；其他 upstream 錯誤 → 502 `upstream_error`，不再把普通上游錯誤誤標成限流；`Retry-After`/`retry-after-ms` 透傳給客戶端 |
+| 其他參數 | 轉發 temperature/top_p/stop/seed | 不轉發（6 個 key，鍵序照官方） | **白名單轉發**：`temperature`/`top_p`/`frequency_penalty`/`presence_penalty`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice`（官方 `openai-chat.ts:889-894` + `lowerOptions` + oc2api `shape.go` 三方一致）；`FORWARD_PARAMS=0` 恢復舊行為；`stop`/`seed` 仍不轉發。無客戶端工具時丟棄 `tool_choice`/`parallel_tool_calls`（官方 `:827-828`「OpenAI rejects parallel_tool_calls unless tools are present」）；`/v1/messages` 的 Anthropic 形狀 `tool_choice` 先翻譯（`any`→`required`、`tool`→named）；`prompt_cache_key` 截斷至官方 64 字元上限 |
+| 錯誤分類 | 200-inline 一律回 429 | — | 依**錯誤內容**分類，順序照官方 `classifyProviderFailure`（`provider-error.ts:225-258`）：內容政策碼 → `content_policy_error`；quota 碼/402 → 429 `rate_limit_error`；auth 碼（含 400）→ `authentication_error`；429 → `rate_limit_error`；其他保留原狀態碼。非 quota 的上游錯誤不再誤標成限流；`Retry-After`/`retry-after-ms` 與 `x-ratelimit-*` 全部透傳給客戶端 |
 
 **Session ID 演算法**（`server.mjs` `zenSessionId()`，oc2api `SessionID` 對齊）：
 
@@ -659,3 +659,35 @@ node --test test/responses-pipe.test.mjs
 | R3 | 端點路徑改版 | oc2api v4.5.0 同樣使用 `/inference/v1/*`，無變更依據 |
 | R4 | 空回應自動重試一次 | 官方無此機制；stream 不可重放；已文件化（§6.7） |
 | R5 | `oc-project.json` 持久化 project id | 改採 oc2api v4.5.0 的每請求隨機方案，檔案持久化反而重建共用桶問題；`OC_PROJECT` 提供釘選逃生口 |
+
+---
+
+## 附錄 E: 二次源碼核對修正 (v11.3, 2026-11-05)
+
+> 對照官方 opencode HEAD `ee6b87031c` 逐檔複核上一輪修復，發現並修正以下遺漏。
+> 測試增至 **57 pass / 0 fail**；並以假上游做端到端驗證（headers/body 實際內容）。
+
+| # | 遺漏 | 根因 | 修正 | 官方依據 |
+|---|------|------|------|----------|
+| E1 | `x-opencode-client` 被改成 `opencode`（**上一輪改錯**） | 誤讀 `app.name`，未追到 CLI 的實際取值 | 改回 `cli`，並改為由 `OC_UA` 末段自動推導，UA 與 header 永遠一致 | `cli/src/version.ts:10` `artifact = "cli"`；`cli/src/commands/handlers/default.ts:98` `name: process.env.OPENCODE_CLIENT ?? OPENCODE_ARTIFACT`；`core/src/app.ts:24-26` UA 尾段即 name |
+| E2 | `/v1/messages` 把 Anthropic 形狀 `tool_choice` 原樣送上游 | A14 加入白名單轉發後，該路由直接傳 `req.body` 給 `buildZenChatBody`，`{type:"any"}`/`{type:"tool",name}` 對 OpenAI 形狀非法 | 新增 `normalizeToolChoiceForChat()`：`auto`→不送、`any`→`required`、`none`→`none`、`tool`→`{type:"function",function:{name}}` | `openai-chat.ts:882` `lowerToolChoice` |
+| E3 | `frequency_penalty` / `presence_penalty` 未轉發 | 上一輪白名單只抄了 oc2api，漏掉官方 `fromRequest` 明列這兩項 | 加入白名單 | `openai-chat.ts:891-892` |
+| E4 | 無客戶端工具時仍送 `tool_choice`/`parallel_tool_calls` | 未套用官方的 hasActiveTools 守衛 | `TOOL_GATED_PARAMS`：無工具時丟棄這兩鍵 | `openai-chat.ts:827-828`（`parallel_tool_calls` 無 tools 會被 OpenAI 拒絕）、`:882` |
+| E5 | `prompt_cache_key` 無限長度 | 直接透傳，超長會被上游 400 | 截斷至 64 字元（unicode-aware） | `protocols/shared.ts:86-100` `OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64` |
+| E6 | 內容政策錯誤被歸為 `upstream_error` | 只實作 quota/auth，漏了 CONTENT_POLICY | 新增 `content_policy_error`（狀態碼 400），分類順序照官方 | `provider-error.ts:125-134,237-238` |
+| E7 | auth 碼出現在 400 時未識別 | 只看 HTTP 狀態碼 | 加入 `AUTH_ERROR_CODES`（`api_key_invalid` 等）→ `authentication_error` | `provider-error.ts:101,245-251` |
+| E8 | 只透傳 `Retry-After` | 未透傳其餘限流資訊 | 新增 `relayRateLimitHeaders()`：`x-ratelimit-*`/`retry-after*` 全部轉發 | `route/executor.ts:22-54` 官方解析同一組 header |
+
+### 核對後確認「已正確、無需改動」
+
+| 項目 | 結論 |
+|------|------|
+| 端點 `POST /inference/v1/chat/completions` | 官方源碼用 `/inference/openai/v1`，但 **oc2api 用 `/inference/v1` 且實測可用**；使用者已確認 oc2api 可通，故維持不變 |
+| `Authorization: Bearer public` | 與 `provider/opencode.ts:429-435` 一致 |
+| 錯誤分類優先序（quota > auth > rate limit） | 與 `classifyProviderFailure` 完全一致；402 已涵蓋 |
+| `stream: true` 恆開、`stream_options.include_usage` | 與 `openai-chat.ts:883-884` 一致 |
+| `max_completion_tokens`（非 `max_tokens`） | opencode provider baseURL 不含 deepseek/moonshot 等，`detectMaxTokensField` 回預設值 |
+| 重試策略（不自動重試 429） | `FreeUsageLimitError` → QuotaExceeded → `retryable=false`（`session-error.test.ts:85`），本代理不重試正確 |
+| `parent-session-id` / `x-parent-session-id` | 僅在有 parent session（subagent）時送；代理是無狀態轉發層，無從得知，刻意不加 |
+| `store: false` | 僅 openai/azure 才送（`detectSupportsStore`），opencode 端點不在列 → 不送正確 |
+| `Accept: */*` | `zenHeaders` 已無此 header；端到端觀察到的 `*/*` 來自 fetch/undici 傳輸層自動補值，非本專案程式碼 |

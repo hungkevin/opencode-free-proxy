@@ -17,6 +17,9 @@ import {
   buildZenChatBody,
   FORWARDED_PARAMS,
   FORWARD_PARAMS,
+  normalizeToolChoiceForChat,
+  clientName,
+  sendUpstreamError,
   OFFICIAL_TOOLS,
 } from "../server.mjs";
 
@@ -66,13 +69,21 @@ test("project ids are random 40-hex and differ between calls", () => {
   assert.notEqual(a, b);
 });
 
-test("zenHeaders sends a fresh project id and official client name", () => {
+test("zenHeaders sends a fresh project id and the official CLI client name", () => {
   const h1 = zenHeaders("ses_1", "{}", "mimo-v2.6-flash-free");
   const h2 = zenHeaders("ses_1", "{}", "mimo-v2.6-flash-free");
   assert.match(h1["x-opencode-project"], /^[0-9a-f]{40}$/);
   assert.notEqual(h1["x-opencode-project"], h2["x-opencode-project"]);
-  assert.equal(h1["x-opencode-client"], "opencode");
+  // Official: name = process.env.OPENCODE_CLIENT ?? OPENCODE_ARTIFACT, and the
+  // CLI artifact is "cli" (packages/cli/src/version.ts:10) — also the trailing
+  // segment of App.useragent().
+  assert.equal(h1["x-opencode-client"], "cli");
   assert.equal(h1["Accept"], undefined, "oc2api deliberately omits Accept");
+});
+
+test("x-opencode-client is derived from OC_UA so UA and header stay consistent", () => {
+  // Default UA `opencode/latest/2.1.1/cli` → client "cli".
+  assert.equal(clientName(), "cli");
 });
 
 // ── A1 + A2: header auth is per-model ───────────────────────────────
@@ -144,6 +155,50 @@ test("parseUpstreamError extracts message and normalised code", () => {
   assert.equal(p.code, "gousagelimiterror");
 });
 
+test("content-policy rejections get their own type instead of upstream_error", () => {
+  // official provider-error.ts:125-134 CONTENT_POLICY_CODES
+  const raw = JSON.stringify({ error: { type: "content_filter", message: "blocked" } });
+  const { status, error } = upstreamErrorPayload(502, raw, null);
+  assert.equal(error.type, "content_policy_error");
+  assert.equal(status, 400, "client-side rejection, not a gateway fault");
+});
+
+test("auth-shaped codes map to authentication_error even on 400", () => {
+  // official AUTH_CODES: providers report bad keys as 400, not 401.
+  const raw = JSON.stringify({ error: { type: "api_key_invalid", message: "bad key" } });
+  assert.equal(upstreamErrorPayload(400, raw, null).error.type, "authentication_error");
+});
+
+test("quota classification wins over rate-limit text (official order)", () => {
+  // A 429 whose body names a quota code must be QuotaExceeded, i.e. our
+  // rate_limit_error — never reclassified by message text into something else.
+  const raw = JSON.stringify({ error: { type: "CreditLimitExceeded", message: "rate limit exceeded" } });
+  const { status, error } = upstreamErrorPayload(429, raw, null);
+  assert.equal(status, 429);
+  assert.equal(error.type, "rate_limit_error");
+});
+
+test("rate-limit headers from upstream are relayed to the client", () => {
+  const set = {};
+  const res = {
+    headersSent: false,
+    setHeader(n, v) { set[n.toLowerCase()] = v; },
+    status() { return this; },
+    json() { return this; },
+  };
+  const upstream = new Headers({
+    "x-ratelimit-limit-requests": "60",
+    "x-ratelimit-remaining-requests": "0",
+    "retry-after": "30",
+    "content-type": "application/json",
+  });
+  sendUpstreamError(res, 429, '{"error":{"message":"slow down"}}', upstream, "openai");
+  assert.equal(set["x-ratelimit-limit-requests"], "60");
+  assert.equal(set["x-ratelimit-remaining-requests"], "0");
+  assert.equal(set["retry-after"], "30");
+  assert.equal(set["content-type"], undefined, "non-rate-limit headers are not copied");
+});
+
 test("responsesNon200Raw emits the classified status/shape", () => {
   const sent = [];
   const res = { headersSent: false, status(c) { sent.push(c); return this; }, json(b) { sent.push(b); return this; } };
@@ -169,11 +224,80 @@ test("buildZenChatBody forwards whitelisted params and rewrites tool_choice", ()
   assert.equal(parsed.stream, true);
 });
 
-test("FORWARDED_PARAMS follows the official/oc2api whitelist", () => {
+test("FORWARDED_PARAMS matches the official lowering plus oc2api whitelist", () => {
+  // official openai-chat.ts:889-894 sends temperature/top_p/frequency_penalty/
+  // presence_penalty; lowerOptions adds reasoning_effort/parallel_tool_calls/
+  // prompt_cache_key; tool_choice at :882. oc2api's forwardedParams agrees.
   assert.deepEqual([...FORWARDED_PARAMS].sort(), [
-    "parallel_tool_calls", "prompt_cache_key", "reasoning_effort", "temperature", "tool_choice", "top_p",
+    "frequency_penalty", "parallel_tool_calls", "presence_penalty",
+    "prompt_cache_key", "reasoning_effort", "temperature", "tool_choice", "top_p",
   ]);
   assert.equal(FORWARD_PARAMS, true);
+});
+
+test("frequency_penalty and presence_penalty are forwarded", () => {
+  const { body } = buildZenChatBody("mimo-v2.6-flash-free", [{ role: "user", content: "hi" }], [], {
+    frequency_penalty: 0.5,
+    presence_penalty: -0.25,
+  });
+  const parsed = JSON.parse(body);
+  assert.equal(parsed.frequency_penalty, 0.5);
+  assert.equal(parsed.presence_penalty, -0.25);
+});
+
+test("tool_choice and parallel_tool_calls are dropped without client tools", () => {
+  // Official: "OpenAI rejects parallel_tool_calls unless tools are present"
+  // (openai-chat.ts:827-828); tool_choice is gated on hasActiveTools (:882).
+  const { body } = buildZenChatBody("mimo-v2.6-flash-free", [{ role: "user", content: "hi" }], [], {
+    tool_choice: "required",
+    parallel_tool_calls: true,
+  });
+  const parsed = JSON.parse(body);
+  assert.equal(parsed.tool_choice, undefined);
+  assert.equal(parsed.parallel_tool_calls, undefined);
+});
+
+test("Anthropic-shaped tool_choice is translated for the chat body", () => {
+  const tools = [{ type: "function", function: { name: "my_tool", parameters: {} } }];
+  const msgs = [{ role: "user", content: "hi" }];
+
+  // {type:"auto"} is the upstream default → no key sent at all.
+  const auto = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", msgs, tools, { tool_choice: { type: "auto" } }).body);
+  assert.equal(auto.tool_choice, undefined);
+
+  // {type:"any"} → "required"
+  const any = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", msgs, tools, { tool_choice: { type: "any" } }).body);
+  assert.equal(any.tool_choice, "required");
+
+  // {type:"tool", name} → {type:"function", function:{name}} with renamed tool.
+  const named = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", msgs, tools, {
+    tool_choice: { type: "tool", name: "my_tool" },
+  }).body);
+  assert.equal(named.tool_choice.type, "function");
+  assert.ok(named.tool_choice.function.name.startsWith("oc2api_"));
+
+  // OpenAI-shaped input passes through unchanged in form.
+  const oai = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", msgs, tools, {
+    tool_choice: { type: "function", function: { name: "my_tool" } },
+  }).body);
+  assert.equal(oai.tool_choice.type, "function");
+});
+
+test("prompt_cache_key is clamped to the official 64-char limit", () => {
+  // protocols/shared.ts:86-100 — unicode-aware slice.
+  const tools = [{ type: "function", function: { name: "t", parameters: {} } }];
+  const long = "k".repeat(100);
+  const parsed = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", [{ role: "user", content: "hi" }], tools, {
+    prompt_cache_key: long,
+  }).body);
+  assert.equal(parsed.prompt_cache_key.length, 64);
+  assert.equal(parsed.prompt_cache_key, long.slice(0, 64));
+
+  const short = "abc123";
+  const ok = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", [{ role: "user", content: "hi" }], tools, {
+    prompt_cache_key: short,
+  }).body);
+  assert.equal(ok.prompt_cache_key, short);
 });
 
 // ── N1: official tool set has 13 entries including patch ────────────

@@ -232,6 +232,18 @@ function ocId(prefix) {
 // without editing source. Models-registry fetches use the SAME UA (A3).
 const OC_UA = process.env.OC_UA || "opencode/latest/2.1.1/cli";
 
+// x-opencode-client mirrors the official `app.name`. The CLI builds pass
+// `name: process.env.OPENCODE_CLIENT ?? OPENCODE_ARTIFACT`, and the artifact
+// name for the CLI is "cli" (packages/cli/src/version.ts:10) — which is also
+// the last segment of App.useragent() (`opencode/<channel>/<version>/<name>`).
+// Deriving it from OC_UA keeps the UA and the header consistent for whatever
+// official build an operator mirrors; OC_CLIENT still overrides explicitly.
+function clientName() {
+  if (process.env.OC_CLIENT) return process.env.OC_CLIENT;
+  const parts = String(OC_UA).split("/");
+  return parts.length >= 4 && parts[3] ? parts[3] : "cli";
+}
+
 // x-opencode-project: the official client sends session.projectID (a stable
 // per-project SHA1 of the git remote / directory, or the literal "global").
 // oc2api instead randomises a 40-hex id per request because the free tier
@@ -346,17 +358,17 @@ function restoreToolName(name, renames) {
   return renames.reverse.get(name) || name;
 }
 
-// Shared upstream headers. Deliberately no `Accept` (oc2api removed its own
-// Accept: shape-gating is sensitive to header presence), no x-opencode-request.
-// `x-opencode-client` follows the official app.name ("opencode"); the free tier
-// has historically accepted "cli" but the official source uses app.name.
+// Shared upstream headers. Deliberately no explicit `Accept` (oc2api removed
+// its own Accept: shape-gating is sensitive to header presence); note that
+// fetch/undici still adds a transport-level `Accept: */*` on its own.
+// `x-opencode-client` follows the official app.name — see clientName().
 function zenHeaders(sessionId, body, model) {
   return {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
     "Authorization": `Bearer ${zenKey(model)}`,
     "User-Agent": OC_UA,
-    "x-opencode-client": process.env.OC_CLIENT || "opencode",
+    "x-opencode-client": clientName(),
     "x-opencode-project": projectId(),
     "x-opencode-session": sessionId,
     "x-opencode-session-id": sessionId,
@@ -537,6 +549,34 @@ const QUOTA_ERROR_CODES = new Set([
   "freeusagelimiterror", "gousagelimiterror", "budgetlimiterror", "creditlimitexceeded",
   "insufficient_quota", "usage_not_included", "billing_error",
 ]);
+// Content/policy rejections (official provider-error.ts:125-134). These are
+// deterministic client-side failures, not upstream faults — surfacing them as
+// a distinct type lets clients stop retrying and show the real reason.
+const CONTENT_POLICY_CODES = new Set([
+  "content_filter", "content_moderation", "responsibleaipolicyviolation",
+  "content_policy_violation", "image_content_policy_violation", "refusal",
+  "datainspectionfailed", "moderation_blocked",
+]);
+// Auth-shaped codes (official AUTH_CODES) — providers report bad keys as 400.
+const AUTH_ERROR_CODES = new Set([
+  "authentication_error", "permission_error", "permission_denied", "api_key_invalid",
+]);
+// Upstream rate-limit headers worth relaying so clients can pace themselves.
+const RATE_LIMIT_HEADER_RE = /^(?:x-ratelimit-|ratelimit-|retry-after)/i;
+
+// Copy upstream rate-limit/retry headers onto our response so clients can pace
+// themselves exactly as they would against the real provider (official client
+// reads retry-after-ms first, then retry-after — route/executor.ts:22-35).
+function relayRateLimitHeaders(res, zenHeaders) {
+  if (!zenHeaders?.forEach || res.headersSent) return;
+  zenHeaders.forEach((value, name) => {
+    if (!value || !RATE_LIMIT_HEADER_RE.test(name)) return;
+    try {
+      // Express/node lowercases incoming names; setHeader accepts either.
+      res.setHeader(name, value);
+    } catch {}
+  });
+}
 function parseUpstreamError(raw) {
   let msg = "";
   let code = "";
@@ -559,14 +599,21 @@ function isQuotaError(status, raw, parsed) {
 function upstreamErrorPayload(status, raw, headers) {
   const p = parseUpstreamError(raw);
   const quota = isQuotaError(status, raw, p);
+  const contentPolicy = CONTENT_POLICY_CODES.has(p.code);
   const limited = quota || status === 429 || /\brate limit\b|quota/i.test(p.msg);
   let type = "upstream_error";
   let outStatus = status >= 400 ? status : 502;
-  if (quota) {
+  // Order mirrors official classifyProviderFailure (provider-error.ts:225-258):
+  // content policy → quota → auth → rate limit → everything else.
+  if (contentPolicy) {
+    type = "content_policy_error";
+    if (outStatus === 502) outStatus = 400;
+  } else if (quota) {
     type = "rate_limit_error";
     outStatus = 429;
+  } else if (status === 401 || status === 403 || AUTH_ERROR_CODES.has(p.code)) {
+    type = "authentication_error";
   } else if (status === 429) type = "rate_limit_error";
-  else if (status === 401 || status === 403) type = "authentication_error";
   else if (status === 404) type = "not_found_error";
   else if (status === 400) type = "invalid_request_error";
   const message = limited ? `${p.msg} (free model rate limit)` : p.msg;
@@ -580,7 +627,10 @@ function upstreamErrorPayload(status, raw, headers) {
 // Express response; `zenHeaders` is the upstream Response headers (or null).
 function sendUpstreamError(res, status, raw, zenHeaders, shape = "openai") {
   const { status: outStatus, error, retryAfter } = upstreamErrorPayload(status, raw, zenHeaders);
-  if (retryAfter && !res.headersSent) res.setHeader("Retry-After", retryAfter);
+  if (!res.headersSent) {
+    relayRateLimitHeaders(res, zenHeaders);
+    if (retryAfter) res.setHeader("Retry-After", retryAfter);
+  }
   if (res.headersSent) return;
   const body = shape === "anthropic"
     ? { type: "error", error: { type: error.type, message: error.message } }
@@ -900,7 +950,19 @@ function buildZenChatBody(model, messages, clientTools, extra = {}) {
   if (FORWARD_PARAMS) {
     for (const key of FORWARDED_PARAMS) {
       if (extra[key] === undefined || extra[key] === null) continue;
-      body[key] = key === "tool_choice" ? rewriteToolChoice(extra[key], renames) : extra[key];
+      // Official parity: tool-control keys are meaningless without client tools.
+      if (TOOL_GATED_PARAMS.has(key) && !hasClientTools) continue;
+      if (key === "tool_choice") {
+        const choice = normalizeToolChoiceForChat(extra[key], hasClientTools);
+        if (choice !== undefined) body[key] = rewriteToolChoice(choice, renames);
+        continue;
+      }
+      if (key === "prompt_cache_key") {
+        const cacheKey = clampPromptCacheKey(extra[key]);
+        if (cacheKey !== undefined) body[key] = cacheKey;
+        continue;
+      }
+      body[key] = extra[key];
     }
   }
 
@@ -908,14 +970,42 @@ function buildZenChatBody(model, messages, clientTools, extra = {}) {
 }
 
 // Sampling/tool-control params forwarded to the upstream chat body. Mirrors
-// the official client's generation options and oc2api's forwardedParams.
+// the official client's lowering (packages/ai/src/protocols/openai-chat.ts:
+// 889-894 sends temperature/top_p/frequency_penalty/presence_penalty) plus the
+// provider-option keys, which is also exactly oc2api's forwardedParams list.
 // `stop`/`seed` are intentionally omitted: the free tier has been observed to
-// 400 on them, and neither oc2api nor the official whitelist requires them.
+// 400 on them, and oc2api's whitelist excludes them too.
 const FORWARDED_PARAMS = [
-  "temperature", "top_p", "reasoning_effort", "parallel_tool_calls",
-  "prompt_cache_key", "tool_choice",
+  "temperature", "top_p", "frequency_penalty", "presence_penalty",
+  "reasoning_effort", "parallel_tool_calls", "prompt_cache_key", "tool_choice",
 ];
 const FORWARD_PARAMS = !/^(0|false)$/i.test(String(process.env.FORWARD_PARAMS || "").trim());
+
+// Official client: "OpenAI rejects `parallel_tool_calls` unless tools are
+// present" (openai-chat.ts:827-828). Same guard for tool_choice (:882
+// requires hasActiveTools). Without client tools the body carries only the
+// reserved official set, which the model must never pick, so both are dropped.
+const TOOL_GATED_PARAMS = new Set(["parallel_tool_calls", "tool_choice"]);
+
+// Anthropic tool_choice → OpenAI shape. The /v1/messages route hands the raw
+// client body to buildZenChatBody, so without this an Anthropic
+// {type:"any"} or {type:"auto"} would be forwarded verbatim and rejected
+// upstream. Mirrors anthropicToolChoiceToOpenAI but returns undefined for the
+// default "auto" so no key is sent unless the client asked for something.
+function normalizeToolChoiceForChat(value, hasClientTools) {
+  if (value === undefined || value === null || !hasClientTools) return undefined;
+  if (typeof value === "string") return value;
+  if (typeof value !== "object") return undefined;
+  // Already OpenAI-shaped ({type:"function", function:{name}}).
+  if (value.type === "function" && value.function) return value;
+  if (value.type === "auto") return undefined; // upstream default — send nothing
+  if (value.type === "any") return "required";
+  if (value.type === "none") return "none";
+  if (value.type === "tool" && typeof value.name === "string" && value.name) {
+    return { type: "function", function: { name: value.name } };
+  }
+  return undefined;
+}
 
 // tool_choice may name a client tool that was renamed for the upstream body;
 // rewrite it through the same renames map so the choice stays consistent.
@@ -930,6 +1020,16 @@ function rewriteToolChoice(value, renames) {
   }
   if (typeof out.name === "string" && out.name) out.name = renameTool(renames, out.name);
   return out;
+}
+
+// Official limit: OpenAI caps prompt_cache_key at 64 chars, and DeepSeek/Z.ai
+// inherit it via their OpenAI-compatible APIs (protocols/shared.ts:86-100).
+// Clamp unicode-aware so a long client key cannot 400 the request.
+const PROMPT_CACHE_KEY_MAX = 64;
+function clampPromptCacheKey(value) {
+  if (typeof value !== "string" || !value) return undefined;
+  const chars = Array.from(value);
+  return chars.length <= PROMPT_CACHE_KEY_MAX ? value : chars.slice(0, PROMPT_CACHE_KEY_MAX).join("");
 }
 
 function zenRequest(model, messages, tools, sessionId, extra = {}) {
@@ -3373,6 +3473,8 @@ export {
   projectId,
   FORWARDED_PARAMS,
   FORWARD_PARAMS,
+  normalizeToolChoiceForChat,
+  clientName,
   rewriteToolChoice,
   upstreamErrorPayload,
   parseUpstreamError,

@@ -232,24 +232,31 @@ sudo systemctl enable --now opencode-proxy
 | `OUTPUT_LIMIT` | `32000` | `max_completion_tokens` sent upstream when the client sends no length cap; `0` disables (`MAX_TOKENS_DEFAULT` still honored as a legacy alias) |
 | `OC_UA` | `opencode/latest/2.1.1/cli` | Upstream `User-Agent` (single source for inference + models-registry fetches) |
 | `OC_PROJECT` | unset | Pin the upstream `x-opencode-project` id. Default sends a fresh random 40-hex per request (oc2api v4.5.0 behavior — a fixed id makes every deployment share one free-tier quota bucket) |
-| `OC_CLIENT` | `opencode` | Upstream `x-opencode-client` value (official sends `app.name`; set `cli` for the historical value) |
-| `FORWARD_PARAMS` | `1` | `0`/`false` restores the old silent-drop behavior for `temperature`/`top_p`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice` |
+| `OC_CLIENT` | derived from `OC_UA` | Upstream `x-opencode-client`. Defaults to the trailing segment of `OC_UA` (i.e. `cli`), matching the official `app.name` (`OPENCODE_ARTIFACT`); set explicitly to override |
+| `FORWARD_PARAMS` | `1` | `0`/`false` restores the old silent-drop behavior for `temperature`/`top_p`/`frequency_penalty`/`presence_penalty`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice` |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 
 > Note: client sampling/tool-control params are forwarded via a whitelist —
-> `temperature`, `top_p`, `reasoning_effort`, `parallel_tool_calls`,
-> `prompt_cache_key`, `tool_choice` (the official client and oc2api both send
-> them). `stop`/`seed` are still not forwarded (observed 400s). On
+> `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`,
+> `reasoning_effort`, `parallel_tool_calls`, `prompt_cache_key`,
+> `tool_choice` (matching the official client's lowering plus oc2api's
+> list). `stop`/`seed` are still not forwarded (observed 400s).
+> Tool-control keys (`tool_choice`, `parallel_tool_calls`) are dropped when the
+> client sent no tools, as the official client does; Anthropic-shaped
+> `tool_choice` on `/v1/messages` is translated (`any`→`required`,
+> `tool`→named function); `prompt_cache_key` is clamped to 64 chars. On
 > `/v1/responses` (Spark path) sampling params remain dropped — that endpoint
 > accepts only `tool_choice: "auto"`. A client that wants "no tools" gets a
 > system-prompt nudge instead of `tool_choice: "none"` on the Spark path.
 >
-> Error classification follows the official client: quota-shaped errors
+> Error classification follows the official client: content-policy codes get
+> their own `content_policy_error` type, quota-shaped errors
 > (`FreeUsageLimitError` etc., HTTP 429/402) map to `429 rate_limit_error`,
-> other upstream failures keep their status (`502 upstream_error` etc.), and
-> upstream `Retry-After` / `retry-after-ms` headers are passed through to the
-> client.
+> auth-shaped codes map to `authentication_error` even on HTTP 400, other
+> upstream failures keep their status (`502 upstream_error` etc.), and
+> upstream `Retry-After` / `retry-after-ms` plus `x-ratelimit-*` headers are
+> relayed to the client.
 >
 > `oc-keys.json` also accepts `"FREE_USES_OC_KEY": 1` (default `0`): with `1`,
 > free-tier models send the Console key too instead of `public`. The official
@@ -378,7 +385,7 @@ the old shape fails. The request must mirror the official client (the working
 ```
 Authorization: Bearer public            (free-tier models; paid models get the oc_sk_ key)
 User-Agent: opencode/latest/2.1.1/cli
-x-opencode-client: opencode
+x-opencode-client: cli
 x-opencode-project: <random 40-hex per request>
 x-opencode-session:    ses_<12 hex + 14 base62>
 x-opencode-session-id: ses_<same>
@@ -386,8 +393,9 @@ x-session-affinity:    ses_<same>
 X-Session-Id:          ses_<same>
 ```
 
-No `Accept` header (oc2api v4.5.0 removed it; the shape gate is sensitive to
-header presence).
+No explicit `Accept` header (oc2api v4.5.0 removed it; the shape gate is
+sensitive to header presence) — `fetch` still adds a transport-level
+`Accept: */*` on its own.
 
 ## License
 
