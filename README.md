@@ -225,18 +225,31 @@ sudo systemctl enable --now opencode-proxy
 | `PROXY_PORT` | `6446` | Server port |
 | `PROXY_HOST` | `0.0.0.0` | Bind address; set to `127.0.0.1` to listen only on loopback |
 | `KEYS_FILE` | `./api-keys.json` | API keys file path |
-| `OC_KEYS_FILE` | `./oc-keys.json` | Optional upstream OpenCode Console key file (`{"ockeys": ["oc_sk_...", ...]}`); with a key, upstream gets `Bearer <oc_sk_...>` instead of the anonymous `Bearer public`. Missing/broken file silently falls back to `public` |
+| `OC_KEYS_FILE` | `./oc-keys.json` | Optional upstream OpenCode Console key file (`{"ockeys": ["oc_sk_...", ...]}`); Console keys apply to **paid models only** — free-tier models always get the anonymous `Bearer public` (official opencode semantics), with or without ockeys. Missing/broken file silently falls back to `public` for everything |
 | `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | Model registry URL (http allowed, e.g. LAN mirror) |
 | `REASONING_CAP` | `65536` | Stream reasoning-token fuse before force-stop; `0` disables |
 | `SESSION_TTL_MS` | `1800000` | Session rotation TTL (ms); `0` disables rotation (fresh session per request) |
 | `OUTPUT_LIMIT` | `32000` | `max_completion_tokens` sent upstream when the client sends no length cap; `0` disables (`MAX_TOKENS_DEFAULT` still honored as a legacy alias) |
+| `OC_UA` | `opencode/latest/2.1.1/cli` | Upstream `User-Agent` (single source for inference + models-registry fetches) |
+| `OC_PROJECT` | unset | Pin the upstream `x-opencode-project` id. Default sends a fresh random 40-hex per request (oc2api v4.5.0 behavior — a fixed id makes every deployment share one free-tier quota bucket) |
+| `OC_CLIENT` | `opencode` | Upstream `x-opencode-client` value (official sends `app.name`; set `cli` for the historical value) |
+| `FORWARD_PARAMS` | `1` | `0`/`false` restores the old silent-drop behavior for `temperature`/`top_p`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice` |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 
-> Note: client `temperature`/`top_p`/`stop`/`seed`/`tool_choice` are **not**
-> forwarded upstream — the free tier only accepts the official client's
-> parameter set. A client that wants "no tools" gets a system-prompt nudge
-> instead of `tool_choice: "none"`.
+> Note: client sampling/tool-control params are forwarded via a whitelist —
+> `temperature`, `top_p`, `reasoning_effort`, `parallel_tool_calls`,
+> `prompt_cache_key`, `tool_choice` (the official client and oc2api both send
+> them). `stop`/`seed` are still not forwarded (observed 400s). On
+> `/v1/responses` (Spark path) sampling params remain dropped — that endpoint
+> accepts only `tool_choice: "auto"`. A client that wants "no tools" gets a
+> system-prompt nudge instead of `tool_choice: "none"` on the Spark path.
+>
+> Error classification follows the official client: quota-shaped errors
+> (`FreeUsageLimitError` etc., HTTP 429/402) map to `429 rate_limit_error`,
+> other upstream failures keep their status (`502 upstream_error` etc.), and
+> upstream `Retry-After` / `retry-after-ms` headers are passed through to the
+> client.
 
 ### Log levels (`LOG_LEVEL`)
 
@@ -335,33 +348,41 @@ the old shape fails. The request must mirror the official client (the working
 `oc2api` reference implementation):
 
 - `POST /inference/v1/chat/completions` (the old `/zen/v1/*` paths are dead)
-- `User-Agent: opencode/latest/2.1.1/cli`, project-id hash in
-  `x-opencode-project`, four session headers (`x-opencode-session`,
-  `x-opencode-session-id`, `x-session-affinity`, `X-Session-Id`)
+- `User-Agent: opencode/latest/2.1.1/cli` (`OC_UA`), a fresh random 40-hex
+  `x-opencode-project` per request (`OC_PROJECT` to pin), four session headers
+  (`x-opencode-session`, `x-opencode-session-id`, `x-session-affinity`,
+  `X-Session-Id`)
 - session id format `ses_` + 12 hex (bitwise-NOT of `ms*0x1000 + counter`) +
-  14 base62 chars; the in-millisecond counter must stay in `1..15`
+  14 base62 chars; the in-millisecond counter must stay in `1..15`; the same
+  id is reused for every request of one conversation (client conversation
+  header → API-key fallback bucket)
+- `Authorization: Bearer public` for free-tier models (official anonymous
+  semantics), Console key only for paid models
 - the official system prompt (`oc-prompt.txt`) first, client system messages
   appended after it
-- the 12 official OpenCode tools (`oc-tools.json`, descriptions replaced with
-  a "do not call" marker) always present, plus renamed client tools
+- the 13 official OpenCode tools (`oc-tools.json` — including `patch`, missing
+  one is a 429; descriptions replaced with a "do not call" marker) always
+  present, plus renamed client tools
 - always `stream: true` + `stream_options.include_usage` — sync client
   requests are aggregated back into one JSON object locally
-- `max_completion_tokens` (never `max_tokens`), no `tool_choice`, and no
-  `temperature`/`top_p`/`stop`/`seed` forwarding
+- `max_completion_tokens` (never `max_tokens`), sampling params forwarded via
+  a whitelist (`FORWARD_PARAMS=0` to drop), no `stop`/`seed`
 
 ### Upstream request headers (for the curious)
 
 ```
-Authorization: Bearer public
+Authorization: Bearer public            (free-tier models; paid models get the oc_sk_ key)
 User-Agent: opencode/latest/2.1.1/cli
-Accept: */*
-x-opencode-client: cli
-x-opencode-project: 3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787
+x-opencode-client: opencode
+x-opencode-project: <random 40-hex per request>
 x-opencode-session:    ses_<12 hex + 14 base62>
 x-opencode-session-id: ses_<same>
 x-session-affinity:    ses_<same>
 X-Session-Id:          ses_<same>
 ```
+
+No `Accept` header (oc2api v4.5.0 removed it; the shape gate is sensitive to
+header presence).
 
 ## License
 

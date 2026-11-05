@@ -11,7 +11,6 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PROXY_PORT || 6446;
 const HOST = process.env.PROXY_HOST || "0.0.0.0";
-const OC_VERSION = "1.18.31"; // only used for the models.opencode.ai registry fetch (not gated)
 const PROXY_VERSION = (() => {
   try {
     return JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8")).version || "0.0.0";
@@ -124,7 +123,22 @@ function setOcKeys(keys) {
   ocKeys = normalizeOcKeys(keys);
 }
 
-const zenKey = () => ocKeys[0] || "public";
+// Upstream auth (official-opencode parity): the opencode provider sets
+// apiKey:"public" for the anonymous free tier and hides paid models
+// (packages/core/src/plugin/provider/opencode.ts:429-451). A Console key is
+// only for paid models. Free models are determined by COST (zero input/output),
+// with the `-free` / `big-pickle` name rule as a fallback for ids whose cost
+// is not in the local registry snapshot.
+function isFreeTierModel(model) {
+  const m = String(model || "");
+  const meta = MODEL_META[m];
+  if (meta) return meta.free !== false;
+  return m.endsWith("-free") || m === "big-pickle";
+}
+function zenKey(model) {
+  if (model !== undefined && isFreeTierModel(model)) return "public";
+  return ocKeys[0] || "public";
+}
 
 // oc-<40 hex> → oc-<first 7>…<last 4>: enough to tell keys apart, useless if
 // the log leaks. Short/exotic values are masked wholesale. Keys print in full
@@ -182,15 +196,37 @@ function ocId(prefix) {
 //    - UA `opencode/latest/2.1.1/cli`, project id hash, four session headers
 //    - official system prompt (oc-prompt.txt) first; client system messages
 //      appended after it
-//    - the 12 official OpenCode tools (oc-tools.json, descriptions replaced
+//    - the 13 official OpenCode tools (oc-tools.json, descriptions replaced
 //      with a "do not call" marker) always present; client tools ride along
 //      renamed with an `oc2api_` prefix so they can never collide, names
 //      restored on the way back
+//      NOTE: oc-prompt.txt / oc-tools.json are reverse-engineered assets copied
+//      from oc2api internal/shape/assets (opencode source assembles these
+//      dynamically). The free tier shape-gates on the full 13-tool set —
+//      dropping any one of them yields a 429 that looks like quota exhaustion.
 //    - always stream:true + stream_options.include_usage, and
-//      max_completion_tokens (never max_tokens, never tool_choice —
-//      clients that want "no tools" are handled by a system-prompt nudge)
-const OC_UA = "opencode/latest/2.1.1/cli";
-const OC_PROJECT = "3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787";
+//      max_completion_tokens (never max_tokens). Client sampling params are
+//      forwarded via a whitelist (see FORWARDED_PARAMS); clients that want
+//      "no tools" are handled by a system-prompt nudge
+// User-Agent: official client builds `opencode/<channel>/<version>/<name>`
+// at runtime (packages/core/src/app.ts). The free tier gate currently expects
+// the v2 CLI shape; OC_UA lets an operator mirror a different official build
+// without editing source. Models-registry fetches use the SAME UA (A3).
+const OC_UA = process.env.OC_UA || "opencode/latest/2.1.1/cli";
+
+// x-opencode-project: the official client sends session.projectID (a stable
+// per-project SHA1 of the git remote / directory, or the literal "global").
+// oc2api instead randomises a 40-hex id per request because the free tier
+// buckets quota by project id + egress IP: a fixed value makes every
+// deployment share one quota bucket. We follow oc2api's proven behaviour by
+// default and allow an explicit override (OC_PROJECT) for reproducibility.
+const FIXED_OC_PROJECT = process.env.OC_PROJECT || "";
+function newProjectId() {
+  return crypto.randomBytes(20).toString("hex");
+}
+function projectId() {
+  return FIXED_OC_PROJECT || newProjectId();
+}
 const ZEN_HOST = "opencode.ai";
 const ZEN_CHAT_PATH = "/inference/v1/chat/completions";
 const ZEN_RESPONSES_PATH = "/inference/v1/responses";
@@ -292,17 +328,18 @@ function restoreToolName(name, renames) {
   return renames.reverse.get(name) || name;
 }
 
-// Shared upstream headers (oc2api zen.UpstreamHeaders parity — deliberately
-// no x-opencode-request and no tool_choice anywhere).
-function zenHeaders(sessionId, body) {
+// Shared upstream headers. Deliberately no `Accept` (oc2api removed its own
+// Accept: shape-gating is sensitive to header presence), no x-opencode-request.
+// `x-opencode-client` follows the official app.name ("opencode"); the free tier
+// has historically accepted "cli" but the official source uses app.name.
+function zenHeaders(sessionId, body, model) {
   return {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
-    "Accept": "*/*",
-    "Authorization": `Bearer ${zenKey()}`,
+    "Authorization": `Bearer ${zenKey(model)}`,
     "User-Agent": OC_UA,
-    "x-opencode-client": "cli",
-    "x-opencode-project": OC_PROJECT,
+    "x-opencode-client": process.env.OC_CLIENT || "opencode",
+    "x-opencode-project": projectId(),
     "x-opencode-session": sessionId,
     "x-opencode-session-id": sessionId,
     "x-session-affinity": sessionId,
@@ -472,6 +509,67 @@ function withCause(status, msg) {
   return cause ? `${text}（${cause}）` : text;
 }
 
+// ── Shared upstream error classification (official-opencode parity) ──
+// The official client classifies by response BODY (error.type / code), not by
+// HTTP status alone: FreeUsageLimitError / GoUsageLimitError / BudgetLimitError
+// are QuotaExceeded, which is NOT retryable. A bare 429 with no quota marker is
+// a rate limit. See packages/ai/src/provider-error.ts (QUOTA_CODES) and
+// packages/ai/src/schema/errors.ts (isRetryable) in the opencode source tree.
+const QUOTA_ERROR_CODES = new Set([
+  "freeusagelimiterror", "gousagelimiterror", "budgetlimiterror", "creditlimitexceeded",
+  "insufficient_quota", "usage_not_included", "billing_error",
+]);
+function parseUpstreamError(raw) {
+  let msg = "";
+  let code = "";
+  try {
+    const p = JSON.parse(raw);
+    msg = p?.error?.message || p?.message || "";
+    code = String(p?.error?.type || p?.error?.code || p?.type || p?.code || "");
+  } catch {}
+  if (!msg) msg = String(raw || "").trim().slice(0, 300);
+  return { msg: msg || "Upstream error", code: code.toLowerCase() };
+}
+function isQuotaError(status, raw, parsed) {
+  const p = parsed || parseUpstreamError(raw);
+  if (QUOTA_ERROR_CODES.has(p.code)) return true;
+  if (/\bFreeUsageLimitError\b/.test(String(raw || ""))) return true;
+  // 402 is always a quota/billing cap (official provider-error.ts:240).
+  if (status === 402) return true;
+  return false;
+}
+function upstreamErrorPayload(status, raw, headers) {
+  const p = parseUpstreamError(raw);
+  const quota = isQuotaError(status, raw, p);
+  const limited = quota || status === 429 || /\brate limit\b|quota/i.test(p.msg);
+  let type = "upstream_error";
+  let outStatus = status >= 400 ? status : 502;
+  if (quota) {
+    type = "rate_limit_error";
+    outStatus = 429;
+  } else if (status === 429) type = "rate_limit_error";
+  else if (status === 401 || status === 403) type = "authentication_error";
+  else if (status === 404) type = "not_found_error";
+  else if (status === 400) type = "invalid_request_error";
+  const message = limited ? `${p.msg} (free model rate limit)` : p.msg;
+  const error = { message, type, code: limited ? "rate_limit_exceeded" : "upstream_error" };
+  // Official client reads retry-after-ms first, then retry-after; oc2api passes
+  // Retry-After through to the client. Preserve both for the caller to emit.
+  const retryAfter = headers?.get?.("retry-after-ms") || headers?.get?.("retry-after") || "";
+  return { status: outStatus, error, retryAfter: String(retryAfter || "").trim() };
+}
+// Emit a classified upstream error in OpenAI or Anthropic shape. `res` is the
+// Express response; `zenHeaders` is the upstream Response headers (or null).
+function sendUpstreamError(res, status, raw, zenHeaders, shape = "openai") {
+  const { status: outStatus, error, retryAfter } = upstreamErrorPayload(status, raw, zenHeaders);
+  if (retryAfter && !res.headersSent) res.setHeader("Retry-After", retryAfter);
+  if (res.headersSent) return;
+  const body = shape === "anthropic"
+    ? { type: "error", error: { type: error.type, message: error.message } }
+    : { error };
+  res.status(outStatus).json(body);
+}
+
 // Active zero-cost model snapshot from https://models.opencode.ai/api.json → ["opencode"].models
 // Used as fallback when the live registry cannot be fetched/parsed.
 const DEFAULT_MODELS = [
@@ -494,7 +592,7 @@ let MODELS = [];
 let MODELS_ORIGIN = "unknown";
 let MODELS_LOADED_AT = null;
 
-// Metadata per model id: { name, status, reasoning, toolCall, contextLimit, outputLimit, releaseDate }
+// Metadata per model id: { name, status, reasoning, toolCall, contextLimit, outputLimit, releaseDate, free }
 const MODEL_META = {};
 
 const MODELS_SOURCE =
@@ -514,9 +612,10 @@ function useDefaults(reason) {
       contextLimit: m.contextLimit || 0,
       outputLimit: m.outputLimit || 0,
       releaseDate: m.releaseDate || "-",
+      free: true,
     };
   }
-  console.log(`[MODELS] ${reason} - using ${MODELS.length} built-in defaults`);
+  console.log(`[MODELS] ${reason} - using ${MODELS.length} built-in defaults (snapshot 2026-10-28; verify against live registry)`);
 }
 
 function applyRegistry(models) {
@@ -544,6 +643,7 @@ function applyRegistry(models) {
       contextLimit: m.limit?.context ?? 0,
       outputLimit: m.limit?.output ?? 0,
       releaseDate: m.release_date || "-",
+      free: true,
     };
   }
 
@@ -584,7 +684,7 @@ async function loadModels() {
         path: u.pathname + u.search,
         method: "GET",
         headers: {
-          "User-Agent": `opencode/${OC_VERSION}`,
+          "User-Agent": OC_UA,
           "Accept": "application/json",
         },
       }, (res) => {
@@ -638,6 +738,7 @@ function mergeUpstreamModels(list) {
       contextLimit: 0,
       outputLimit: 0,
       releaseDate: "-",
+      free: true,
     };
     MODELS.push(id);
     added++;
@@ -659,21 +760,36 @@ async function fetchUpstreamModels() {
   }
 }
 
-// Track sessions per user: each session lives 30min base + 0~15min random
-// jitter (re-drawn on every rotation), mimicking humans opening new
-// conversations at irregular intervals. SESSION_TTL_MS=0 disables rotation
-// (fresh session per request).
+// Sessions follow the official client: one id per conversation, reused for
+// every request in that conversation (packages/core/src/session/affinity.ts).
+// A client-supplied conversation header selects the id; clients that send none
+// fall back to a per-API-key bucket so they keep upstream session affinity
+// (oc2api creates a fresh id per request and lists that as a known limitation).
+// SESSION_TTL_MS bounds reuse; 0 disables it entirely (fresh id per request).
 const SESSION_TTL_MS = envInt("SESSION_TTL_MS", 1800000);
 const SESSION_JITTER_MS = 15 * 60 * 1000;
 const userSessions = {};
-function getSession(user) {
+function conversationHeader(req) {
+  const h = req?.headers || {};
+  for (const key of ["x-opencode-session", "x-session-id", "x-conversation-id"]) {
+    const v = h[key];
+    const s = Array.isArray(v) ? v[0] : v;
+    if (typeof s === "string" && s.trim()) return s.trim().slice(0, 256);
+  }
+  return "";
+}
+function getSession(user, req) {
   const now = Date.now();
-  const s = userSessions[user];
+  const header = conversationHeader(req);
+  const keyUser = header
+    ? `${user}:${crypto.createHash("sha256").update(header).digest("hex")}`
+    : `user:${user}`;
+  const s = userSessions[keyUser];
   if (!s || SESSION_TTL_MS <= 0 || now - s.ts > s.ttl) {
     const ttl = SESSION_TTL_MS + Math.floor(Math.random() * (SESSION_JITTER_MS + 1));
-    userSessions[user] = { id: zenSessionId(), ts: now, ttl };
+    userSessions[keyUser] = { id: zenSessionId(), ts: now, ttl };
   }
-  return userSessions[user].id;
+  return userSessions[keyUser].id;
 }
 // P2.1: bound userSessions growth — sweep entries dead for >2× their TTL.
 // Runs on a 10-minute interval; a live user re-creates its entry on next call.
@@ -745,8 +861,12 @@ function buildZenChatBody(model, messages, clientTools, extra = {}) {
   }
 
   // Key order mirrors the official client: model, messages, tools, stream,
-  // stream_options, max_completion_tokens. temperature/top_p/stop/seed are
-  // NOT forwarded (oc2api doesn't either — unproven params risk a 400).
+  // stream_options, max_completion_tokens. The official client DOES forward
+  // sampling/tool-control params (packages/ai/src/protocols/openai-chat.ts:
+  // 889-894), and oc2api's current shape.Build whitelists them too. Dropping
+  // them silently made client temperature/top_p/tool_choice ineffective.
+  // A conservative whitelist avoids sending params the free tier may reject;
+  // set FORWARD_PARAMS=0 to restore the old degenerate behaviour.
   const body = {
     model,
     messages: [{ role: "system", content: system }, ...rest],
@@ -759,17 +879,46 @@ function buildZenChatBody(model, messages, clientTools, extra = {}) {
   else if (extra.max_tokens !== undefined) body.max_completion_tokens = extra.max_tokens;
   else if (DEFAULT_MAX_TOKENS > 0) body.max_completion_tokens = DEFAULT_MAX_TOKENS;
 
+  if (FORWARD_PARAMS) {
+    for (const key of FORWARDED_PARAMS) {
+      if (extra[key] === undefined || extra[key] === null) continue;
+      body[key] = key === "tool_choice" ? rewriteToolChoice(extra[key], renames) : extra[key];
+    }
+  }
+
   return { body: JSON.stringify(body), renames };
+}
+
+// Sampling/tool-control params forwarded to the upstream chat body. Mirrors
+// the official client's generation options and oc2api's forwardedParams.
+// `stop`/`seed` are intentionally omitted: the free tier has been observed to
+// 400 on them, and neither oc2api nor the official whitelist requires them.
+const FORWARDED_PARAMS = [
+  "temperature", "top_p", "reasoning_effort", "parallel_tool_calls",
+  "prompt_cache_key", "tool_choice",
+];
+const FORWARD_PARAMS = !/^(0|false)$/i.test(String(process.env.FORWARD_PARAMS || "").trim());
+
+// tool_choice may name a client tool that was renamed for the upstream body;
+// rewrite it through the same renames map so the choice stays consistent.
+function rewriteToolChoice(value, renames) {
+  if (!value || typeof value !== "object") return value;
+  const out = { ...value };
+  if (out.function && typeof out.function === "object") {
+    out.function = { ...out.function };
+    if (typeof out.function.name === "string" && out.function.name) {
+      out.function.name = renameTool(renames, out.function.name);
+    }
+  }
+  if (typeof out.name === "string" && out.name) out.name = renameTool(renames, out.name);
+  return out;
 }
 
 function zenRequest(model, messages, tools, sessionId, extra = {}) {
   // Free-tier shape (see fingerprint note): official prompt + official tools +
-  // always-stream + max_completion_tokens. tool_choice is never sent —
-  // upstream only truly supports auto; a client asking for "no tools" is
-  // handled by the system-prompt nudge inside buildZenChatBody.
-  if (extra.tool_choice !== undefined) {
-    log("warn", "[ZEN-DEGRADE] tool_choice dropped (upstream has no tool_choice; no-tool clients handled by system nudge)");
-  }
+  // always-stream + max_completion_tokens. tool_choice is now forwarded through
+  // the whitelist when the client sends it; when it does not, the no-tools
+  // nudge inside buildZenChatBody keeps the model from picking marker tools.
   const { body, renames } = buildZenChatBody(model, messages, tools, extra);
   return {
     body,
@@ -780,7 +929,7 @@ function zenRequest(model, messages, tools, sessionId, extra = {}) {
       port: 443,
       path: ZEN_CHAT_PATH,
       method: "POST",
-      headers: zenHeaders(sessionId, body),
+      headers: zenHeaders(sessionId, body, model),
       timeout: 120000,
     },
   };
@@ -1050,15 +1199,8 @@ async function pipeZenResponse(zenOpts, body, stream, res, model, renames, clien
       reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
       return;
     }
-    let msg = "Upstream error";
-    try {
-      const p = JSON.parse(raw);
-      msg = p.error?.message || p.message || msg;
-    } catch {}
-    log("error", `[ZEN UPSTREAM ${zenRes.status} ${TAG}]`, withCause(zenRes.status, msg));
-    if (!res.headersSent) {
-      res.status(zenRes.status).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
-    }
+    log("error", `[ZEN UPSTREAM ${zenRes.status} ${TAG}]`, withCause(zenRes.status, parseUpstreamError(raw).msg));
+    sendUpstreamError(res, zenRes.status, raw, zenRes.headers, "openai");
     return;
   }
 
@@ -1074,19 +1216,9 @@ async function pipeZenResponse(zenOpts, body, stream, res, model, renames, clien
     }
     const { json } = coerceChatSyncBody(raw);
     if (json && (json.error || json.type === "error")) {
-      const msg = json.error?.message || json.message || "Upstream error";
-      const limited = raw.includes("FreeUsageLimitError");
-      const status = limited ? 429 : 502;
-      log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
-      if (!res.headersSent) {
-        res.status(status).json({
-          error: {
-            message: limited ? msg + " (free model rate limit)" : msg,
-            type: limited ? "rate_limit_error" : "upstream_error",
-            code: limited ? "rate_limit_exceeded" : "upstream_error",
-          },
-        });
-      }
+      const { status, error } = upstreamErrorPayload(200, raw, zenRes.headers);
+      log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, error.message));
+      sendUpstreamError(res, 200, raw, zenRes.headers, "openai");
       return;
     }
     if (!json) {
@@ -1177,13 +1309,12 @@ async function pipeZenResponse(zenOpts, body, stream, res, model, renames, clien
         try {
           const parsed = JSON.parse(str);
           if (parsed.error || parsed.type === "error") {
-            const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
-            log("error", "[ZEN RATE LIMITED]", withCause(429, errMsg));
-            if (!res.headersSent) {
-              res.status(429).json({
-                error: { message: errMsg + " (free model rate limit)", type: "rate_limit_error", code: "rate_limit_exceeded" }
-              });
-            }
+            // A7/N10: classify by the error body (official opencode does the
+            // same). Only quota/rate-limit errors become 429; a plain upstream
+            // error must not be mislabelled as a rate limit.
+            const { status, error } = upstreamErrorPayload(200, str, null);
+            log("error", `[ZEN INLINE ERROR ${status}]`, withCause(status, error.message));
+            if (!res.headersSent) res.status(status).json({ error });
             abortUpstream(controller, "inline error, stop reading");
             stopped = true; // do not synthesize anything further
             return;
@@ -1238,19 +1369,9 @@ async function pipeZenResponse(zenOpts, body, stream, res, model, renames, clien
       }
       if (!inline) inline = sseErrorPayload(rawAccum);
       if (inline) {
-        const msg = inline.error?.message || inline.message || "Upstream error";
-        const limited = /FreeUsageLimitError|rate limit|quota/i.test(msg) || rawAccum.includes("FreeUsageLimitError");
-        const status = limited ? 429 : 502;
-        log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
-        if (!res.headersSent) {
-          res.status(status).json({
-            error: {
-              message: limited ? msg + " (free model rate limit)" : msg,
-              type: limited ? "rate_limit_error" : "upstream_error",
-              code: limited ? "rate_limit_exceeded" : "upstream_error",
-            },
-          });
-        }
+        const { status, error } = upstreamErrorPayload(200, rawAccum, zenRes.headers);
+        log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, error.message));
+        sendUpstreamError(res, 200, rawAccum, zenRes.headers, "openai");
         return;
       }
       log("warn", "[ZEN EMPTY] No response from Zen API");
@@ -1611,13 +1732,10 @@ async function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, rename
         try {
           const parsed = JSON.parse(trimmed);
           if (parsed.error || parsed.type === "error") {
-            const errMsg = parsed.error?.message || parsed.message || "Rate limit";
+            const { status, error } = upstreamErrorPayload(200, trimmed, null);
             if (!res.headersSent) {
-              res.writeHead(429, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({
-                type: "error",
-                error: { type: "rate_limit_error", message: errMsg + " (free model rate limit)" },
-              }));
+              res.writeHead(status, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ type: "error", error: { type: error.type, message: error.message } }));
             }
             abortUpstream(controller, "inline error, stop reading");
             selfStopped = true;
@@ -1754,19 +1872,9 @@ async function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, rename
       }
       if (!inline) inline = sseErrorPayload(rawAccum);
       if (inline) {
-        const msg = inline.error?.message || inline.message || "Upstream error";
-        const limited = /FreeUsageLimitError|rate limit|quota/i.test(msg) || rawAccum.includes("FreeUsageLimitError");
-        const status = limited ? 429 : 502;
-        log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
-        if (!res.headersSent) {
-          res.status(status).json({
-            type: "error",
-            error: {
-              type: limited ? "rate_limit_error" : "api_error",
-              message: limited ? msg + " (free model rate limit)" : msg,
-            },
-          });
-        }
+        const { status, error } = upstreamErrorPayload(200, rawAccum, zenRes.headers);
+        log("error", `[ZEN UPSTREAM ${status} ${TAG}]`, withCause(status, error.message));
+        sendUpstreamError(res, 200, rawAccum, zenRes.headers, "anthropic");
         return;
       }
       if (!res.headersSent) {
@@ -1815,10 +1923,11 @@ function zenResponsesRequest(clientBody, sessionId, opts = {}) {
     }
   }
   delete reqBody.max_tokens;
-  // Sampling params are never forwarded (oc2api shape.Build parity): the free
-  // tier takes only the official client's parameter set. This also covers the
-  // native /v1/responses passthrough, which hands req.body straight through.
-  for (const k of ["temperature", "top_p", "seed"]) delete reqBody[k];
+  // The Responses endpoint has its own stricter shape (unknown params → 400),
+  // so sampling params are dropped here even though chat forwards them via the
+  // whitelist. `stop` is included: the old code omitted it and contradicted
+  // the documented "no stop forwarding" rule.
+  for (const k of ["temperature", "top_p", "seed", "stop"]) delete reqBody[k];
   if (renameTools && Array.isArray(reqBody.tools)) {
     reqBody.tools = reqBody.tools.map((t) => {
       if (!t || typeof t !== "object") return t;
@@ -1899,7 +2008,7 @@ function zenResponsesRequest(clientBody, sessionId, opts = {}) {
       port: 443,
       path: ZEN_RESPONSES_PATH,
       method: "POST",
-      headers: zenHeaders(sessionId, body),
+      headers: zenHeaders(sessionId, body, clientBody.model),
       timeout: 120000,
     },
   };
@@ -1930,15 +2039,8 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
       reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
       return;
     }
-    let msg = "Upstream error";
-    try {
-      const p = JSON.parse(raw);
-      msg = p.error?.message || p.message || msg;
-    } catch {}
-    log("error", `[ZEN RESPONSES UPSTREAM ${zenRes.status} ${TAG}]`, withCause(zenRes.status, msg));
-    if (!res.headersSent) {
-      res.status(zenRes.status).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
-    }
+    log("error", `[ZEN RESPONSES UPSTREAM ${zenRes.status} ${TAG}]`, withCause(zenRes.status, parseUpstreamError(raw).msg));
+    sendUpstreamError(res, zenRes.status, raw, zenRes.headers, "openai");
     return;
   }
 
@@ -1954,13 +2056,9 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
     }
     const { json } = coerceResponsesSyncBody(raw);
     if (json && (json.error || json.type === "error")) {
-      const msg = json.error?.message || json.message || "Upstream error";
-      const limited = raw.includes("FreeUsageLimitError");
-      const status = limited ? 429 : 502;
-      log("error", `[ZEN RESPONSES UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
-      if (!res.headersSent) {
-        res.status(status).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_exceeded" : "upstream_error" } });
-      }
+      const { status, error } = upstreamErrorPayload(200, raw, zenRes.headers);
+      log("error", `[ZEN RESPONSES UPSTREAM ${status} ${TAG}]`, withCause(status, error.message));
+      sendUpstreamError(res, 200, raw, zenRes.headers, "openai");
       return;
     }
     if (!json) {
@@ -2000,19 +2098,10 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
   }
 
   function inlineError(parsed) {
-    const msg = parsed.error?.message || parsed.message || "Upstream error";
-    const limited = /FreeUsageLimitError|rate limit|quota/i.test(msg);
-    const status = limited ? 429 : 502;
-    log("error", `[ZEN RESPONSES UPSTREAM ${status} ${TAG}]`, withCause(status, msg));
-    if (!res.headersSent) {
-      res.status(status).json({
-        error: {
-          message: limited ? msg + " (free model rate limit)" : msg,
-          type: limited ? "rate_limit_error" : "upstream_error",
-          code: limited ? "rate_limit_exceeded" : "upstream_error",
-        },
-      });
-    }
+    const raw = JSON.stringify(parsed);
+    const { status, error } = upstreamErrorPayload(200, raw, zenRes.headers);
+    log("error", `[ZEN RESPONSES UPSTREAM ${status} ${TAG}]`, withCause(status, error.message));
+    sendUpstreamError(res, 200, raw, zenRes.headers, "openai");
     stopped = true;
     abortUpstream(controller, "inline error, stop reading");
   }
@@ -2264,18 +2353,13 @@ function responsesSSEParser(onEvent) {
 // Upstream non-200 for the Spark translation paths. `raw` is the full body
 // text (caller collects it via collectZenBody).
 function responsesNon200Raw(raw, status, res, anthropicShape, tag) {
-  let msg = "Upstream error";
-  try {
-    const p = JSON.parse(raw);
-    msg = p.error?.message || p.message || msg;
-  } catch {}
-  log("error", `[ZEN RESPONSES UPSTREAM ${status} ${tag || "??"}]`, withCause(status, msg));
+  const { status: outStatus, error } = upstreamErrorPayload(status, raw, null);
+  log("error", `[ZEN RESPONSES UPSTREAM ${status} ${tag || "??"}]`, withCause(outStatus, error.message));
   if (res.headersSent) return;
   if (anthropicShape) {
-    const errType = ({ 400: "invalid_request_error", 401: "authentication_error", 403: "authentication_error", 404: "not_found_error", 429: "rate_limit_error" })[status] || "api_error";
-    res.status(status >= 400 ? status : 502).json({ type: "error", error: { type: errType, message: msg } });
+    res.status(outStatus).json({ type: "error", error: { type: error.type, message: error.message } });
   } else {
-    res.status(status >= 400 ? status : 502).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
+    res.status(outStatus).json({ error });
   }
 }
 
@@ -2345,10 +2429,9 @@ async function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel, rename
       return res.status(502).json({ error: { message: msg, type: "upstream_error", code: "upstream_error" } });
     }
     if (d.error || d.type === "error") {
-      const msg = d.error?.message || d.message || "Upstream error";
-      const limited = raw.includes("FreeUsageLimitError");
-      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
-      return res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
+      const { status, error } = upstreamErrorPayload(200, raw, zenRes.headers);
+      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(status, error.message));
+      return sendUpstreamError(res, 200, raw, zenRes.headers, "openai");
     }
     log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
     return res.json(responsesObjectToChatResponse(d, chatModel, renames));
@@ -2472,11 +2555,9 @@ async function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel, rename
     // and the split-across-chunks case caught only by the accumulated tail).
     function reportInlineError(raw) {
       if (res.headersSent) return res.end(); // stream already committed — nothing else to do
-      let msg = "Rate limit";
-      try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
-      const limited = raw.includes("FreeUsageLimitError");
-      log("error", `[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, withCause(limited ? 429 : 502, msg));
-      res.status(limited ? 429 : 502).json({ error: { message: limited ? msg + " (free model rate limit)" : msg, type: limited ? "rate_limit_error" : "upstream_error", code: limited ? "rate_limit_error" : "upstream_error" } });
+      const { status, error } = upstreamErrorPayload(200, raw, zenRes.headers);
+      log("error", `[ZEN RESPONSES INLINE ${status} ${TAG} +${Date.now() - t0}ms]`, withCause(status, error.message));
+      sendUpstreamError(res, 200, raw, zenRes.headers, "openai");
     }
     function onData(c) {
       rxBytes += c.length;
@@ -2570,10 +2651,9 @@ async function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, i
       return res.status(502).json({ type: "error", error: { type: "api_error", message: msg } });
     }
     if (d.error || d.type === "error") {
-      const msg = d.error?.message || d.message || "Upstream error";
-      const limited = raw.includes("FreeUsageLimitError");
-      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(limited ? 429 : 502, msg));
-      return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
+      const { status, error } = upstreamErrorPayload(200, raw, zenRes.headers);
+      log("error", `[ZEN RESPONSES SYNC ${TAG} +${Date.now() - t0}ms rx=${raw.length}B]`, withCause(status, error.message));
+      return sendUpstreamError(res, 200, raw, zenRes.headers, "anthropic");
     }
     log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${raw.length}B sync]`);
     return res.json(openAIToAnthropic(responsesObjectToChatResponse(d, chatModel, renames), chatModel, inputTokens));
@@ -2692,12 +2772,10 @@ async function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, i
     // B-Q5 (Anthropic side): split-across-chunks error bodies evade the
     // first-chunk sniff — the accumulated raw tail is the backstop.
     function reportInlineError(raw) {
-      let msg = "Rate limit";
-      try { const p = JSON.parse(raw); msg = p.error?.message || p.message || msg; } catch {}
-      const limited = raw.includes("FreeUsageLimitError");
-      log("error", `[ZEN RESPONSES INLINE ${limited ? 429 : 502} ${TAG} +${Date.now() - t0}ms]`, withCause(limited ? 429 : 502, msg));
+      const { status, error } = upstreamErrorPayload(200, raw, zenRes.headers);
+      log("error", `[ZEN RESPONSES INLINE ${status} ${TAG} +${Date.now() - t0}ms]`, withCause(status, error.message));
       if (res.headersSent) return res.end();
-      return res.status(limited ? 429 : 502).json({ type: "error", error: { type: limited ? "rate_limit_error" : "api_error", message: limited ? msg + " (free model rate limit)" : msg } });
+      return sendUpstreamError(res, 200, raw, zenRes.headers, "anthropic");
     }
     function onData(c) {
       rxBytes += c.length;
@@ -2782,6 +2860,74 @@ function validateGenParams(b) {
   return null;
 }
 
+const CHAT_ROLES = new Set(["system", "developer", "user", "assistant", "tool"]);
+const CHAT_TEXT_PART_TYPES = new Set(["text", "input_text", "output_text"]);
+
+// Medium validation for /v1/chat/completions. Malformed message structures
+// otherwise reach the free-tier upstream and come back as an opaque 400/429.
+// Unknown content-part types are allowed (the official client passes them
+// through); only text-family parts require a string `text`.
+function validateChatBody(body) {
+  if (!isPlainObject(body)) return "request body must be a JSON object";
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return "messages must be a non-empty array";
+  }
+  for (const [i, msg] of body.messages.entries()) {
+    if (!isPlainObject(msg)) return `messages[${i}] must be an object`;
+    if (typeof msg.role !== "string" || !msg.role) {
+      return `messages[${i}].role must be a non-empty string`;
+    }
+    if (!CHAT_ROLES.has(msg.role)) return `messages[${i}].role must be one of ${[...CHAT_ROLES].join(", ")}`;
+    const c = msg.content;
+    if (c !== undefined && c !== null) {
+      if (typeof c === "string") {
+        // ok
+      } else if (Array.isArray(c)) {
+        for (const [j, p] of c.entries()) {
+          if (!isPlainObject(p)) return `messages[${i}].content[${j}] must be an object`;
+          if (typeof p.type !== "string" || !p.type) {
+            return `messages[${i}].content[${j}].type must be a non-empty string`;
+          }
+          if (CHAT_TEXT_PART_TYPES.has(p.type) && typeof p.text !== "string") {
+            return `messages[${i}].content[${j}].text must be a string`;
+          }
+        }
+      } else {
+        return `messages[${i}].content must be a string or an array of content parts`;
+      }
+    }
+    if (msg.tool_calls !== undefined) {
+      if (!Array.isArray(msg.tool_calls)) return `messages[${i}].tool_calls must be an array`;
+      for (const [j, tc] of msg.tool_calls.entries()) {
+        if (!isPlainObject(tc)) return `messages[${i}].tool_calls[${j}] must be an object`;
+        if (typeof tc.id !== "string" || !tc.id) {
+          return `messages[${i}].tool_calls[${j}].id must be a non-empty string`;
+        }
+        if (!isPlainObject(tc.function) || typeof tc.function.name !== "string" || !tc.function.name) {
+          return `messages[${i}].tool_calls[${j}].function.name must be a non-empty string`;
+        }
+        const args = tc.function.arguments;
+        if (args !== undefined && typeof args !== "string" && !isPlainObject(args)) {
+          return `messages[${i}].tool_calls[${j}].function.arguments must be a string or object`;
+        }
+      }
+    }
+    if (msg.role === "tool" && (typeof msg.tool_call_id !== "string" || !msg.tool_call_id)) {
+      return `messages[${i}].tool_call_id must be a non-empty string`;
+    }
+  }
+  if (body.tools !== undefined) {
+    if (!Array.isArray(body.tools)) return "tools must be an array";
+    for (const [i, t] of body.tools.entries()) {
+      const fn = isPlainObject(t) ? t.function || t : null;
+      if (!fn || typeof fn.name !== "string" || !fn.name) {
+        return `tools[${i}].function.name must be a non-empty string`;
+      }
+    }
+  }
+  return null;
+}
+
 function sendRouteError(res, e, anthropicShape = false) {
   log("error", "[ROUTE ERROR]", e?.stack || e?.message || e);
   if (res.headersSent || res.writableEnded) {
@@ -2839,8 +2985,14 @@ app.post("/v1/chat/completions", async (req, res) => {
     const perr = validateGenParams(req.body);
     if (perr) return res.status(400).json({ error: { message: perr, type: "invalid_request_error" } });
   }
+  // A9: medium message-structure validation (protects both native chat and
+  // the chat→Spark/Responses translation from opaque upstream 400/429).
+  {
+    const cerr = validateChatBody(req.body);
+    if (cerr) return res.status(400).json({ error: { message: cerr, type: "invalid_request_error" } });
+  }
 
-  const sessionId = getSession(user);
+  const sessionId = getSession(user, req);
   const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
 
   if (isSparkModel(model)) {
@@ -2902,7 +3054,7 @@ app.post("/v1/responses", async (req, res) => {
     if (perr) return res.status(400).json({ error: { message: perr, type: "invalid_request_error" } });
   }
 
-  const sessionId = getSession(user);
+  const sessionId = getSession(user, req);
   log("info", "[RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync");
 
   const { body, options } = zenResponsesRequest(req.body, sessionId);
@@ -2937,7 +3089,7 @@ app.post("/v1/messages", async (req, res) => {
   }
   // B2 retired for messages — Spark is translated to the upstream Responses
   // API right here (Phase 1, same as the chat route).
-  const sessionId = getSession(user);
+  const sessionId = getSession(user, req);
   const { messages, tools, error } = anthropicToOpenAI(req.body);
   if (error) {
     return res.status(400).json({
@@ -3045,6 +3197,10 @@ app.get("/health", (_req, res) => res.json({
   status: "ok", version: `v${PROXY_VERSION}`, runtime: RUNTIME, models: MODELS.length,
   models_source: MODELS_ORIGIN, models_loaded_at: MODELS_LOADED_AT,
   responses_available: hasFreeSparkModel(),
+  upstream_auth: zenKey(MODELS[0]) === "public" ? "public (free tier)" : "console key",
+  official_tools: OFFICIAL_TOOLS.length,
+  session_ttl_ms: SESSION_TTL_MS,
+  forward_params: FORWARD_PARAMS,
   endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
 }));
 
@@ -3189,8 +3345,22 @@ export {
   restoreToolName,
   dropToolCall,
   validateGenParams,
+  validateChatBody,
   validateAnthropicBody,
   isPlainObject,
+  isFreeTierModel,
+  newProjectId,
+  projectId,
+  FORWARDED_PARAMS,
+  FORWARD_PARAMS,
+  rewriteToolChoice,
+  upstreamErrorPayload,
+  parseUpstreamError,
+  isQuotaError,
+  sendUpstreamError,
+  responsesNon200Raw,
+  OFFICIAL_TOOLS,
+  OFFICIAL_TOOL_NAMES,
   buildZenChatBody,
   zenRequest,
   zenResponsesRequest,

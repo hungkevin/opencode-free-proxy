@@ -118,7 +118,9 @@ Zen 免費層新增伺服器端閘門：不像 OpenCode 客戶端的請求一律
 > 「傳輸層 TLS 指紋 + 應用層請求形狀」雙層，兩層**各自獨立必要**，缺一即拒。
 > 差分探針（本次修復的對照實驗，可重跑）：
 > `review/probe_tls_fingerprint_node.mjs`、`review/probe_tls_fingerprint_bun.mjs`。
-> 修復對齊的可工作參考實作：`oc2api` v4.3.0（Go + uTLS）。
+> 修復對齊的可工作參考實作：`oc2api` v4.3.0（Go + uTLS）；
+> 2026-11-05 再以 oc2api v4.5.0 與官方 opencode 源碼（HEAD ee6b87031c）複核並修正
+> 形狀漂移（見 §6.3 修訂欄與附錄 D）。
 
 ### 6.1 故障現象與誤判風險
 
@@ -288,21 +290,25 @@ Safari / Opera / okhttp profile，**沒有 Bun profile**——用 Chrome 指紋�
 
 ### 6.3 閘門 2：請求形狀（應用層）
 
-對照表（舊 = v10 失效形狀；新 = oc2api 對齊形狀）：
+對照表（舊 = v10 失效形狀；新 = oc2api 對齊形狀；v11.2 修訂 = 2026-11-05 對照
+oc2api v4.5.0 與官方 opencode 源碼後的再校正）：
 
-| 項目 | 舊（失效） | 新（oc2api 對齊） |
-|------|-----------|------------------|
-| 端點 | `POST /zen/v1/chat/completions` | `POST /inference/v1/chat/completions` |
-| User-Agent | `opencode/1.18.31 ai-sdk/... runtime/bun/1.3.13` | `opencode/latest/2.1.1/cli` |
-| `x-opencode-project` | `global` | `3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787` |
-| `Accept` | `text/event-stream` | `*/*` |
-| `x-opencode-request` | `msg_<id>` | **不送**（oc2api 不送） |
-| session 相關 header | 僅 `x-opencode-session` | 四個：`x-opencode-session` / `x-opencode-session-id` / `x-session-affinity` / `X-Session-Id`（同值） |
-| system prompt | 無（原樣轉發客戶端訊息） | 官方 prompt（`oc-prompt.txt`）置頂，客戶端 system 附加其後 |
-| 工具 | 5 個內建名（空 schema）+ 用戶工具 | 12 個官方工具（`oc-tools.json` 完整 schema，description 換「禁止調用」）+ 改名用戶工具 |
-| 長度上限 | `max_tokens` | `max_completion_tokens`（預設 32000，`OUTPUT_LIMIT` 可調） |
-| `tool_choice` | 無工具時送 `"none"` | **不送**；無工具客戶端靠 system 末尾提示句勸退 |
-| 其他參數 | 轉發 temperature/top_p/stop/seed | **不轉發**（只送 6 個 key：model/messages/tools/stream/stream_options/max_completion_tokens，鍵序照官方） |
+| 項目 | 舊（失效） | 新（oc2api 對齊） | v11.2 修訂 |
+|------|-----------|------------------|-----------|
+| 端點 | `POST /zen/v1/chat/completions` | `POST /inference/v1/chat/completions` | 不變 |
+| User-Agent | `opencode/1.18.31 ai-sdk/... runtime/bun/1.3.13` | `opencode/latest/2.1.1/cli` | 同一 UA（`OC_UA` 可覆寫）也用於 models registry 抓取 |
+| `Authorization` | 客戶端 key | `oc_sk_*` | 免費模型一律 `Bearer public`（官方 opencode 匿名層語義，`provider/opencode.ts:429-451`）；付費模型才送 `oc_sk_*` |
+| `x-opencode-project` | `global` | 固定 `3f3f7816...e1787` | **每請求隨機 40-hex**（oc2api v4.5.0 行為：固定值會讓所有部署共用同一配額桶）；`OC_PROJECT` 可釘選 |
+| `x-opencode-client` | `cli` | `cli` | `opencode`（官方送 `app.name`；`OC_CLIENT` 可覆寫回 `cli`） |
+| `Accept` | `text/event-stream` | `*/*` | **不送**（oc2api v4.5.0 移除；形狀閘門對 header 存在敏感） |
+| `x-opencode-request` | `msg_<id>` | **不送**（oc2api 不送） | 不變 |
+| session 相關 header | 僅 `x-opencode-session` | 四個同值 header | 不變；session 改依「客戶端對話 header（`x-opencode-session`/`x-session-id`/`x-conversation-id`）→ API key」兩層鍵控，同一對話重用同一 `ses_` id |
+| system prompt | 無（原樣轉發客戶端訊息） | 官方 prompt（`oc-prompt.txt`）置頂，客戶端 system 附加其後 | 不變 |
+| 工具 | 5 個內建名（空 schema）+ 用戶工具 | 12 個官方工具 + 改名用戶工具 | **13 個**官方工具（補 `patch`；缺任一會被形狀閘門擋成 429） |
+| 長度上限 | `max_tokens` | `max_completion_tokens`（預設 32000，`OUTPUT_LIMIT` 可調） | 不變 |
+| `tool_choice` | 無工具時送 `"none"` | 不送；無工具客戶端靠 system 提示句勸退 | **chat 路徑白名單轉發**（named choice 經改名映射重寫）；`/v1/responses` 仍降級 auto（該端點僅接受 auto，實測 none/required/named → 400） |
+| 其他參數 | 轉發 temperature/top_p/stop/seed | 不轉發（6 個 key，鍵序照官方） | **白名單轉發**：`temperature`/`top_p`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice`（官方 `openai-chat.ts:889-894` 與 oc2api `shape.go` 皆轉發）；`FORWARD_PARAMS=0` 恢復舊行為；`stop`/`seed` 仍不轉發（實測 400 風險） |
+| 錯誤分類 | 200-inline 一律回 429 | — | 依**錯誤內容**分類（官方 `provider-error.ts` QUOTA 語義）：`FreeUsageLimitError`/quota 類 → 429 `rate_limit_error`；其他 upstream 錯誤 → 502 `upstream_error`，不再把普通上游錯誤誤標成限流；`Retry-After`/`retry-after-ms` 透傳給客戶端 |
 
 **Session ID 演算法**（`server.mjs` `zenSessionId()`，oc2api `SessionID` 對齊）：
 
@@ -315,10 +321,12 @@ ses_ + 12 hex + 14 base62
 - **計數器必須落在 1..15**：序號 0 會把低 12 位元編成 `0xFFF`，實測被判 429
   （oc2api 註解明言此坑）。同毫秒多請求以模組層計數器 `sesCounter % 15 + 1` 保證。
 
-**官方工具集**（`oc-tools.json`，oc2api 逆向的官方客戶端形狀）：
+**官方工具集**（`oc-tools.json`，oc2api 逆向的官方客戶端形狀；2026-11-05 重新
+對齊 oc2api v4.5.0，兩邊檔案 byte-identical）：
 `edit` / `glob` / `grep` / `question` / `read` / `shell` / `skill` / `subagent` /
-`webfetch` / `websearch` / `write` / `execute`——含完整參數 schema（閘門可能驗形狀
-不只驗名），description 一律換成「Reserved for the host runtime; do not call...」
+`webfetch` / `websearch` / `write` / `execute` / `patch`（13 個）——含完整參數 schema
+（閘門可能驗形狀不只驗名；oc2api 的 AGENTS.md 明言**缺 `patch` 會被上游 429**），
+description 一律換成「Reserved for the host runtime; do not call...」
 讓模型別選它們（客戶端執行不了）。
 
 ### 6.4 工具改名機制（撞名問題的解法）
@@ -376,7 +384,7 @@ v10 的 stream 模式把上游位元組**原樣直通**——在「只注入 5 �
 | 檔案 | 內容 |
 |------|------|
 | `server.mjs` | 指紋區段重寫（常數/session/headers/agent）、`buildZenChatBody`、改名三函式、`createChatStreamRewriter`、`pipeZenResponse` stream 分支重構、`pipeZenAsAnthropic` 重構、model 合併、`/health` 加 `runtime`、Node 誤用警告橫幅 |
-| `oc-prompt.txt` / `oc-tools.json` | 新增，自 oc2api `internal/shape/assets/` 原樣複製 |
+| `oc-prompt.txt` / `oc-tools.json` | 新增，自 oc2api `internal/shape/assets/` 複製（2026-11-05 重新同步 oc2api v4.5.0，tools 補 `patch` 至 13 個，byte-identical） |
 | `package.json` | v0.11.0；`start: bun server.mjs`（`start:node` 保留但會被上游拒） |
 | `start_warn.bat` | 自動找 bun（PATH → `%USERPROFILE%\.bun\bin\bun.exe`），找不到給安裝指引 |
 | `README.md` | 安裝、兩層閘門原理（含實測矩陣）、標頭格式、環境變數、VPS/systemd |
@@ -405,11 +413,13 @@ metadata 併入，過濾條件同 oc2api：`id === "big-pickle" || id.endsWith("
 
 | 捨棄 | 原因 | 後果 |
 |------|------|------|
-| `temperature`/`top_p`/`stop`/`seed` 轉發 | oc2api 不送；未驗證參數有 400 風險 | 客戶端無法調溫度/top_p |
-| `tool_choice`（auto/none/required/named） | 上游不接受 | 「必須呼叫某工具」降級為「建議」；無工具客戶端靠 system 提示 |
-| 舊 5 工具相容方案 | 新閘門要求 12 個官方工具完整形狀 | — |
+| ~~`temperature`/`top_p` 轉發~~ | **v11.2 已恢復白名單轉發**（官方與 oc2api v4.5.0 皆轉發）；`stop`/`seed` 仍不轉發（實測 400 風險） | `FORWARD_PARAMS=0` 可關閉恢復完全静默 |
+| `tool_choice`（`/v1/responses` 端點） | 該端點實測僅接受 auto（none/required/named → 400） | Spark 路徑仍降級；chat 路徑 v11.2 起白名單轉發 |
+| 舊 5 工具相容方案 | 新閘門要求 13 個官方工具完整形狀 | — |
 | `/v1/responses` Spark 翻譯深度維護 | registry 已無 muse-spark 系列，路徑休眠 | 只更新標頭/端點，未做工具改名（該系列重現時需補） |
-| oc2api 的「空回應自動重試一次」 | stream 無法重試；system 提示已大幅降低空回應機率 | 極端情況下 sync 可能拿到空內容（無工具客戶端） |
+| oc2api 的「空回應自動重試一次」 | stream 無法重試；system 提示已大幅降低空回應機率；官方 opencode 也無此機制 | 極端情況下 sync 可能拿到空內容（無工具客戶端） |
+| 429 自動重試 | 官方把 `FreeUsageLimitError` 歸為 QuotaExceeded（**不可重試**，`schema/errors.ts:219`）；基準的「不重試」更接近官方 | 等待時間由客戶端根據透傳的 `Retry-After` 決定 |
+| 日誌遮罩金鑰 | 本專案僅供本地網路使用，**完整金鑰必須可見**（使用者明確要求） | 日誌含明文 key，切勿暴露到公網 |
 
 ### 6.8 維運備忘
 
@@ -501,7 +511,10 @@ metadata 併入，過濾條件同 oc2api：`id === "big-pickle" || id.endsWith("
 - **推理**:`reasoning` — 是否輸出 `reasoning_content`;此類模型受 server.mjs 的 `REASONING_CAP` 保護。
 - **工具**:`tool_call` — 是否支援 function calling。
 - **Context / 輸出上限**:`limit.context` / `limit.output`,單位 tokens(`K`=千,`M`=百萬);後者可作為 `OUTPUT_LIMIT`(注入 `max_completion_tokens`)的精準依據。
-- **費用判定**:一律以 `cost.input === 0 && cost.output === 0` 為準,不以名稱判斷。
+- **費用判定**:一律以 `cost.input === 0 && cost.output === 0` 為準,不以名稱判斷;
+  名稱僅作 fallback（`-free` 後綴 / `big-pickle`）——用於 cost 資訊缺席的動態合併 id。
+  判定結果決定上游 `Authorization`：免費模型 `Bearer public`（官方匿名層語義）、
+  其餘模型送設定的 `oc_sk_*`。
 
 ---
 
@@ -600,3 +613,48 @@ node --test test/responses-pipe.test.mjs
 - [x] 客戶端斷線瞬間上游連線中止 (日誌見 `[ZEN ABORT]` / `[ZEN ERROR]`)
 - [x] `SIGINT`/`SIGTERM` 10 秒內優雅退出
 - [x] `PROXY_HOST=127.0.0.1` 僅回環可連
+
+---
+
+## 附錄 D: 對照源碼審查修復彙總 (v11.2, 2026-11-05)
+
+> 本輪以官方 opencode 源碼（`c:\work\opencode`, HEAD ee6b87031c）為最終權威、
+> oc2api v4.5.0（`c:\work\oc2api`, HEAD 965dc3a）為現行可工作參考，對照審查
+> 24 項後逐項修復。測試：`test/review-fixes.test.mjs`（17 條）+ 既有 10 檔，
+> 全套 **46 pass / 0 fail**。
+
+### 已修復
+
+| # | 問題 | 修復 | 對照依據 |
+|---|------|------|----------|
+| A1 | 免費模型送 `oc_sk_*`（共用付費配額桶） | `zenKey(model)`：免費模型一律 `Bearer public`；付費才送 Console key | opencode `provider/opencode.ts:429-451` |
+| A2/N3 | `x-opencode-project` 硬編碼常數（所有部署共用同一配額桶） | 每請求隨機 40-hex；`OC_PROJECT` 可釘選 | oc2api v4.5.0 `client.go:35-44` |
+| A3/A10 | models registry 抓取用 `opencode/1.18.31`、上游用 `opencode/latest/2.1.1/cli`，UA 不一致 | 統一 `OC_UA`（可環境變數覆寫） | opencode `app.ts` |
+| A4 | `x-opencode-client: cli` | 改 `opencode`（官方送 `app.name`；`OC_CLIENT` 可覆寫） | opencode `model-request.ts:313-325` |
+| A5 | 固定 project id + 固定 UA 形成穩定指紋 | 見 A2/A3 | — |
+| A6 | session 只按 API key 鍵控（不同對話共用 `ses_` id） | 改「客戶端對話 header → API key」兩層鍵控；同對話重用、跨對話隔離 | opencode `session/affinity.ts` |
+| A7 | 200-inline 任何 `{"error":...}` 一律誤回 429 | 集中分類 `upstreamErrorPayload()`：quota 語義才 429，其他 502 `upstream_error` | opencode `provider-error.ts` / `schema/errors.ts:197-224` |
+| A8 | 非 200 一律 `upstream_error`（429 也誤標） | 429/402/quota → `rate_limit_error`；401/403 → `authentication_error`；400 → `invalid_request_error`；404 → `not_found_error` | 同上 + oc2api `stream.go:376-379` |
+| A9 | chat 路由只驗訊息非空 | `validateChatBody()`：role 白名單、content 形狀、tool_calls/tool_call_id 結構 | _1 版審查項 |
+| A10 | registry UA 與上游不一致 | 併入 A3 | — |
+| A11 | `/health` 缺運維欄位 | 加 `upstream_auth` / `official_tools` / `session_ttl_ms` / `forward_params` | — |
+| A12 | `oc-keys.test.mjs` 斷言**錯誤行為**（免費模型送 oc key） | 改斷言 `Bearer public`；新增 `test/review-fixes.test.mjs` 17 條覆蓋本輪全部修復 | A1 對照 |
+| A14 | temperature/top_p/tool_choice 靜默丟棄（與「已驗證」宣告矛盾） | chat 白名單轉發 `temperature`/`top_p`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice`（named choice 經改名映射重寫）；`FORWARD_PARAMS=0` 可關 | opencode `openai-chat.ts:889-894`；oc2api `shape.go:293-297` |
+| A16 | `/v1/responses` 只刪 temperature/top_p/seed，漏 `stop`（與宣告矛盾） | 補刪 `stop`；Responses 端點維持取樣參數静默（該端點 400 較敏感） | — |
+| A17/A18 | 文件漂移（12 工具、不轉發宣告、v4.3.0 對齊） | §6.3 修訂欄 + 本附錄 | — |
+| N1 | 官方工具缺 `patch`（oc2api AGENTS.md：缺工具=上游 429） | `oc-tools.json` 重新同步 oc2api v4.5.0，13 工具 byte-identical | oc2api `AGENTS.md:89-92` |
+| N2/N7/N9 | 資產來源未標註、捨棄項過時 | §6.3/§6.7 更新，標註 oc-prompt.txt / oc-tools.json 來源與同步日期 | — |
+| N4 | 上游送 `Accept: */*`（oc2api v4.5.0 已移除） | 不再送 `Accept` | oc2api `client_test.go:32-41` |
+| N6 | 429 無 `Retry-After` 透傳 | `upstreamErrorPayload()` 讀取 `retry-after-ms`/`retry-after` 並透傳客戶端 | oc2api `server.go:256,279` |
+| N10 | 兩種錯誤判定標準並存（`FreeUsageLimitError` vs `/rate limit|quota/`） | 統一進 `upstreamErrorPayload()`（QUOTA codes 集合 + 訊息正則 + 402） | opencode QUOTA_CODES |
+
+### 審查後刻意不改
+
+| # | 項目 | 不改理由 |
+|---|------|----------|
+| N5 | 工具名改用 `oc2api_<sha256-12hex>` 摘要 | 官方 opencode 送真實名稱；摘要改名僅 oc2api 反指紋用，未實測前不動（現行可讀名已實測通過） |
+| R1 | 429 自動重試 | 官方將 `FreeUsageLimitError` 歸為 QuotaExceeded，`isRetryable=false`；「不重試 + 透傳 Retry-After」更接近官方語義 |
+| R2 | `MASK_KEYS` 預設遮罩 | 使用者明確要求本地網路完整顯示金鑰 |
+| R3 | 端點路徑改版 | oc2api v4.5.0 同樣使用 `/inference/v1/*`，無變更依據 |
+| R4 | 空回應自動重試一次 | 官方無此機制；stream 不可重放；已文件化（§6.7） |
+| R5 | `oc-project.json` 持久化 project id | 改採 oc2api v4.5.0 的每請求隨機方案，檔案持久化反而重建共用桶問題；`OC_PROJECT` 提供釘選逃生口 |

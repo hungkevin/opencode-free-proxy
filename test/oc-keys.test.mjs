@@ -66,14 +66,16 @@ function postChat() {
   });
 }
 
-test("with ockeys set, upstream Authorization carries the oc key", async () => {
+test("free model keeps Bearer public even when ockeys are configured", async () => {
   setOcKeys(["oc_sk_test_aaa", "oc_sk_test_bbb"]);
   seenAuth.length = 0;
   const res = await postChat();
   assert.equal(res.status, 200);
   await res.text();
   assert.equal(seenAuth.length, 1);
-  assert.equal(seenAuth[0], `Bea` + `rer oc_sk_test_aaa`);
+  // Official opencode uses apiKey "public" for the anonymous free tier; a
+  // Console key only applies to paid models (see provider/opencode.ts:429-451).
+  assert.equal(seenAuth[0], `Bea` + `rer public`);
 });
 
 test("with no ockeys, upstream Authorization falls back to public", async () => {
