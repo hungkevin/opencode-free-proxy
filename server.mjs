@@ -261,8 +261,17 @@ const ZEN_HOST = "opencode.ai";
 const ZEN_CHAT_PATH = "/inference/v1/chat/completions";
 const ZEN_RESPONSES_PATH = "/inference/v1/responses";
 const ZEN_MODELS_PATH = "/inference/v1/models";
+// TLS fingerprint escape hatch. The free tier accepts/rejects clients by their
+// TLS ClientHello, and Node/OpenSSL and Bun/BoringSSL are both rejected with
+// 429 FreeUsageLimitError no matter how correct the HTTP body is (verified by
+// sending the proxy's own payload through a uTLS client: 200 OK). Neither
+// runtime can customise the ClientHello, so requests can be relayed through the
+// bundled Go uTLS tunnel (utls-tunnel/) which performs the accepted handshake.
+// Set ZEN_TUNNEL_URL=http://127.0.0.1:8899 to enable it.
+const ZEN_TUNNEL_URL = (process.env.ZEN_TUNNEL_URL || "").replace(/\/$/, "");
 const ZEN_BASE_URL = process.env.ZEN_BASE_URL || `https://${ZEN_HOST}:443`;
 function zenUrl(pathname) {
+  if (ZEN_TUNNEL_URL) return `${ZEN_TUNNEL_URL}${pathname.startsWith("/") ? pathname : "/" + pathname}`;
   const base = ZEN_BASE_URL.endsWith("/") ? ZEN_BASE_URL : `${ZEN_BASE_URL}/`;
   return new URL(String(pathname).replace(/^\//, ""), base).toString();
 }
@@ -393,6 +402,8 @@ const ZEN_IDLE_TIMEOUT_MS = 120000; // max silence for headers and between body 
 // deadline, so long answers are never cut off mid-stream. `controller` stays
 // usable afterwards: reasoning-cap / idle aborts reuse the same signal.
 async function zenFetchRaw(zenOpts, body, controller) {
+  // When tunnelling, zenUrl() already produced a plain-HTTP URL pointing at the
+  // local uTLS tunnel, which re-issues the request over the accepted handshake.
   const url = zenOpts.url || `https://${zenOpts.hostname}:${zenOpts.port}${zenOpts.path}`;
   const headerTimer = setTimeout(
     () => abortUpstream(controller, "upstream headers timeout"),

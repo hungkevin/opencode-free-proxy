@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-proxy",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "Proxy server for OpenCode free-tier AI models via Zen API (requires Bun — upstream gates on TLS fingerprint)",
   "type": "module",
   "main": "server.mjs",

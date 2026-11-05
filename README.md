@@ -238,6 +238,7 @@ sudo systemctl enable --now opencode-proxy
 | `RETRY_429_HARD_LIMIT_MS` | `300000` | A 429 whose `Retry-After` exceeds this (5 min) is a spent daily quota — fail fast instead of sleeping through pointless retries |
 | `RETRY_429_BASE_MS` | `2000` | Exponential backoff base for 429 retries |
 | `RETRY_429_CAP_MS` | `30000` | Max wait per single 429 retry |
+| `ZEN_TUNNEL_URL` | unset | **TLS fingerprint escape hatch.** The free tier fingerprints the TLS ClientHello. Neither Bun nor Node can customise the ClientHello, so the proxy can relay upstream requests through a local uTLS tunnel (`utls-tunnel/`) that performs the accepted handshake. Set `ZEN_TUNNEL_URL=http://127.0.0.1:8899` to enable it. See `utls-tunnel/` for the standalone Go binary. |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 

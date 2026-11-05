@@ -808,3 +808,79 @@ ELAPSED = 153ms            ← 舊版需 ~120 秒
 | 注意 | 同一 IP 上 proxy 與 opencode v2 共用配額，同時跑會互相消耗 |
 
 測試自 61 增至 **63 pass / 0 fail**。
+
+---
+
+## 附錄 G: TLS 指紋閘門與 uTLS 隧道方案 (v11.5, 2026-11-05)
+
+> 本輪由使用者對照實驗驅動：發現 `oc2api`（Go + uTLS）可用、同機 `bun run`（BoringSSL 原生 ClientHello）全軍覆沒。確認差異在 **TLS ClientHello 指紋**，而非請求形狀。
+
+### 決定性對照實驗
+
+同一機器、同一 IP（`218.211.116.40`）、同一請求形狀、同一時刻：
+
+| 客戶端 | 結果 | 耗時 |
+|--------|------|------|
+| oc2api (`:8080`, uTLS) | ✅ 200 | 1999ms |
+| `bun run` 直接直連 (`fetch`) | ❌ 429 | 225ms |
+
+**同一 IP、同一請求形狀、同一時間，一個成功、一個 429。**
+
+### 差異在 TLS ClientHello
+
+oc2api 用 **uTLS 手工構造 ClientHello**（`internal/zen/client.go:48-83`），關鍵特徵：
+
+| 特徵 | oc2api（可用） | Bun 1.4.4 / Node 22（429） |
+|------|---------------|---------------------------|
+| 金鑰交換曲線 | `X25519MLKEM768`（後量子） | 無 |
+| KeyShare | `X25519MLKEM768` + `X25519` | 僅 `X25519` |
+| ALPN | `http/1.1` | 已測試無效 |
+
+我測了 Node 的三種變體（預設 / 只給 http/1.1 / 強制 TLS 1.3）、**全部 429**，`ra` 完全相同。所以不是 ALPN，也不是 TLS 版本。
+
+**最可能是 `X25519MLKEM768`（後量子金鑰交換）**：這是 Chrome/BoringSSL 近期才加入的，而上游把「不支援它的 ClientHello」判定為非官方客戶端。
+
+### 解決方案：uTLS 隧道
+
+代理無法直接自訂 ClientHello（Node/Bun 都不支援），解決方案是**外掛一層 Go uTLS 隧道**：
+
+```
+代理 (Bun) ──HTTP──▶ 本地隧道 (:8899) ──uTLS──▶ 上游 (opencode.ai)
+```
+
+隧道用 Go `utls` 庫，手工構造與 oc2api 完全相同的 ClientHello（含 `X25519MLKEM768`、`http/1.1` ALPN、`X25519MLKEM768` KeyShare 等）。
+
+**隧道位置**：`utls-tunnel/main.go`（Go 1.25 + uTLS v1.8.2，編譯後 10.5 MB）。
+
+**接入方式**：設定環境變數 `ZEN_TUNNEL_URL=http://127.0.0.1:8899`，代理自動把所有上游請求轉給隧道。
+
+**驗證結果**：
+
+```
+oc2api  : 200 OK
+tunnel  : 200 OK  (原本 429，修正 header 順序 + Accept-Encoding 後通過)
+```
+
+### 實作細節
+
+| 項目 | 內容 |
+|------|------|
+| TLS 庫 | `github.com/refraction-networking/utls v1.8.2`（與 oc2api 相同） |
+| ClientHello | 逐字複製 oc2api `bunClientHello()`（含 `X25519MLKEM768` KeyShare） |
+| 協議 | HTTP/1.1（隧道內）+ uTLS 1.3（對上游） |
+| 傳輸 | 逐塊轉發 SSE，無緩衝，`Connection: close` 避免連線複用問題 |
+| Header 修正 | 自動補齊 `Content-Length`、`Accept-Encoding: gzip`、`Accept: */*` |
+| 啟用方式 | 環境變數 `ZEN_TUNNEL_URL=http://127.0.0.1:8899` |
+
+### 環境變數
+
+| 變數 | 預設 | 說明 |
+|------|------|------|
+| `ZEN_TUNNEL_URL` | unset | 本地 uTLS 隧道地址，啟用後所有上游請求經隧道轉發 |
+| `RETRY_429_HARD_LIMIT_MS` | `300000` | Retry-After 超過此值（5 分鐘）視為硬配額，不重試 |
+
+---
+
+---
+
+以上內容已加入文件末尾。現在更新版本號並提交。
