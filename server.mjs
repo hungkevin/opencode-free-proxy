@@ -413,6 +413,76 @@ async function zenFetchRaw(zenOpts, body, controller) {
 function abortUpstream(controller, why) {
   if (!controller.signal.aborted) controller.abort(new Error(why));
 }
+
+// ── 429 rate-limit retry (empirically-derived, NOT official parity) ──
+// MEASURED BEHAVIOUR (2026-11-05, same egress IP, Bun + Node, every free model):
+// the upstream answers `429 FreeUsageLimitError` for a burst of requests and
+// recovers after roughly 3 minutes — and a running opencode v2 shows the exact
+// same 429-then-recover cycle. So this is a ROLLING-WINDOW RATE LIMIT whose
+// message text ("Free usage limit reached") is misleading, not a spent quota.
+// The official client treats it as QuotaExceeded (isRetryable=false) and gives
+// up immediately; a proxy that also gives up just looks broken to the caller,
+// because the upstream would have accepted the request seconds later.
+// Strategy: retry 429s only, with bounded jittered backoff that fits inside the
+// observed recovery window. Quota-shaped bodies (402 / credit / budget codes,
+// which are NOT rate limits) are never retried.
+const RETRY_429_MAX = envInt("RETRY_429_MAX", 4); // 0 disables retrying
+const RETRY_429_BASE_MS = envInt("RETRY_429_BASE_MS", 2000);
+const RETRY_429_CAP_MS = envInt("RETRY_429_CAP_MS", 30000);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Honour Retry-After when the upstream sends one, else exponential + jitter.
+// The jitter multiplier is applied BEFORE the cap so the result never exceeds it.
+function retryDelay(attempt, retryAfterMs) {
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return Math.min(retryAfterMs, RETRY_429_CAP_MS);
+  const base = Math.min(RETRY_429_BASE_MS * 2 ** attempt, RETRY_429_CAP_MS);
+  const jittered = base * (0.75 + Math.random() * 0.5);
+  return Math.round(Math.min(jittered, RETRY_429_CAP_MS));
+}
+function parseRetryAfterMs(headers) {
+  // Read the raw strings first: Headers#get returns null when absent, and
+  // Number(null) === 0 would otherwise masquerade as a real "0 ms" hint.
+  const rawMs = headers?.get?.("retry-after-ms");
+  if (rawMs !== null && rawMs !== undefined && String(rawMs).trim() !== "") {
+    const ms = Number(rawMs);
+    if (Number.isFinite(ms) && ms >= 0) return ms;
+  }
+  const v = headers?.get?.("retry-after");
+  if (!v) return undefined;
+  const sec = Number(v);
+  if (Number.isFinite(sec)) return sec * 1000;
+  const date = Date.parse(v);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+// A retryable 429 is one that is NOT a hard quota/billing cap.
+function isRetryableLimit(status, raw) {
+  if (status !== 429) return false;
+  const p = parseUpstreamError(raw);
+  // 402-style caps arrive as 429 with credit/budget codes — never retry those.
+  if (/^(creditlimitexceeded|insufficient_quota|billing_error|budgetlimiterror|gousagelimiterror)$/.test(p.code)) {
+    return false;
+  }
+  return true;
+}
+// Fetch with 429 retry. Returns the final Response. Classification reads a
+// clone, so the caller still gets a readable body on the non-200 path and no
+// cooperation from the pipe sites is needed.
+async function zenFetchWithRetry(zenOpts, body, controller) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await zenFetchRaw(zenOpts, body, controller);
+    if (res.status !== 429 || attempt >= RETRY_429_MAX) return res;
+    let raw = "";
+    try {
+      raw = await res.clone().text();
+    } catch {
+      return res;
+    }
+    if (!isRetryableLimit(res.status, raw)) return res;
+    const wait = retryDelay(attempt, parseRetryAfterMs(res.headers));
+    log("warn", `[ZEN 429 RETRY ${attempt + 1}/${RETRY_429_MAX}] upstream rate limit, waiting ${wait}ms`);
+    await sleep(wait);
+    if (controller.signal.aborted) return res;
+  }
+}
 function bindClientAbort(controller, clientSignal) {
   if (!clientSignal) return;
   const onAbort = () => abortUpstream(controller, "client disconnected");
@@ -1301,7 +1371,7 @@ async function pipeZenResponse(zenOpts, body, stream, res, model, renames, clien
 
   let zenRes;
   try {
-    zenRes = await zenFetchRaw(zenOpts, body, controller);
+    zenRes = await zenFetchWithRetry(zenOpts, body, controller);
   } catch (e) {
     reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
     return;
@@ -1520,7 +1590,7 @@ async function pipeZenResponse(zenOpts, body, stream, res, model, renames, clien
 async function zenRequestFull(zenOpts, body, clientSignal) {
   const controller = new AbortController();
   bindClientAbort(controller, clientSignal);
-  const zenRes = await zenFetchRaw(zenOpts, body, controller);
+  const zenRes = await zenFetchWithRetry(zenOpts, body, controller);
   const raw = await collectZenBody(zenRes, controller);
   const { json } = coerceChatSyncBody(raw);
   return { status: zenRes.status, data: json ?? null, raw };
@@ -1741,7 +1811,7 @@ async function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, rename
 
   let zenRes;
   try {
-    zenRes = await zenFetchRaw(zenOpts, body, controller);
+    zenRes = await zenFetchWithRetry(zenOpts, body, controller);
   } catch (e) {
     reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
     return;
@@ -2143,7 +2213,7 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
 
   let zenRes;
   try {
-    zenRes = await zenFetchRaw(zenOpts, body, controller);
+    zenRes = await zenFetchWithRetry(zenOpts, body, controller);
   } catch (e) {
     reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
     return;
@@ -2508,7 +2578,7 @@ async function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel, rename
 
   let zenRes;
   try {
-    zenRes = await zenFetchRaw(zenOpts, body, controller);
+    zenRes = await zenFetchWithRetry(zenOpts, body, controller);
   } catch (e) {
     reportZenFailure(e, controller, res, TAG, t0, rxBytes, "openai", false);
     return;
@@ -2730,7 +2800,7 @@ async function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, i
 
   let zenRes;
   try {
-    zenRes = await zenFetchRaw(zenOpts, body, controller);
+    zenRes = await zenFetchWithRetry(zenOpts, body, controller);
   } catch (e) {
     reportZenFailure(e, controller, res, TAG, t0, rxBytes, "anthropic", false);
     return;
@@ -3480,6 +3550,11 @@ export {
   parseUpstreamError,
   isQuotaError,
   sendUpstreamError,
+  isRetryableLimit,
+  retryDelay,
+  parseRetryAfterMs,
+  RETRY_429_CAP_MS,
+  zenFetchWithRetry,
   responsesNon200Raw,
   OFFICIAL_TOOLS,
   OFFICIAL_TOOL_NAMES,

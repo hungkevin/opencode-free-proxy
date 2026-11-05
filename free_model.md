@@ -418,7 +418,7 @@ metadata 併入，過濾條件同 oc2api：`id === "big-pickle" || id.endsWith("
 | 舊 5 工具相容方案 | 新閘門要求 13 個官方工具完整形狀 | — |
 | `/v1/responses` Spark 翻譯深度維護 | registry 已無 muse-spark 系列，路徑休眠 | 只更新標頭/端點，未做工具改名（該系列重現時需補） |
 | oc2api 的「空回應自動重試一次」 | stream 無法重試；system 提示已大幅降低空回應機率；官方 opencode 也無此機制 | 極端情況下 sync 可能拿到空內容（無工具客戶端） |
-| 429 自動重試 | 官方把 `FreeUsageLimitError` 歸為 QuotaExceeded（**不可重試**，`schema/errors.ts:219`）；基準的「不重試」更接近官方 | 等待時間由客戶端根據透傳的 `Retry-After` 決定 |
+| 429 自動重試 | 官方把 `FreeUsageLimitError` 歸為 QuotaExceeded（**不可重試**，`schema/errors.ts:219`） | **v11.4 已改為重試**（見附錄 F）：實測該 429 約 3 分鐘即恢復、且執行中的 opencode v2 也出現同樣的 429→恢復循環，證明它是滾動窗速率限制而非配額；不重試會讓呼叫端誤以為代理壞了 |
 | 日誌遮罩金鑰 | 本專案僅供本地網路使用，**完整金鑰必須可見**（使用者明確要求） | 日誌含明文 key，切勿暴露到公網 |
 
 ### 6.8 維運備忘
@@ -691,3 +691,72 @@ node --test test/responses-pipe.test.mjs
 | `parent-session-id` / `x-parent-session-id` | 僅在有 parent session（subagent）時送；代理是無狀態轉發層，無從得知，刻意不加 |
 | `store: false` | 僅 openai/azure 才送（`detectSupportsStore`），opencode 端點不在列 → 不送正確 |
 | `Accept: */*` | `zenHeaders` 已無此 header；端到端觀察到的 `*/*` 來自 fetch/undici 傳輸層自動補值，非本專案程式碼 |
+## 附錄 F: 429 真實成因與重試機制 (v11.4, 2026-11-05)
+
+> 本輪由實際故障驅動：使用者回報「原生 opencode v2 可用、但兩個代理都 429」，
+> 追查後推翻「額度耗盡」的判斷。
+
+### 實測證據
+
+以**完全符合官方 v2 形狀**的請求直連上游（同出口 IP，Bun + Node 皆測）：
+
+| 測試項目 | 結果 |
+|----------|------|
+| 6 個不同免費模型 | 全部 `429 FreeUsageLimitError` |
+| project id 三種變體（固定 hash / 每次隨機 / 字面值 `global`） | 三者結果完全相同，全部 429 |
+| `/inference/v1/models`（不受閘門管） | **200**，回傳 80 個模型 |
+
+`/models` 正常證明 TLS 指紋、網路、DNS 皆無問題 —— 上游是對「這個出口 IP 的併發請求」限流。
+
+### 關鍵翻轉證據
+
+使用者回報：**「剛才 opencode v2 也觸發 429，大約等 3 分鐘後又可以再次使用」**。
+
+- 原生 v2 也會 429 → 不是代理的 bug
+- 3 分鐘即恢復 → 這是**滾動窗速率限制**，不是配額
+- 錯誤訊息卻寫 “Free usage limit reached” → **上游文案誤導**（即 §6.1 早已記載的誤判陷阱）
+
+官方 opencode 把 `FreeUsageLimitError` 歸為 `QuotaExceeded` 且 `isRetryable=false`，
+但實務上它 3 分鐘就恢復，所以「不可重試」的結論在這裡是錯的。
+
+### 修正
+
+| 項目 | 內容 |
+|------|------|
+| 重試範圍 | 僅 HTTP 429；`402`／`CreditLimitExceeded`／`insufficient_quota`／`billing_error`／`BudgetLimitError`／`GoUsageLimitError` 等**真配額碼一律不重試** |
+| 退避策略 | 尊重上游 `Retry-After`／`retry-after-ms`；否則指數退避（基準 2s）＋ 0.75~1.25 抖動，單次上限 30s，抖動後仍受上限約束 |
+| 次數 | 預設 4 次（`RETRY_429_MAX`，設 0 關閉） |
+| 覆蓋範圍 | 5 個串流管線入口 + 同步聚合路徑，全部改走 `zenFetchWithRetry()` |
+| 可觀測性 | 每次重試印 `[ZEN 429 RETRY n/N] upstream rate limit, waiting Xms` |
+| 分類不變 | 重試耗盡後仍以 `429 rate_limit_error` 回應，並透傳 `Retry-After` |
+
+實作細節：`zenFetchWithRetry()` 用 `res.clone().text()` 讀取 429 內容做分類，
+原始 Response 保持可讀，因此各管線的非 200 分支無需修改。
+
+### 環境變數
+
+| 變數 | 預設 | 說明 |
+|------|------|------|
+| `RETRY_429_MAX` | `4` | 429 最大重試次數；`0` 關閉 |
+| `RETRY_429_BASE_MS` | `2000` | 指數退避基準 |
+| `RETRY_429_CAP_MS` | `30000` | 單次等待上限 |
+
+### 端到端驗證
+
+假上游持續回 429（`RETRY_429_MAX=2`）：
+
+```
+[ZEN 429 RETRY 1/2] upstream rate limit, waiting 500ms
+[ZEN 429 RETRY 2/2] upstream rate limit, waiting 500ms
+CLIENT STATUS=429 RETRY_AFTER=1
+UPSTREAM HITS=3   ← 1 次初始 + 2 次重試，符合預期
+```
+
+### 同時修正的兩個 bug
+
+| bug | 說明 |
+|-----|------|
+| `parseRetryAfterMs` 誤判 | `Headers#get()` 不存在時回 `null`，`Number(null) === 0` 被當成「0ms」的有效提示 → 先檢查原始字串再轉數字 |
+| 抖動突破上限 | 先乘抖動再套上限，`30000 × 1.25 = 37500` 超出單次上限 → 改為先套上限 |
+
+測試自 57 增至 **61 pass / 0 fail**。

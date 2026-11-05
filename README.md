@@ -234,6 +234,9 @@ sudo systemctl enable --now opencode-proxy
 | `OC_PROJECT` | unset | Pin the upstream `x-opencode-project` id. Default sends a fresh random 40-hex per request (oc2api v4.5.0 behavior — a fixed id makes every deployment share one free-tier quota bucket) |
 | `OC_CLIENT` | derived from `OC_UA` | Upstream `x-opencode-client`. Defaults to the trailing segment of `OC_UA` (i.e. `cli`), matching the official `app.name` (`OPENCODE_ARTIFACT`); set explicitly to override |
 | `FORWARD_PARAMS` | `1` | `0`/`false` restores the old silent-drop behavior for `temperature`/`top_p`/`frequency_penalty`/`presence_penalty`/`reasoning_effort`/`parallel_tool_calls`/`prompt_cache_key`/`tool_choice` |
+| `RETRY_429_MAX` | `4` | How many times to retry an upstream HTTP 429. Measured 2026-11-05: the upstream's `429 FreeUsageLimitError` is a **rolling rate limit that clears in ~3 minutes**, not a spent quota (a running opencode v2 shows the same cycle), so retrying is what keeps the proxy usable. Real quota codes (`CreditLimitExceeded`, `insufficient_quota`, `billing_error`, `BudgetLimitError`, `GoUsageLimitError`) are never retried. `0` disables |
+| `RETRY_429_BASE_MS` | `2000` | Exponential backoff base for 429 retries |
+| `RETRY_429_CAP_MS` | `30000` | Max wait per single 429 retry |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 

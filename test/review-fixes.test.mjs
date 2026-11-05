@@ -13,6 +13,10 @@ import {
   upstreamErrorPayload,
   parseUpstreamError,
   isQuotaError,
+  isRetryableLimit,
+  retryDelay,
+  parseRetryAfterMs,
+  RETRY_429_CAP_MS,
   responsesNon200Raw,
   buildZenChatBody,
   FORWARDED_PARAMS,
@@ -147,6 +151,38 @@ test("Retry-After (and retry-after-ms) are preserved for the client", () => {
   assert.equal(upstreamErrorPayload(429, "", h).retryAfter, "120");
   const h2 = new Headers({ "retry-after-ms": "500" });
   assert.equal(upstreamErrorPayload(429, "", h2).retryAfter, "500");
+});
+
+// ── 429 retry: measured upstream behaviour is a rolling rate limit ──
+test("429 FreeUsageLimitError is retryable (it is a rate limit, not a quota)", () => {
+  // Measured 2026-11-05: same 429 recovers after ~3 minutes, and a running
+  // opencode v2 shows the identical cycle — so the message text is misleading.
+  const raw = JSON.stringify({ type: "error", error: { type: "FreeUsageLimitError", message: "Free usage limit reached." } });
+  assert.equal(isRetryableLimit(429, raw), true);
+});
+
+test("402-style credit/budget caps on 429 are never retried", () => {
+  for (const code of ["CreditLimitExceeded", "insufficient_quota", "billing_error", "BudgetLimitError", "GoUsageLimitError"]) {
+    const raw = JSON.stringify({ type: "error", error: { type: code, message: "cap" } });
+    assert.equal(isRetryableLimit(429, raw), false, `${code} must not retry`);
+  }
+  // Non-429 statuses are handled elsewhere and are not retry targets here.
+  assert.equal(isRetryableLimit(500, "{}"), false);
+});
+
+test("retryDelay honours Retry-After and otherwise backs off with a cap", () => {
+  assert.equal(retryDelay(0, 5000), 5000, "explicit Retry-After wins");
+  assert.equal(retryDelay(0, 999999), RETRY_429_CAP_MS, "clamped to the cap");
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const d = retryDelay(attempt, undefined);
+    assert.ok(d > 0 && d <= RETRY_429_CAP_MS, `attempt ${attempt} delay ${d} out of range`);
+  }
+});
+
+test("parseRetryAfterMs reads both header forms", () => {
+  assert.equal(parseRetryAfterMs(new Headers({ "retry-after-ms": "1500" })), 1500);
+  assert.equal(parseRetryAfterMs(new Headers({ "retry-after": "3" })), 3000);
+  assert.equal(parseRetryAfterMs(new Headers({})), undefined);
 });
 
 test("parseUpstreamError extracts message and normalised code", () => {
