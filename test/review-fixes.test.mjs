@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   zenKey,
   setOcKeys,
+  setFreeUsesOcKey,
   isFreeTierModel,
   newProjectId,
   projectId,
@@ -29,6 +30,25 @@ test("free models always use Bearer public even with a Console key", () => {
 test("non-free models use the configured Console key", () => {
   setOcKeys(["oc_sk_test_aaa"]);
   assert.equal(zenKey("paid-model"), "oc_sk_test_aaa");
+});
+
+test("FREE_USES_OC_KEY=1 makes free models send the Console key", () => {
+  setOcKeys(["oc_sk_test_aaa"]);
+  setFreeUsesOcKey(1);
+  assert.equal(zenKey("big-pickle"), "oc_sk_test_aaa");
+  setFreeUsesOcKey(0);
+  assert.equal(zenKey("big-pickle"), "public", "flag off returns to public");
+  setFreeUsesOcKey(true);
+  assert.equal(zenKey("big-pickle"), "oc_sk_test_aaa", "boolean true also accepted");
+  setFreeUsesOcKey("0");
+  assert.equal(zenKey("big-pickle"), "public", "anything but 1/'1'/true is off");
+});
+
+test("FREE_USES_OC_KEY=1 with no ockeys still degrades to public", () => {
+  setOcKeys([]);
+  setFreeUsesOcKey(1);
+  assert.equal(zenKey("big-pickle"), "public");
+  setFreeUsesOcKey(0);
 });
 
 test("isFreeTierModel uses cost metadata when available", () => {

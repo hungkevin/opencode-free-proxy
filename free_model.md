@@ -297,7 +297,7 @@ oc2api v4.5.0 與官方 opencode 源碼後的再校正）：
 |------|-----------|------------------|-----------|
 | 端點 | `POST /zen/v1/chat/completions` | `POST /inference/v1/chat/completions` | 不變 |
 | User-Agent | `opencode/1.18.31 ai-sdk/... runtime/bun/1.3.13` | `opencode/latest/2.1.1/cli` | 同一 UA（`OC_UA` 可覆寫）也用於 models registry 抓取 |
-| `Authorization` | 客戶端 key | `oc_sk_*` | 免費模型一律 `Bearer public`（官方 opencode 匿名層語義，`provider/opencode.ts:429-451`）；付費模型才送 `oc_sk_*` |
+| `Authorization` | 客戶端 key | `oc_sk_*` | 免費模型一律 `Bearer public`（官方 opencode 匿名層語義，`provider/opencode.ts:429-451`）；付費模型才送 `oc_sk_*`。`oc-keys.json` 可設 `"FREE_USES_OC_KEY": 1` 讓免費模型也送 Console key（opt-in，官方客戶端不這樣做；預設 `0` = `public`） |
 | `x-opencode-project` | `global` | 固定 `3f3f7816...e1787` | **每請求隨機 40-hex**（oc2api v4.5.0 行為：固定值會讓所有部署共用同一配額桶）；`OC_PROJECT` 可釘選 |
 | `x-opencode-client` | `cli` | `cli` | `opencode`（官方送 `app.name`；`OC_CLIENT` 可覆寫回 `cli`） |
 | `Accept` | `text/event-stream` | `*/*` | **不送**（oc2api v4.5.0 移除；形狀閘門對 header 存在敏感） |
@@ -513,7 +513,8 @@ metadata 併入，過濾條件同 oc2api：`id === "big-pickle" || id.endsWith("
 - **Context / 輸出上限**:`limit.context` / `limit.output`,單位 tokens(`K`=千,`M`=百萬);後者可作為 `OUTPUT_LIMIT`(注入 `max_completion_tokens`)的精準依據。
 - **費用判定**:一律以 `cost.input === 0 && cost.output === 0` 為準,不以名稱判斷;
   名稱僅作 fallback（`-free` 後綴 / `big-pickle`）——用於 cost 資訊缺席的動態合併 id。
-  判定結果決定上游 `Authorization`：免費模型 `Bearer public`（官方匿名層語義）、
+  判定結果決定上游 `Authorization`：免費模型 `Bearer public`（官方匿名層語義，
+  `oc-keys.json` 的 `"FREE_USES_OC_KEY": 1` 可改送 Console key）、
   其餘模型送設定的 `oc_sk_*`。
 
 ---

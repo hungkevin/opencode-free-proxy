@@ -225,7 +225,7 @@ sudo systemctl enable --now opencode-proxy
 | `PROXY_PORT` | `6446` | Server port |
 | `PROXY_HOST` | `0.0.0.0` | Bind address; set to `127.0.0.1` to listen only on loopback |
 | `KEYS_FILE` | `./api-keys.json` | API keys file path |
-| `OC_KEYS_FILE` | `./oc-keys.json` | Optional upstream OpenCode Console key file (`{"ockeys": ["oc_sk_...", ...]}`); Console keys apply to **paid models only** — free-tier models always get the anonymous `Bearer public` (official opencode semantics), with or without ockeys. Missing/broken file silently falls back to `public` for everything |
+| `OC_KEYS_FILE` | `./oc-keys.json` | Optional upstream OpenCode Console key file. Free-tier models always get the anonymous `Bearer public` (official opencode semantics) unless the file sets `"FREE_USES_OC_KEY": 1`, which opts free models into the Console key as well. Paid models always use the key. Missing/broken file silently falls back to `public` |
 | `MODELS_SOURCE` | `https://models.opencode.ai/api.json` | Model registry URL (http allowed, e.g. LAN mirror) |
 | `REASONING_CAP` | `65536` | Stream reasoning-token fuse before force-stop; `0` disables |
 | `SESSION_TTL_MS` | `1800000` | Session rotation TTL (ms); `0` disables rotation (fresh session per request) |
@@ -250,6 +250,11 @@ sudo systemctl enable --now opencode-proxy
 > other upstream failures keep their status (`502 upstream_error` etc.), and
 > upstream `Retry-After` / `retry-after-ms` headers are passed through to the
 > client.
+>
+> `oc-keys.json` also accepts `"FREE_USES_OC_KEY": 1` (default `0`): with `1`,
+> free-tier models send the Console key too instead of `public`. The official
+> client never does this — opt in only if you know the upstream accepts keys
+> on the free tier. Requires a restart after editing the file.
 
 ### Log levels (`LOG_LEVEL`)
 

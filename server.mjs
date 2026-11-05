@@ -94,14 +94,19 @@ function setApiKeys(keys) {
 }
 
 // ── OC keys (upstream Console key) ─────────────────────────────────
-// oc-keys.json (optional): {"ockeys": ["oc_sk_...", ...]}. When a key is
-// present, upstream requests send "Authorization: Bearer <oc_sk_...>"
-// (OpenCode Console key, same inference endpoints). With none, upstream
-// keeps the official anonymous token "public" (opencode provider fallback
-// apiKey:"public"). A missing/broken file degrades to "public" — unlike
-// api-keys.json this file is optional, so it must never fail startup.
+// oc-keys.json (optional):
+//   {"ockeys": ["oc_sk_...", ...], "FREE_USES_OC_KEY": 1}
+// When a key is present, upstream requests for PAID models send
+// "Authorization: Bearer <oc_sk_...>" (OpenCode Console key, same inference
+// endpoints). Free-tier models keep the official anonymous token "public"
+// (opencode provider fallback apiKey:"public") — UNLESS FREE_USES_OC_KEY is
+// 1, which makes free models send the Console key too (opt-in; the official
+// client never does this). With no keys everything degrades to "public".
+// A missing/broken file degrades to "public" — unlike api-keys.json this
+// file is optional, so it must never fail startup.
 const ocKeysFile = process.env.OC_KEYS_FILE || "./oc-keys.json";
 let ocKeys = [];
+let freeUsesOcKey = false;
 
 function normalizeOcKeys(keys) {
   return (Array.isArray(keys) ? keys : [])
@@ -109,18 +114,29 @@ function normalizeOcKeys(keys) {
     .map((k) => k.trim());
 }
 
+function parseFreeUsesOcKey(v) {
+  return v === 1 || v === "1" || v === true;
+}
+
 function loadOcKeys() {
   try {
     const parsed = JSON.parse(fs.readFileSync(ocKeysFile, "utf8"));
     ocKeys = normalizeOcKeys(parsed?.ockeys);
+    freeUsesOcKey = parseFreeUsesOcKey(parsed?.FREE_USES_OC_KEY);
   } catch {
     ocKeys = [];
+    freeUsesOcKey = false;
   }
   if (ocKeys.length) console.log(`[OCKEYS] Loaded ${ocKeys.length} upstream key(s) from ${ocKeysFile}`);
+  if (freeUsesOcKey) console.log("[OCKEYS] FREE_USES_OC_KEY=1 — free-tier models send the Console key (official client sends public)");
 }
 
 function setOcKeys(keys) {
   ocKeys = normalizeOcKeys(keys);
+}
+
+function setFreeUsesOcKey(v) {
+  freeUsesOcKey = parseFreeUsesOcKey(v);
 }
 
 // Upstream auth (official-opencode parity): the opencode provider sets
@@ -136,7 +152,9 @@ function isFreeTierModel(model) {
   return m.endsWith("-free") || m === "big-pickle";
 }
 function zenKey(model) {
-  if (model !== undefined && isFreeTierModel(model)) return "public";
+  if (model !== undefined && isFreeTierModel(model)) {
+    return freeUsesOcKey ? (ocKeys[0] || "public") : "public";
+  }
   return ocKeys[0] || "public";
 }
 
@@ -3198,6 +3216,7 @@ app.get("/health", (_req, res) => res.json({
   models_source: MODELS_ORIGIN, models_loaded_at: MODELS_LOADED_AT,
   responses_available: hasFreeSparkModel(),
   upstream_auth: zenKey(MODELS[0]) === "public" ? "public (free tier)" : "console key",
+  free_uses_oc_key: freeUsesOcKey,
   official_tools: OFFICIAL_TOOLS.length,
   session_ttl_ms: SESSION_TTL_MS,
   forward_params: FORWARD_PARAMS,
@@ -3334,6 +3353,7 @@ export {
   setApiKeys,
   loadOcKeys,
   setOcKeys,
+  setFreeUsesOcKey,
   zenKey,
   zenUrl,
   zenHeaders,
