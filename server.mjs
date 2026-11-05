@@ -414,21 +414,31 @@ function abortUpstream(controller, why) {
   if (!controller.signal.aborted) controller.abort(new Error(why));
 }
 
-// ── 429 rate-limit retry (empirically-derived, NOT official parity) ──
-// MEASURED BEHAVIOUR (2026-11-05, same egress IP, Bun + Node, every free model):
-// the upstream answers `429 FreeUsageLimitError` for a burst of requests and
-// recovers after roughly 3 minutes — and a running opencode v2 shows the exact
-// same 429-then-recover cycle. So this is a ROLLING-WINDOW RATE LIMIT whose
-// message text ("Free usage limit reached") is misleading, not a spent quota.
-// The official client treats it as QuotaExceeded (isRetryable=false) and gives
-// up immediately; a proxy that also gives up just looks broken to the caller,
-// because the upstream would have accepted the request seconds later.
-// Strategy: retry 429s only, with bounded jittered backoff that fits inside the
-// observed recovery window. Quota-shaped bodies (402 / credit / budget codes,
-// which are NOT rate limits) are never retried.
+// ── 429 retry (empirically-derived, NOT official parity) ──
+// MEASURED BEHAVIOUR (2026-11-05): the free tier answers
+// `429 FreeUsageLimitError` in TWO distinct situations that need opposite
+// handling, and the only reliable discriminator is the Retry-After value:
+//
+//  (a) DAILY IP QUOTA EXHAUSTED — `retry-after` counts down to the next UTC
+//      midnight (observed 53450s ≈ 14.8h). Nothing helps but waiting; opencode
+//      itself says "You've used today's free messages. They reset at ...".
+//      Retrying is pure waste and makes the proxy look hung.
+//  (b) SHORT ROLLING WINDOW — `retry-after` is small or absent; the request
+//      succeeds again within seconds/minutes. Retrying here is what keeps the
+//      proxy usable, because the official client gives up immediately
+//      (FreeUsageLimitError → QuotaExceeded → isRetryable=false).
+//
+// Cross-IP evidence: the SAME opencode v2 build succeeded from WSL
+// (egress 60.248.31.167) and was quota-blocked from Windows
+// (egress 111.235.254.203) at the same time — so the cap is per egress IP,
+// not per client shape. Requests that look "wrong" are not the cause.
 const RETRY_429_MAX = envInt("RETRY_429_MAX", 4); // 0 disables retrying
 const RETRY_429_BASE_MS = envInt("RETRY_429_BASE_MS", 2000);
 const RETRY_429_CAP_MS = envInt("RETRY_429_CAP_MS", 30000);
+// Above this, treat the 429 as a spent daily quota: fail fast instead of
+// sleeping through several pointless retries. Default 5 minutes comfortably
+// separates (a) from (b) — a rolling-window limit clears well within it.
+const RETRY_429_HARD_LIMIT_MS = envInt("RETRY_429_HARD_LIMIT_MS", 300000);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Honour Retry-After when the upstream sends one, else exponential + jitter.
 // The jitter multiplier is applied BEFORE the cap so the result never exceeds it.
@@ -437,6 +447,11 @@ function retryDelay(attempt, retryAfterMs) {
   const base = Math.min(RETRY_429_BASE_MS * 2 ** attempt, RETRY_429_CAP_MS);
   const jittered = base * (0.75 + Math.random() * 0.5);
   return Math.round(Math.min(jittered, RETRY_429_CAP_MS));
+}
+// A Retry-After beyond the hard limit means the daily quota is gone; no amount
+// of backing off will help before the window resets.
+function isHardQuotaWait(retryAfterMs) {
+  return Number.isFinite(retryAfterMs) && retryAfterMs > RETRY_429_HARD_LIMIT_MS;
 }
 function parseRetryAfterMs(headers) {
   // Read the raw strings first: Headers#get returns null when absent, and
@@ -477,7 +492,19 @@ async function zenFetchWithRetry(zenOpts, body, controller) {
       return res;
     }
     if (!isRetryableLimit(res.status, raw)) return res;
-    const wait = retryDelay(attempt, parseRetryAfterMs(res.headers));
+    const retryAfterMs = parseRetryAfterMs(res.headers);
+    // Daily quota gone (Retry-After counts down to the next UTC midnight):
+    // fail fast and let the client decide. Sleeping through 30s retries four
+    // times would waste two minutes and still fail.
+    if (isHardQuotaWait(retryAfterMs)) {
+      const mins = Math.round(retryAfterMs / 60000);
+      log(
+        "error",
+        `[ZEN 429 DAILY QUOTA] free quota exhausted for this egress IP; resets in ~${mins} min — not retrying`,
+      );
+      return res;
+    }
+    const wait = retryDelay(attempt, retryAfterMs);
     log("warn", `[ZEN 429 RETRY ${attempt + 1}/${RETRY_429_MAX}] upstream rate limit, waiting ${wait}ms`);
     await sleep(wait);
     if (controller.signal.aborted) return res;
@@ -3551,6 +3578,8 @@ export {
   isQuotaError,
   sendUpstreamError,
   isRetryableLimit,
+  isHardQuotaWait,
+  RETRY_429_HARD_LIMIT_MS,
   retryDelay,
   parseRetryAfterMs,
   RETRY_429_CAP_MS,

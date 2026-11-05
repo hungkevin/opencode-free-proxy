@@ -14,6 +14,8 @@ import {
   parseUpstreamError,
   isQuotaError,
   isRetryableLimit,
+  isHardQuotaWait,
+  RETRY_429_HARD_LIMIT_MS,
   retryDelay,
   parseRetryAfterMs,
   RETRY_429_CAP_MS,
@@ -183,6 +185,19 @@ test("parseRetryAfterMs reads both header forms", () => {
   assert.equal(parseRetryAfterMs(new Headers({ "retry-after-ms": "1500" })), 1500);
   assert.equal(parseRetryAfterMs(new Headers({ "retry-after": "3" })), 3000);
   assert.equal(parseRetryAfterMs(new Headers({})), undefined);
+});
+
+test("a daily-quota Retry-After is detected as a hard limit (no retrying)", () => {
+  // Measured: the free tier encodes "resets at next UTC midnight" as
+  // retry-after ≈ 53450s. Retrying that is pointless, so fail fast.
+  assert.equal(isHardQuotaWait(53450 * 1000), true);
+  assert.equal(isHardQuotaWait(RETRY_429_HARD_LIMIT_MS + 1), true);
+});
+
+test("a short rolling-window Retry-After still retries", () => {
+  assert.equal(isHardQuotaWait(30 * 1000), false);
+  assert.equal(isHardQuotaWait(4 * 60 * 1000), false);
+  assert.equal(isHardQuotaWait(undefined), false, "no hint → treat as transient");
 });
 
 test("parseUpstreamError extracts message and normalised code", () => {

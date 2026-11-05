@@ -760,3 +760,51 @@ UPSTREAM HITS=3   ← 1 次初始 + 2 次重試，符合預期
 | 抖動突破上限 | 先乘抖動再套上限，`30000 × 1.25 = 37500` 超出單次上限 → 改為先套上限 |
 
 測試自 57 增至 **61 pass / 0 fail**。
+### 真凶確認：配額是按「出口 IP」計算（本節取代附錄 F 的推論）
+
+使用者提供的決定性對照實驗：
+
+| 環境 | opencode v2 結果 | 出口 IP |
+|------|-----------------|---------|
+| WSL2 | ✅ 可用 | `60.248.31.167` |
+| Windows 11 | ❌ 限額 | `111.235.254.203` |
+
+兩個環境裝的是**同一個 `@opencode/cli@2.2.5`**、同樣未登入 Console、同樣送 `Bearer public`，
+但結果相反。用 `/cdn-cgi/trace` 確認兩者出口 IP 不同 —— `networkingMode=mirrored` 並未讓它們共用出口。
+
+**因此代理的請求形狀從頭到尾都是正確的**：認證、13 工具、project id、session、UA 全部無誤；
+429 純粹是 `111.235.254.203` 這個 IP 的當日免費額度已用盡。
+
+Windows 端 opencode 的提示可直接印證：
+> You've used today's free messages. They reset at 上午8:38 · 2026/11/6
+
+### 兩種 429 必須分開處理
+
+實測發現 `FreeUsageLimitError` 對應兩種完全不同的狀況，唯一可靠的區分方式是 `Retry-After` 數值：
+
+| 類型 | `Retry-After` | 正確處理 |
+|------|--------------|---------|
+| 短時滾動窗 | 小（秒級）或無 | **重試**有效，可讓代理保持可用 |
+| 每日 IP 配額用盡 | 大（實測 53450 秒，倒數至 UTC 午夜） | **立即放棄**，重試純屬浪費 |
+
+修正前：`Retry-After=53450` 被壓成 30 秒上限後重試 4 次，白等約 2 分鐘仍失敗。
+
+修正後：新增 `RETRY_429_HARD_LIMIT_MS`（預設 5 分鐘）門檻，超過即判定為硬配額：
+
+```
+[ZEN 429 DAILY QUOTA] free quota exhausted for this egress IP; resets in ~891 min — not retrying
+CLIENT STATUS = 429
+RETRY-AFTER relayed = 53450
+UPSTREAM HITS = 1          ← 不再重試
+ELAPSED = 153ms            ← 舊版需 ~120 秒
+```
+
+### 可行的解法
+
+| 方案 | 說明 |
+|------|------|
+| **把代理移到 WSL 執行**（推薦） | `cd /mnt/c/work/opencode-free-proxy && bun server.mjs`，改用 `60.248.31.167` 的可用額度 |
+| 等待重置 | 台灣時間每日 08:00 歸零（UTC 00:00） |
+| 注意 | 同一 IP 上 proxy 與 opencode v2 共用配額，同時跑會互相消耗 |
+
+測試自 61 增至 **63 pass / 0 fail**。
