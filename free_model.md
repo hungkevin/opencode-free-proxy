@@ -1094,3 +1094,102 @@ Bun 原生 `fetch` 已攜帶被接受的 ClientHello，隧道僅對 Node 部署�
 不承諾 Node 部署。附錄 G 的實驗數據與 I.2 的交叉驗證**仍為有效歷史記錄**
 （若日後需要 Node 部署，可從 git 歷史（`3e3461d`）取回隧道源碼，或改用
 dsh-providers-hub 的 wreq-js 方案）。
+
+---
+
+## 附錄 J: GitHub 生態普查——正確調用 opencode 免費模型的專案 (v12.2, 2026-11-06)
+
+> 應使用者要求，普查 GitHub 上其他能調用 opencode 免費 AI model 的專案，
+> 多方面挖掘調用方法。以下情報全部來自各專案的 README/源碼自述（各自標注實測日期），
+> 最終裁決仍以官方 opencode 源碼 + 本專案真機差分實測為準。
+
+### J.1 找到的同類專案
+
+| 專案 | 語言 | 路徑/通道 | 傳輸層方案 |
+|------|------|----------|-----------|
+| [opencode2api](https://github.com/rianilham28/opencode2api)（rianilham28） | Rust | `/inference/openai/v1` + models 只在 `/inference/v1/models` | **把 Bun 釘住的 BoringSSL 編譯進二進位**，並以 JA3 + 完整 ClientHello 形狀閘門測試防漂移 |
+| [Coding2API](https://github.com/RobbsLuo/Coding2API)（RobbsLuo，36★） | Python/httpx | `/zen/v1`（舊路徑） | **OpenSSL 直連也過**——推斷傳輸指紋閘門是 `/inference` 路徑特有，`/zen/v1` 舊通道豁免（或尚未收緊） |
+| [dsh-opencode-suite](https://github.com/kexuejin/dsh-opencode-suite)（kexuejin） | JS/DSH 插件 | Go 付費層 `zen/go/v1` | 多 key 池化輪換（付費層） |
+| [magpie-opencode-cli](https://github.com/Jimmy6188/magpie-opencode-cli)（Jimmy6188） | JS/Bun | **不直連**——spawn 本地 `opencode run` 借官方身份 | 官方 CLI 進程（零指紋風險，1–2s 開銷、無工具調用、並發 2） |
+| [opencode（HA 整合）](https://github.com/pranjal-joshi/opencode)（pranjal-joshi） | Python | Console 鑑權通道（`opencode.ai/auth` 註冊免費 key） | 註冊 key 通道，門禁較輕 |
+| oc2api（EOL）/ codearts2api / 本專案 | Go/JS/Bun | `/inference/v1` | oc2api=Bun 形狀 uTLS；本專案=Bun 原生 fetch |
+
+四條通道並存：**匿名 /inference**（本專案，最難）、**註冊 key**（HA/suite）、
+**CLI 委託**（magpie）、**Go 訂閱**（suite）。本專案持續以匿名通道為主，餘者為備援選項。
+
+### J.2 各家門禁實測彙整（與本專案結論互補/矛盾處標注）
+
+**一致（多方獨立驗證，可視為定論）：**
+
+1. `x-opencode-session` 的 12 位 hex 必須解回**近期時間戳**（`~(ms*0x1000+1)` 低 48 位）；
+   隨機 hex 一律 403（Coding2API：2026-10-09 收緊；與本專案 §6.3、dsh-opencode-suite 一致）
+2. `stream: true` 必須（三方一致）
+3. tools 必含 `read`（opencode2api：`{"name":"read"}` 即可；Coding2API：`bash`+`read`；
+   第三方 10-14 收緊後 `bash/glob/grep/read` 四件套——**移動靶**。本專案送整套 13
+   官方工具，任一版本都覆蓋）
+4. `<env>` 塊：須為字面 `<env>…</env>` 對且含 `Working directory:`（小寫 d；
+   `<environment>`、`<env x="1">`、大寫 D 失敗；首對為空毒化請求——opencode2api
+   2026-10-25 逐格實測。本專案 oc-prompt.txt 渲染符合）
+5. UA 版本下限 1.18.0（低於 → 426；無版本 → 403；`opencode/9.9.9/cli` 也過）
+6. 429 `FreeUsageLimitError` 有**多種成因**（配額/形狀/滾動窗），訊息文本不可判因
+   （多方一致，本專案附錄 F/H.3 早已確立）
+7. 免費池限流**跨模型**：一模型 429 全部 429，無「換模型繞過」（magpie）
+
+**矛盾（各自真機實測但結論相反，解讀如下）：**
+
+| 爭點 | opencode2api | Coding2API | 本專案裁決 |
+|------|-------------|-----------|-----------|
+| `/zen/v1` 是否已死 | 403 全體（10-25） | 200 正常（10-28，含 chat） | 本專案用 `/inference/v1`（今日 200），兩說不影響 |
+| 裸 OpenSSL 能否過傳輸閘 | 不能（為此編譯 BoringSSL） | 能（httpx 走 `/zen/v1`） | `/inference` 路徑上 Node/curl 必 429（本專案 10-28 差分實測）——指紋閘門按路徑分型 |
+| 客戶端工具可讀名 | 原樣透傳「Foreign tools pass」 | 原樣透傳 | **可讀 `oc2api_<name>` 429**（H.3 同秒差分）——詞彙閘門疑似針對特定前綴；摘要改名已實證 200，維持 |
+
+**本專案沒有的情報（按價值排序）：**
+
+1. **403 `FreeTierError` 上游抖動**（Coding2API：7 次實測）：完全合規請求偶發 403，
+   同請求數秒後 200——**換新 session id + 關舊連線重發一次**（退避 1s）即消化。
+   本專案現狀：403 直接分類上拋不重試 → **可採**（見 J.3）
+2. **出口 IP 代理池**（opencode2api 整個 transport crate）：輪換 lane、
+   `FreeUsageLimitError` 即標記 lane 花費並換 IP、預熱、`ip_probe_url` 探測避免撞已花費
+   IP、按流量自適應縮放。**這是每日每 IP 配額的真正解法**——本專案目前單出口 IP，
+   配額耗盡只能等台北 08:00 → **最大架構缺口，可選實作**
+3. **模型線路格式分型**（opencode2api 目錄 `api` 物件 + dsh-suite）：muse-spark、
+   grok-4.6 只走 `/responses`（chat 上游 500）；glm/kimi/deepseek 走 `/chat/completions`。
+   本專案恆走 chat——若免費層出現 responses-only 模型會 500 → 低優先防禦
+4. **模型探活剔除規則**（Coding2API）：真發最小請求，`400/401/403/404` 剔除、
+   **429/5xx/逾時保留**（2026-11-03 匿名探活全線 429，若要求 2xx 會顯示「無模型」）
+   → 本專案列表無探活，採納此規則可避免把暫時限流的模型誤判下架
+5. **UA 預設值可升** `opencode/latest/2.2.5/cli`（2.2.2 為 11-05 捕獲、官方 CLI 2.2.5）；
+   門禁中立（dsh 2×2×2 實測），純保真
+6. `b3`+`traceparent`（opencode2api 按真客戶端發送：per-process trace、每請求新 span）；
+   本專案未送也過閘，可選保真
+7. 請求體**不可 gzip**（`Content-Encoding: gzip` → 400 空響應，opencode2api 11-06 實測）；
+   Bun fetch 本就不壓縮請求體，無需動作，記錄備查
+
+**官方態度（重要背景）**：magpie 引述官方維護者在 issue #43786 的答覆——
+「免費模型是給 OpenCode 內部使用的」，關閉為 working as intended，並稱身份門禁
+「may change at any time」。⇒ 匿名通道本質是對抗性的，門禁只會趨嚴；CLI 委託與
+註冊 key 通道是結構上更穩的備援。
+
+### J.3 本專案採納項（本輪已實作）
+
+1. ✅ **403 `FreeTierError` 抖動重試**：`zenFetchWithRetry` 對帶 `FreeTierError` 的
+   403 加一次重試（換新 session、退避 1s），仍 403 才上拋 `free_tier_error`。
+   依據：Coding2API 7 次抖動實測；與 J.2-1 對應
+2. 📋 餘項（代理池/線路分型/探活/UA）記錄於此，待額度或需求浮現再議——
+   各項都不阻塞現行調用（今日 E2E 全 200）。
+
+### J.4 對照表：三份自述的門禁規格合併視圖
+
+| 門禁項 | 本專案 | oc2api | opencode2api | Coding2API | dsh 系 |
+|--------|--------|--------|--------------|-----------|--------|
+| 端點 | `/inference/v1` | `/inference/v1` | `/inference/openai/v1` | `/zen/v1` | `/inference` |
+| 傳輸 | Bun fetch | Bun 形狀 uTLS | BoringSSL（釘 Bun commit） | OpenSSL（舊路徑） | wreq-js Bun 形狀 |
+| UA | `opencode/latest/2.1.1/cli` | 同左 | `opencode/latest/2.2.2/cli` | `opencode/1.18.0`（≥1.18.0 即可） | 同 2.1.1 |
+| session | 4 頭全送、時間編碼、每對話重用 | 4 頭、每請求新 | 2 頭 + b3/traceparent、每進程 | 僅 `x-opencode-session`、每請求新 | 4 頭、harness session 摘要 |
+| project | 隨機 40-hex | 隨機 | `global`（範例） | 不送 | 穩定派生 |
+| tools | 13 官方全套 + 客戶端摘要改名 | 13 官方全套 + 摘要改名 | 官方全集 + 客戶端原樣 | 僅補 `bash`/`read` 空殼 + 同義改寫 | 官方全集 + `dsh_` 可讀別名 |
+| `<env>` | oc-prompt 渲染 | 官方提示詞 | 合成 `<env>Working directory: /</env>` | 不送（舊路徑） | 官方提示詞首位 |
+| 配額策略 | 單 IP、等待重置 | 單 IP | **輪換代理池** | 多憑證池（虛擬憑證） | 多 key（付費層） |
+
+> 註：上表為各專案自述快照（2026-10 ~ 11-06），上游門禁持續演進，引用前宜重驗。
+> 最終裁決準則不變：官方 opencode 源碼（`c:\work\opencode`）+ 本專案真機差分實測。

@@ -27,6 +27,10 @@ import {
   clientName,
   sendUpstreamError,
   OFFICIAL_TOOLS,
+  zenFetchWithRetry,
+  setZenFetchImpl,
+  rotateSessionHeaders,
+  zenSessionId,
 } from "../server.mjs";
 
 // ── A1: free-tier auth ──────────────────────────────────────────────
@@ -243,6 +247,99 @@ test("FreeTierError is its own gate type, not authentication_error", () => {
   // A bare 403 without the marker stays authentication_error.
   const plain = upstreamErrorPayload(403, '{"error":{"message":"forbidden"}}', null);
   assert.equal(plain.error.type, "authentication_error");
+});
+
+// ── 403 FreeTierError gate jitter (free_model.md Appendix J.3-1) ──────────
+// Coding2API measured 7 occurrences (2026-10-09/12): a fully conforming
+// request occasionally gets 403 FreeTierError; the SAME request succeeds
+// seconds later. Mitigation: one retry after ~1s with a FRESH session id.
+
+function fakeResponse(status, body) {
+  return {
+    status,
+    ok: status < 400,
+    headers: new Headers(),
+    clone() { return fakeResponse(status, body); },
+    async text() { return body; },
+    async arrayBuffer() { return new ArrayBuffer(0); },
+  };
+}
+
+test("gate-jitter: 403 FreeTierError is retried once with a fresh session, then 200 wins", async () => {
+  const seen = [];
+  let calls = 0;
+  setZenFetchImpl((opts) => {
+    calls++;
+    seen.push(opts.headers["x-opencode-session"]);
+    return Promise.resolve(
+      calls === 1
+        ? fakeResponse(403, '{"error":{"type":"FreeTierError","message":"denied"}}')
+        : fakeResponse(200, '{"ok":true}'),
+    );
+  });
+  try {
+    const opts = { headers: zenHeaders(zenSessionId(), "{}", "m-free") };
+    const before = opts.headers["x-opencode-session"];
+    const t0 = Date.now();
+    const res = await zenFetchWithRetry(opts, "{}", new AbortController());
+    assert.equal(res.status, 200);
+    assert.equal(calls, 2, "exactly one jitter retry");
+    assert.notEqual(seen[1], before, "retry must carry a FRESH session id");
+    for (const name of ["x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"]) {
+      assert.equal(opts.headers[name], seen[1], `${name} rotated together`);
+    }
+    assert.ok(Date.now() - t0 >= 900, "backoff (~1s) observed");
+  } finally {
+    setZenFetchImpl(null);
+  }
+});
+
+test("gate-jitter: bare 403 (no FreeTierError marker) is NOT retried", async () => {
+  let calls = 0;
+  setZenFetchImpl(() => {
+    calls++;
+    return Promise.resolve(fakeResponse(403, '{"error":{"message":"forbidden"}}'));
+  });
+  try {
+    const res = await zenFetchWithRetry(
+      { headers: zenHeaders(zenSessionId(), "{}", "m-free") }, "{}", new AbortController());
+    assert.equal(res.status, 403);
+    assert.equal(calls, 1, "no jitter retry without the marker");
+  } finally {
+    setZenFetchImpl(null);
+  }
+});
+
+test("gate-jitter: budget is one — a second FreeTierError 403 is surfaced as-is", async () => {
+  let calls = 0;
+  setZenFetchImpl(() => {
+    calls++;
+    return Promise.resolve(fakeResponse(403, '{"error":{"type":"FreeTierError","message":"denied"}}'));
+  });
+  try {
+    const res = await zenFetchWithRetry(
+      { headers: zenHeaders(zenSessionId(), "{}", "m-free") }, "{}", new AbortController());
+    assert.equal(res.status, 403);
+    assert.equal(calls, 2, "one retry, then give up (classified upstream)");
+  } finally {
+    setZenFetchImpl(null);
+  }
+});
+
+test("rotateSessionHeaders rewrites all four affinity headers to one new id", () => {
+  const headers = {
+    "x-opencode-session": "ses_old",
+    "x-opencode-session-id": "ses_old",
+    "x-session-affinity": "ses_old",
+    "X-Session-Id": "ses_old",
+  };
+  rotateSessionHeaders(headers);
+  const fresh = headers["x-opencode-session"];
+  assert.match(fresh, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  for (const name of ["x-opencode-session-id", "x-session-affinity", "X-Session-Id"]) {
+    assert.equal(headers[name], fresh);
+  }
+  assert.notEqual(fresh, "ses_old");
 });
 
 test("rate-limit headers from upstream are relayed to the client", () => {

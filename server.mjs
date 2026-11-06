@@ -490,13 +490,63 @@ function isRetryableLimit(status, raw) {
   }
   return true;
 }
+// 403 FreeTierError GATE JITTER (Coding2API measured 7 occurrences across
+// 2026-10-09/12): a fully conforming request occasionally gets 403
+// FreeTierError from upstream, and the SAME request succeeds seconds later —
+// the jitter is upstream-side, not a shape failure. Their mitigation (and
+// ours): retry ONCE after ~1s with a freshly minted session id on a new
+// connection. Still 403 afterwards → surfaced as free_tier_error.
+const RETRY_403_JITTER_MAX = envInt("RETRY_403_JITTER_MAX", 1); // 0 disables
+const RETRY_403_JITTER_MS = envInt("RETRY_403_JITTER_MS", 1000);
+function rotateSessionHeaders(headers) {
+  // All four affinity headers must carry the same (new) id — callers built
+  // them from one session id, so rewrite them together (free_model.md §6.3).
+  if (!headers || typeof headers !== "object") return;
+  const fresh = zenSessionId();
+  for (const name of ["x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"]) {
+    if (headers[name] !== undefined) headers[name] = fresh;
+  }
+}
 // Fetch with 429 retry. Returns the final Response. Classification reads a
 // clone, so the caller still gets a readable body on the non-200 path and no
 // cooperation from the pipe sites is needed.
+let zenFetchImpl = zenFetchRaw; // test seam: injectable upstream fetch
+function setZenFetchImpl(fn) {
+  zenFetchImpl = fn;
+}
 async function zenFetchWithRetry(zenOpts, body, controller) {
+  let jitter403Used = 0;
   for (let attempt = 0; ; attempt++) {
-    const res = await zenFetchRaw(zenOpts, body, controller);
-    if (res.status !== 429 || attempt >= RETRY_429_MAX) return res;
+    const res = await zenFetchImpl(zenOpts, body, controller);
+    if (res.status !== 429 || attempt >= RETRY_429_MAX) {
+      if (
+        res.status === 403 &&
+        jitter403Used < RETRY_403_JITTER_MAX &&
+        !controller.signal.aborted
+      ) {
+        let raw403 = "";
+        try {
+          raw403 = await res.clone().text();
+        } catch {
+          return res;
+        }
+        if (FREE_TIER_GATE_RE.test(raw403)) {
+          jitter403Used++;
+          // Drain so the socket closes instead of leaking, then come back on
+          // a fresh connection with a fresh session id (Coding2API parity).
+          try { await res.arrayBuffer(); } catch {}
+          log(
+            "warn",
+            `[ZEN 403 JITTER ${jitter403Used}/${RETRY_403_JITTER_MAX}] FreeTierError on a shaped request — gate jitter, retrying with a fresh session in ${RETRY_403_JITTER_MS}ms`,
+          );
+          await sleep(RETRY_403_JITTER_MS);
+          if (controller.signal.aborted) return res;
+          rotateSessionHeaders(zenOpts.headers);
+          continue;
+        }
+      }
+      return res;
+    }
     let raw = "";
     try {
       raw = await res.clone().text();
@@ -3621,6 +3671,8 @@ export {
   parseRetryAfterMs,
   RETRY_429_CAP_MS,
   zenFetchWithRetry,
+  setZenFetchImpl,
+  rotateSessionHeaders,
   responsesNon200Raw,
   OFFICIAL_TOOLS,
   OFFICIAL_TOOL_NAMES,

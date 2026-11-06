@@ -240,6 +240,8 @@ sudo systemctl enable --now opencode-proxy
 | `RETRY_429_HARD_LIMIT_MS` | `300000` | A 429 whose `Retry-After` exceeds this (5 min) is a spent daily quota — fail fast instead of sleeping through pointless retries |
 | `RETRY_429_BASE_MS` | `2000` | Exponential backoff base for 429 retries |
 | `RETRY_429_CAP_MS` | `30000` | Max wait per single 429 retry |
+| `RETRY_403_JITTER_MAX` | `1` | Gate-jitter retries for a `403 FreeTierError` on an otherwise conforming request (upstream-side flake; measured 7× by Coding2API). Each retry waits ~`RETRY_403_JITTER_MS` and rotates to a fresh session id. `0` disables |
+| `RETRY_403_JITTER_MS` | `1000` | Backoff before the gate-jitter retry |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 
