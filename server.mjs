@@ -836,6 +836,12 @@ async function pumpZenStream(zenRes, controller, onData) {
       idle = setTimeout(() => abortUpstream(controller, "upstream idle timeout"), ZEN_IDLE_TIMEOUT_MS);
       onData(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
     }
+    // Some upstreams close the stream with the final SSE frame NOT terminated
+    // by a newline. Every consumer below is line-oriented (it accumulates into
+    // lineBuf/buffer/buf and only processes complete lines), so feed one
+    // trailing newline to flush that last frame. A bare newline yields an empty
+    // line, which all consumers already ignore (no data: prefix / no payload).
+    onData(Buffer.from("\n"));
     clearTimeout(idle);
   } catch (e) {
     clearTimeout(idle);
@@ -1663,6 +1669,12 @@ function createChatStreamRewriter(renames, onFrame) {
   const decisions = new Map(); // upstream tool index → keep?
   let keptAny = false;
   let buffered = [];
+  let bufferedBytes = 0;
+  // A tool whose name never arrives must not let an unbounded transcript
+  // accumulate in memory. When the held frames exceed this, flush them (the
+  // still-unnamed calls are dropped by rewrite(), the rest of the content is
+  // preserved) rather than growing without limit.
+  const MAX_BUFFERED_BYTES = 1 << 20; // 1 MiB
 
   function classify(payload) {
     let chunk;
@@ -1725,6 +1737,7 @@ function createChatStreamRewriter(renames, onFrame) {
     if (!buffered.length) return;
     const held = buffered;
     buffered = [];
+    bufferedBytes = 0;
     for (const b of held) {
       const t = rewrite(b, true);
       if (t) onFrame(t);
@@ -1740,6 +1753,8 @@ function createChatStreamRewriter(renames, onFrame) {
       }
       if (classify(payload) > 0) {
         buffered.push(payload); // hold the whole frame until names are known
+        bufferedBytes += payload.length;
+        if (bufferedBytes > MAX_BUFFERED_BYTES) flushBuffered();
         return;
       }
       flushBuffered();
@@ -2408,8 +2423,14 @@ async function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, rename
           }
           if (!st.opened) {
             // Arguments can arrive before the name; hold them until the name
-            // decides whether this call is kept or dropped.
-            if (typeof tc.function?.arguments === "string") st.pendingArgs += tc.function.arguments;
+            // decides whether this call is kept or dropped. Bound the hold so
+            // a name-less call streaming megabytes of arguments cannot OOM us.
+            if (typeof tc.function?.arguments === "string") {
+              const room = 1 << 20; // 1 MiB per pending call
+              if (st.pendingArgs.length < room) {
+                st.pendingArgs += tc.function.arguments.slice(0, room - st.pendingArgs.length);
+              }
+            }
             const upName = tc.function?.name || "";
             if (!upName) continue; // name not in this delta yet — hold
             st.keep = !dropToolCall(upName, renames);
@@ -2507,7 +2528,14 @@ async function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, rename
 // Body is passed through untouched (client controls input/tools/reasoning);
 // only auth + model-membership are enforced locally.
 function zenResponsesRequest(clientBody, sessionId, opts = {}) {
-  const renameTools = !!opts.renameTools;
+  // Always digest-rename client tools. Previously only the chat/messages
+  // translation paths did it; the native /v1/responses passthrough sent the
+  // client's raw tool names upstream, which both breaks the digest-only
+  // invariant (free-tier vocabulary gate) and makes a shadowed `read`
+  // indistinguishable from the official marker at the response boundary.
+  // `opts.renameTools` is kept as a no-op for backwards compatibility with
+  // tests/callers that pass it.
+  const renameTools = opts.renameTools !== false;
   const renames = newRenames();
   // P1.5: Responses API uses max_output_tokens (NOT max_tokens — upstream
   // 400s "unknown parameter" on the latter). Translate an explicit max_tokens
@@ -2579,15 +2607,10 @@ function zenResponsesRequest(clientBody, sessionId, opts = {}) {
     description: RESERVED_TOOL_DESC,
     parameters: t.function.parameters,
   }));
-  // Native /v1/responses passthrough does NOT rename client tools (renaming is
-  // only wired on the chat/messages translation paths, which restore the names
-  // on the way back). Without it a client tool may reuse an official marker
-  // name — upstream then sees two tools called `read`, and worse, a call for
-  // `read` is indistinguishable from the official marker at the response
-  // boundary, so the pipe cannot drop it and the client gets a phantom call.
-  // A shadowed client tool can never be invoked under its own name on this
-  // route, so dropping it is honest (the chat/messages paths are the fix: they
-  // rename it to oc2api_read and deliver it).
+  // Client tools were digest-renamed above (all routes). This filter is now a
+  // belt-and-braces guard: if a caller somehow still supplies a tool whose
+  // name equals an official marker, drop it rather than send two `read` tools
+  // upstream (which would make the response-side call ambiguous).
   const clientResponsesTools = (Array.isArray(reqBody.tools) ? reqBody.tools : [])
     .filter((t) => {
       const name = t && (t.name || t.function?.name);
@@ -2617,9 +2640,11 @@ function zenResponsesRequest(clientBody, sessionId, opts = {}) {
   };
 }
 
-// Byte-passthrough pipe for the Responses API (sync JSON + SSE stream).
+// Pipe for the Responses API (sync JSON + SSE stream). Byte passthrough for
+// non-tool events; tool names are restored / official marker calls dropped so
+// the client never sees a phantom tool it cannot execute (Appendix L.5 C5).
 // Same non-200分流 as the chat pipes: buffer + mapped error, never 200-dirty.
-async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
+async function pipeZenResponses(zenOpts, body, stream, res, clientSignal, renames = newRenames()) {
   const TAG = zenOpts._tag || "??";
   const t0 = Date.now();
   let rxBytes = 0;
@@ -2673,7 +2698,7 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
       return;
     }
     log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B sync]`);
-    res.json(json);
+    res.json(rewriteResponsesObjectTools(json, renames));
     return;
   }
 
@@ -2709,12 +2734,62 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
     abortUpstream(controller, "inline error, stop reading");
   }
 
+  // Rewrite upstream SSE bytes line by line: restore digest tool names and
+  // drop phantom calls to the official marker tools. Non-data lines and
+  // non-tool events are forwarded byte-identically (including `event:` lines).
+  function sendResponses(buf) {
+    const lines = buf.toString().split("\n");
+    const out = [];
+    for (const line of lines) {
+      const t = line.trim();
+      if (t.startsWith("data:")) {
+        const payload = t.slice(5).trim();
+        if (!payload || payload === "[DONE]") { out.push(line); continue; }
+        const rewritten = rewriteResponsesSSEPayload(payload, renames);
+        if (rewritten === null) continue; // drop phantom tool event
+        out.push(`data: ${rewritten}`);
+      } else {
+        out.push(line);
+      }
+    }
+    sendChunk(out.join("\n"));
+  }
+
+  // Terminal-event detection must work on PARSED SSE lines, not on raw TCP
+  // chunks: an event name straddling a chunk boundary ("response.comp" +
+  // "leted") would otherwise be missed (→ fabricated response.failed after a
+  // real response.completed), and the same text inside a data payload could
+  // false-positive. Accumulate complete lines and inspect them.
+  let tailBuf = "";
+  function observeLines(s) {
+    tailBuf += s;
+    let idx;
+    while ((idx = tailBuf.indexOf("\n")) >= 0) {
+      const line = tailBuf.slice(0, idx).trim();
+      tailBuf = tailBuf.slice(idx + 1);
+      if (!line) continue;
+      if (line.startsWith("event:")) {
+        const ev = line.slice(6).trim();
+        if (/^response\.(completed|incomplete|failed)$/.test(ev)) terminalSeen = true;
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          const t = JSON.parse(payload)?.type;
+          if (t === "response.completed" || t === "response.incomplete" || t === "response.failed") terminalSeen = true;
+        } catch { /* partial JSON across lines — ignore */ }
+      }
+    }
+  }
+
   try {
     await pumpZenStream(zenRes, controller, (chunk) => {
       if (stopped || res.writableEnded || res.destroyed) return;
       rxBytes += chunk.length;
       const s = chunk.toString();
-      if (/response\.(completed|incomplete|failed)/.test(s)) terminalSeen = true;
+      observeLines(s);
       if (!decided) {
         firstBuf += s;
         const t = firstBuf.trim();
@@ -2735,7 +2810,7 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
           if (!parsed) {
             if (firstBuf.length > 65536) {
               decided = true;
-              sendChunk(firstBuf);
+              sendResponses(firstBuf);
             }
             return;
           }
@@ -2745,10 +2820,10 @@ async function pipeZenResponses(zenOpts, body, stream, res, clientSignal) {
           }
         }
         decided = true;
-        sendChunk(firstBuf);
+        sendResponses(firstBuf);
         return;
       }
-      sendChunk(chunk);
+      sendResponses(chunk);
     });
     if (stopped || isClientDisconnect(controller)) return;
     if (!headersSent) {
@@ -2933,6 +3008,72 @@ function responsesObjectToChatResponse(resp, chatModel, renames = newRenames()) 
   };
 }
 
+// Cap for a buffered inline-error body (a 200 response whose first chunk looks
+// like a JSON error). Without it a never-ending "error-looking" stream would
+// retain every chunk in errChunks until the connection closes.
+const MAX_ERR_CHUNKS_BYTES = 1 << 20; // 1 MiB
+function pushErrChunk(errChunks, chunk) {
+  let size = 0;
+  for (const c of errChunks) size += c.length;
+  if (size >= MAX_ERR_CHUNKS_BYTES) return false;
+  errChunks.push(chunk.subarray ? chunk.subarray(0, MAX_ERR_CHUNKS_BYTES - size) : chunk);
+  return true;
+}
+
+// Filter/restore tool names on a Responses-API response OBJECT (sync path).
+// Drops calls to official marker tools the client never declared and restores
+// digest names back to the client's original names.
+function rewriteResponsesObjectTools(resp, renames) {
+  if (!resp || !Array.isArray(resp.output)) return resp;
+  const dropped = new Set();
+  const out = [];
+  for (const item of resp.output) {
+    if (item?.type === "function_call") {
+      const n = item.name;
+      if (dropToolCall(n, renames)) { dropped.add(item.id); continue; }
+      out.push({ ...item, name: restoreToolName(n, renames) });
+    } else if (item?.type === "message" && Array.isArray(item.content)) {
+      // Some upstreams embed function_call items inside message content.
+      out.push({
+        ...item,
+        content: item.content.map((p) =>
+          p?.type === "function_call" && dropToolCall(p.name, renames)
+            ? null
+            : p?.type === "function_call"
+              ? { ...p, name: restoreToolName(p.name, renames) }
+              : p).filter(Boolean),
+      });
+    } else {
+      out.push(item);
+    }
+  }
+  return { ...resp, output: out };
+}
+
+// Rewrite a single Responses SSE `data:` payload: drop official marker tool
+// calls and restore digest names. Returns the (possibly rewritten) payload, or
+// null when the whole event should be dropped. Non-tool events pass through
+// unchanged.
+function rewriteResponsesSSEPayload(payload, renames) {
+  let d;
+  try { d = JSON.parse(payload); } catch { return payload; }
+  const t = d?.type;
+  if (t === "response.output_item.added" && d.item?.type === "function_call") {
+    if (dropToolCall(d.item.name, renames)) return null;
+    d.item = { ...d.item, name: restoreToolName(d.item.name, renames) };
+    return JSON.stringify(d);
+  }
+  if ((t === "response.function_call_arguments.delta" || t === "response.function_call_arguments.done") &&
+      d.name && dropToolCall(d.name, renames)) {
+    return null;
+  }
+  if (t === "response.completed" || t === "response.incomplete") {
+    if (d.response) d.response = rewriteResponsesObjectTools(d.response, renames);
+    return JSON.stringify(d);
+  }
+  return payload;
+}
+
 // Incremental SSE reader for Responses-API upstream: calls onEvent(d) per
 // data payload. Tolerates "event:" lines and partial chunks.
 function responsesSSEParser(onEvent) {
@@ -2948,7 +3089,18 @@ function responsesSSEParser(onEvent) {
       if (!payload || payload === "[DONE]") continue;
       try {
         onEvent(JSON.parse(payload));
-      } catch {}
+      } catch (e) {
+        // C4: never silently swallow a failure inside the event machine (e.g.
+        // res.write after a client disconnect). JSON parse errors on a partial
+        // frame are expected and benign; anything ELSE is a real bug — log it
+        // and rethrow so the pump's catch can report/close cleanly. Do NOT
+        // synthesize a response.failed here: the handler just threw, so any
+        // extra event would be a second, contradictory terminal signal.
+        if (!(e instanceof SyntaxError)) {
+          log("error", "[RESPONSES SSE HANDLER ERROR]", e?.stack || e?.message || e);
+          throw e;
+        }
+      }
     }
   };
 }
@@ -3170,11 +3322,11 @@ async function pipeResponsesAsChat(zenOpts, body, stream, res, chatModel, rename
         firstChunk = c;
         if (responsesFirstChunkIsError(c.toString())) {
           errBuffering = true;
-          errChunks.push(c);
+          pushErrChunk(errChunks, c);
           return;
         }
       } else if (errBuffering) {
-        errChunks.push(c);
+        pushErrChunk(errChunks, c);
         return;
       }
       parser(c);
@@ -3388,11 +3540,11 @@ async function pipeResponsesAsAnthropic(zenOpts, body, stream, res, chatModel, i
         firstChunk = c;
         if (responsesFirstChunkIsError(c.toString())) {
           errBuffering = true;
-          errChunks.push(c);
+          pushErrChunk(errChunks, c);
           return;
         }
       } else if (errBuffering) {
-        errChunks.push(c);
+        pushErrChunk(errChunks, c);
         return;
       }
       parser(c);
@@ -3660,9 +3812,9 @@ app.post("/v1/responses", async (req, res) => {
   const sessionId = getSession(user, req);
   log("info", "[RES]", new Date().toISOString(), user, model, stream ? "stream" : "sync");
 
-  const { body, options } = zenResponsesRequest(req.body, sessionId);
+  const { body, options, renames } = zenResponsesRequest(req.body, sessionId);
   options._tag = `RES ${user} ${model}`;
-  return await pipeZenResponses(options, body, !!stream, res, clientSignal);
+  return await pipeZenResponses(options, body, !!stream, res, clientSignal, renames);
   } catch (e) {
     return sendRouteError(res, e, false);
   }
@@ -4018,6 +4170,8 @@ export {
   chatToResponsesRequest,
   responsesObjectToChatResponse,
   responsesSSEParser,
+  rewriteResponsesObjectTools,
+  rewriteResponsesSSEPayload,
   responsesFirstChunkIsError,
   isSparkModel,
   hasFreeSparkModel,

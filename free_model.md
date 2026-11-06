@@ -4,7 +4,7 @@
 > - 註冊表:`https://models.opencode.ai/api.json` → `["opencode"].models`(官方客戶端同一來源)
 > - 線上端點:`https://opencode.ai/inference/v1`(實際服務,`Bearer public` 免認證;
 >   舊 `/zen/v1` 端點已於 2026-10 停用,見 §6)
-> 最後更新:**2026-11-07(v0.19.1 + server.mjs 審查修復 / 附錄 L.5;下方「現況速查」為唯一有效錨點)**
+> 最後更新:**2026-11-07(v0.19.1 + 兩輪 server.mjs 審查修復 / 附錄 L.5-L.6;下方「現況速查」為唯一有效錨點)**
 
 ---
 
@@ -15,7 +15,7 @@
 
 | 面向 | 目前有效結論 | 依據 |
 |------|-------------|------|
-| 版本 / 測試 | **v0.19.1 + 2026-11-07 審查修復**;測試 **87 pass / 0 fail**(`bun test`,13 檔) | `package.json`、`8457147`、附錄 L.5 |
+| 版本 / 測試 | **v0.19.1 + 2026-11-07 兩輪審查修復**;測試 **95 pass / 0 fail**(`bun test`,14 檔) | `package.json`、`8457147`、附錄 L.5 / L.6 |
 | 端點 | `POST /inference/v1/chat/completions`(兩 proxy);官方源碼為 `/inference/openai/v1`(別名並存,維持不變) | 附錄 E、J.4 |
 | 傳輸 | **Bun 原生 `fetch` 即過 TLS 閘**;uTLS 隧道與 `ZEN_TUNNEL_URL` 已移除(Bun-only 足跡) | 附錄 H.4 / I.4 / I.7 |
 | 認證 | 免費模型 `Bearer public`;models 抓取亦固定 `Bearer public` | 附錄 D A1 / H.2 / I.3 |
@@ -1431,7 +1431,26 @@ SWAP 帶健全數**。全套 **76 pass / 0 fail**（`bun test`,2026-11-06 實測
 
 **低優先未修(列入 L.4)**:三處無上限緩衝(`buffered`/`pendingArgs`/`errChunks`)、`terminalSeen` 對 raw TCP chunk 做 regex、無換行尾幀、`responsesSSEParser` 的 `catch {}`、`/v1/responses` 原生路徑無 tool-call 過濾(休眠路徑)。
 
+### L.6 2026-11-07 第二輪（低優先 5 項）修復（95 pass / 0 fail）
+
+> 接續 L.5 刻意留下的 5 個低優先項。全部離線驗證,未消耗免費額度。
+> 新增 `test/audit-round-c.test.mjs`(8 條)。
+
+| # | 問題 | 修復 | 驗證 |
+|---|------|------|------|
+| C1 | 三處無上限緩衝:`createChatStreamRewriter.buffered`、`pipeZenAsAnthropic` 的 `pendingArgs`、兩條 Responses 翻譯管線的 `errChunks` | `buffered` 加 `MAX_BUFFERED_BYTES=1 MiB`(超限即 `flushBuffered()`,保留內容、丟未命名呼叫);`pendingArgs` 每呼叫上限 1 MiB;新增 `pushErrChunk()` + `MAX_ERR_CHUNKS_BYTES=1 MiB` 供兩處共用 | `audit-round-c` C1 |
+| C2 | `pipeZenResponses` 的 `terminalSeen` 對 **raw TCP chunk** 做 `/response\.(completed\|incomplete\|failed)/` regex → 事件名跨 chunk 漏判(補發假的 `response.failed`)、data 內文誤判 | 改為 `observeLines()`:累積完整行,解析 `event:`/`data:` 後才判定(精確比對 event 名或 `JSON.parse().type`) | `audit-round-c` C2(刻意把 `response.completed` 切成兩次 TCP write) |
+| C3 | `lineBuf/buffer/buf = lines.pop()` 後,上游最後一幀若**無換行結尾**就永不被處理 → 末幀 `[DONE]` 丟失、chat 路徑還會合成重複結尾 | `pumpZenStream` 迴圈結束後補餵一個 `Buffer.from("\n")`。所有「行導向」消費者因此 flush 尾幀;空行被各消費者既有 `if (!t.startsWith("data:"))` / `if (!payload)` 忽略 | `audit-round-c` C3(假上游末幀無換行,斷言 `[DONE]` 恰一次) |
+| C4 | `responsesSSEParser` 的 `catch {}` 吞掉 `onEvent` 擲出的例外(如客戶端斷線後 `res.write`),無日誌無上報 | 只對 `SyntaxError`(partial frame)靜默;其餘 log `[RESPONSES SSE HANDLER ERROR]` 並 **rethrow**,交給 pump 的 catch → `reportZenFailure`。不合成 `response.failed`,避免第二個矛盾終端事件 | `audit-round-c` C4 兩條(throws / 仍忽略 parse error) |
+| C5 | `/v1/responses` 原生 passthrough 路徑**不 rename 也不過濾**客戶端工具 → raw 名稱進 body(違反 digest-only)、模型呼叫官方 marker 時客戶端收到 phantom tool call | `zenResponsesRequest` 一律摘要改名(`renameTools` 退化為相容 no-op);`pipeZenResponses` 接受 `renames`,sync 用 `rewriteResponsesObjectTools()`、stream 用 `rewriteResponsesSSEPayload()` 逐行還原/丟棄;`/v1/responses` route 傳入 `renames` | `audit-round-c` C5 三條 + 既有 `spark-tools`/`responses-pipe` 不回歸 |
+
+**配套註記**:`zenResponsesRequest` 內 `clientResponsesTools` 的 official-name filter 現在是「保險栓」(改名後已不撞名),註解已更新。
+
 ### L.4 仍待處理（不阻塞,記錄備查）
+
+> **2026-11-07 更新**:L.5 列出的「5 個低優先未修項」(無上限緩衝、terminalSeen
+> chunk regex、無換行尾幀、`catch {}`、responses 原生路徑無工具過濾)**已全數
+> 由 L.6 修復**,本節只剩下列「需真機/外部證據」的項目。
 
 1. **H.3 嚴謹差分**：固定字串長度 + 交錯重複 + 反序 + 記錄 `Retry-After`,以定稿
    「`oc2api_` 前綴黑名單」假說(目前修復已生效,純學術補強)。
@@ -1537,6 +1556,7 @@ SWAP 帶健全數**。全套 **76 pass / 0 fail**（`bun test`,2026-11-06 實測
 | 🟢 8 | egress pool 補 **IP 探測 / 冷卻持久化 / `direct` 一等公民 / 冷卻倍數(429×4)** | azrinaldi / opencode2api | 附錄 K.6 已列「無 ip_probe」為已知限制;此為完整版藍圖 |
 | ⚪ 9 | 多來源 failover / LiteLLM 聚合 / CLI 委託 | FreeAIRouter / bansos / zengate | 與本專案「匿名 /inference 單通道」定位不同,列為結構性備援(呼應 J.1 四通道) |
 | ✅ 10 | **server.mjs 全檔審查修復 11 項**(靜默空答案、reasoning-cap 順序、Retry-After 單位、inline error、連線/關機/記憶體/歷史工具名) | 2026-11-07 本輪審查 | **已實作**,詳 **附錄 L.5**;87 pass / 0 fail |
+| ✅ 11 | **第二輪低優先 5 項**(緩衝 cap / terminalSeen 解析 / 尾幀 flush / SSE handler 例外 / responses 工具過濾) | 2026-11-07 第二輪 | **已實作**,詳 **附錄 L.6**;合計 95 pass / 0 fail |
 
 ### M.5 方法論小結
 
