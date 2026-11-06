@@ -242,6 +242,9 @@ sudo systemctl enable --now opencode-proxy
 | `RETRY_429_CAP_MS` | `30000` | Max wait per single 429 retry |
 | `RETRY_403_JITTER_MAX` | `1` | Gate-jitter retries for a `403 FreeTierError` on an otherwise conforming request (upstream-side flake; measured 7× by Coding2API). Each retry waits ~`RETRY_403_JITTER_MS` and rotates to a fresh session id. `0` disables |
 | `RETRY_403_JITTER_MS` | `1000` | Backoff before the gate-jitter retry |
+| `ZEN_EGRESS_PROXIES` | unset | **Egress proxy pool** (per-IP free-quota multiplication): comma-separated HTTP proxy URLs, round-robined per upstream attempt. A URL with `{session}` is a residential sticky-session lane (re-mints a fresh token after `ZEN_EGRESS_SESSION_TTL`); without it, a static lane. Hard-quota 429s retire the lane and fail over once; unset = direct egress |
+| `ZEN_EGRESS_SESSION_TTL` | `1800` | Sticky-session lifetime (seconds) for `{session}` lanes |
+| `ZEN_EGRESS_SESSION_LEN` | `10` | Random token length for `{session}` lanes |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 
@@ -394,6 +397,38 @@ the old shape fails. The request must mirror the official client (the working
   a whitelist (`FORWARD_PARAMS=0` to drop), no `stop`/`seed`
 - a `403 FreeTierError` body (shape-gate rejection, distinct from quota) is
   surfaced as `free_tier_error`, not `authentication_error`
+
+### Egress proxy pool (optional — multiplies the per-IP free quota)
+
+The free tier counts its daily quota **per egress IP** and resets at UTC
+midnight (same build, one egress OK while another was blocked at the same
+minute). `ZEN_EGRESS_PROXIES` turns on a pool of "lanes" — one HTTP proxy URL
+each, round-robined per upstream attempt — so **N lanes multiply the daily
+quota by N**, and a spent IP swaps in seconds instead of waiting for midnight:
+
+```sh
+# two static lanes (fixed IPs) and one residential sticky-session lane:
+export ZEN_EGRESS_PROXIES="http://user:pass@dc1.example.com:8000,http://user:pass@dc2.example.com:8000,http://user:pass@gate.provider.com:1338?session={session}&ttl=3600"
+```
+
+Semantics (opencode2api's transport design, trimmed to MVP; see
+`free_model.md` Appendix K):
+
+- only a **hard-quota `429 FreeUsageLimitError`** (Retry-After running to
+  midnight) retires a lane — rolling-window 429s, 5xx and timeouts never do;
+- on a hard-quota 429 the request **fails over once** to the next healthy
+  lane; a `{session}` lane re-mints a fresh token (→ fresh IP) instead of
+  parking, a static lane parks until `min(Retry-After, UTC midnight)`;
+- when **every** lane is spent, the upstream 429 is surfaced unchanged (or
+  synthesized with the same shape if nothing was sent yet) — the pool **never
+  silently falls back to direct egress**;
+- unset (default) = today's direct-egress behavior, byte for byte.
+
+Credentials never appear in logs (userinfo is redacted); a malformed URL
+refuses to start the server rather than silently sharing one IP. Proxies are
+metered traffic — rotation multiplies the provider bill. Bun's per-request
+`proxy` option is verified working (`review/probe_bun_fetch_proxy.mjs`);
+under Node the option is ignored (one more reason to run Bun).
 
 ### Upstream request headers (for the curious)
 

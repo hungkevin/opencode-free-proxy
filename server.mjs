@@ -416,6 +416,10 @@ async function zenFetchRaw(zenOpts, body, controller) {
       headers: zenOpts.headers,
       body: body === undefined || zenOpts.method === "GET" ? undefined : body,
       signal: controller.signal,
+      // Egress pool (free_model.md Appendix K): Bun honours this per-request
+      // `proxy` option (verified 2026-11-06 with a local CONNECT probe);
+      // Node/undici silently ignores the unknown key.
+      ...(zenOpts.__egress?.proxy ? { proxy: zenOpts.__egress.proxy } : {}),
     });
   } finally {
     clearTimeout(headerTimer);
@@ -424,6 +428,144 @@ async function zenFetchRaw(zenOpts, body, controller) {
 
 function abortUpstream(controller, why) {
   if (!controller.signal.aborted) controller.abort(new Error(why));
+}
+
+// ── Egress proxy pool (per-IP free-quota multiplication) ───────────
+// free_model.md Appendix K. Upstream counts the free quota per EGRESS IP and
+// resets it at UTC midnight (Appendix F: same build, WSL egress OK while the
+// Windows egress was blocked at the same moment). ZEN_EGRESS_PROXIES turns on
+// a pool of "lanes" — one HTTP proxy URL each, round-robined per upstream
+// attempt — so N lanes multiply the daily quota by N and a spent IP swaps in
+// seconds instead of waiting for midnight. Semantics (opencode2api's
+// transport crate trimmed to MVP):
+//   - ONLY a hard-quota 429 (FreeUsageLimitError with a Retry-After running
+//     past RETRY_429_HARD_LIMIT_MS) retires a lane. Rolling-window 429s,
+//     5xx and timeouts never do — they ride a working tunnel.
+//   - On a hard-quota 429 the request fails over ONCE to the next healthy
+//     lane; when no healthy lane remains the 429 is surfaced unchanged. The
+//     pool NEVER silently falls back to direct egress — a clean origin IP is
+//     usually the reason the pool exists, and the direct IP may be spent too.
+//   - A URL containing `{session}` is a RESIDENTIAL sticky-session lane:
+//     each mint expands a fresh random token, which the provider resolves to
+//     a fresh IP, and the identity lives ZEN_EGRESS_SESSION_TTL seconds.
+//     Retiring it just discards the mint — the lane re-mints immediately.
+//   - A URL without the template is a STATIC lane (fixed IP): retiring it
+//     parks the lane until min(Retry-After horizon, next UTC midnight).
+//   - Bun's per-request `proxy` RequestInit option is verified working
+//     (review/probe_bun_fetch_proxy.mjs); Node ignores the unknown option —
+//     one more reason Node is unsupported anyway.
+const EGRESS_RAW = (process.env.ZEN_EGRESS_PROXIES || "").trim();
+const EGRESS_SESSION_TTL_MS = envInt("ZEN_EGRESS_SESSION_TTL", 1800) * 1000;
+const EGRESS_SESSION_LEN = envInt("ZEN_EGRESS_SESSION_LEN", 10);
+
+// Never let a proxy credential reach a log line or an error message.
+function redactProxyUrl(u) {
+  try {
+    const p = new URL(u);
+    if (p.username || p.password) {
+      p.username = "***";
+      p.password = "***";
+    }
+    return p.toString();
+  } catch {
+    return "<invalid-proxy-url>";
+  }
+}
+
+function nextUtcMidnight(now = Date.now()) {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
+}
+
+const egress = { lanes: null, cursor: 0 };
+function parseEgressProxies(raw) {
+  const lanes = [];
+  for (const part of raw.split(",")) {
+    const url = part.trim();
+    if (!url) continue;
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`ZEN_EGRESS_PROXIES: not a valid URL: ${redactProxyUrl(url)}`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error(`ZEN_EGRESS_PROXIES: only http/https proxies are supported: ${redactProxyUrl(url)}`);
+    }
+    lanes.push({
+      template: url, // may embed {session}
+      templated: url.includes("{session}"),
+      host: parsed.host, // logs: no userinfo
+      current: null, // lazily minted { proxy, key, expiresAt, lane }
+      spentUntil: 0, // static lanes only
+    });
+  }
+  return lanes;
+}
+// Called at boot (below) and from tests. A malformed entry throws so a broken
+// pool config kills startup instead of silently degrading to one shared IP.
+function configureEgress(raw) {
+  egress.lanes = raw && raw.trim() ? parseEgressProxies(raw.trim()) : null;
+  egress.cursor = 0;
+  if (egress.lanes) {
+    log(
+      "info",
+      `[EGRESS] pool on: ${egress.lanes.length} lane(s) — ${egress.lanes
+        .map((l) => `${l.host}${l.templated ? " (sticky-session)" : " (static)"}`)
+        .join(", ")}`,
+    );
+  }
+  return egress.lanes;
+}
+if (EGRESS_RAW) configureEgress(EGRESS_RAW);
+
+const EGRESS_TOKEN_CHARS = SESSION_ID_CHARS; // [0-9A-Za-z]
+function mintLane(lane) {
+  const mint = { lane, proxy: lane.template, expiresAt: Infinity };
+  if (lane.templated) {
+    const rnd = crypto.randomBytes(EGRESS_SESSION_LEN);
+    let token = "";
+    for (let i = 0; i < EGRESS_SESSION_LEN; i++) token += EGRESS_TOKEN_CHARS[rnd[i] % EGRESS_TOKEN_CHARS.length];
+    mint.proxy = lane.template.replaceAll("{session}", token);
+    mint.expiresAt = Date.now() + EGRESS_SESSION_TTL_MS;
+  }
+  return mint;
+}
+// Round-robin over healthy lanes; mints lazily and re-mints after the sticky
+// TTL. Returns null when the pool exists but every lane is spent — callers
+// must surface an error rather than fall back to direct egress.
+function egressPick() {
+  if (!egress.lanes || egress.lanes.length === 0) return null;
+  const now = Date.now();
+  const n = egress.lanes.length;
+  for (let i = 0; i < n; i++) {
+    const lane = egress.lanes[egress.cursor % n];
+    egress.cursor++;
+    if (lane.spentUntil > now) continue;
+    if (!lane.current || lane.current.expiresAt <= now) lane.current = mintLane(lane);
+    return lane.current;
+  }
+  return null;
+}
+function egressHasHealthy() {
+  if (!egress.lanes) return false;
+  const now = Date.now();
+  return egress.lanes.some((l) => l.spentUntil <= now);
+}
+// A hard-quota 429 just told us this lane's egress IP is out of free quota.
+// Static lanes park until the quota horizon; sticky-session lanes only drop
+// the current mint so the next pick re-mints onto (hopefully) a fresh IP.
+function egressMarkSpent(mint, retryAfterMs) {
+  if (!mint?.lane) return;
+  const lane = mint.lane;
+  lane.current = null;
+  if (!lane.templated) {
+    const horizon =
+      Number.isFinite(retryAfterMs) && retryAfterMs > 0
+        ? Math.min(Date.now() + retryAfterMs, nextUtcMidnight())
+        : nextUtcMidnight();
+    lane.spentUntil = horizon;
+  }
 }
 
 // ── 429 retry (empirically-derived, NOT official parity) ──
@@ -516,8 +658,35 @@ function setZenFetchImpl(fn) {
 }
 async function zenFetchWithRetry(zenOpts, body, controller) {
   let jitter403Used = 0;
+  let swappedEgress = false;
+  let lastRes = null;
   for (let attempt = 0; ; attempt++) {
+    if (egress.lanes) {
+      const mint = egressPick();
+      if (!mint) {
+        // Every lane has spent its quota. Never fall back to direct egress:
+        // surface the last upstream answer, or — when nothing was sent yet —
+        // answer 429 ourselves with the same shape upstream would send.
+        if (lastRes) return lastRes;
+        const secs = Math.max(1, Math.round((nextUtcMidnight() - Date.now()) / 1000));
+        log(
+          "error",
+          `[EGRESS] all ${egress.lanes.length} lane(s) spent their free quota — answering 429 without an upstream call (resets in ~${Math.round(secs / 60)} min)`,
+        );
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "All egress proxy lanes have spent today's free quota.",
+              type: "FreeUsageLimitError",
+            },
+          }),
+          { status: 429, headers: { "content-type": "application/json", "retry-after": String(secs) } },
+        );
+      }
+      zenOpts.__egress = mint;
+    }
     const res = await zenFetchImpl(zenOpts, body, controller);
+    lastRes = res;
     if (res.status !== 429 || attempt >= RETRY_429_MAX) {
       if (
         res.status === 403 &&
@@ -560,6 +729,24 @@ async function zenFetchWithRetry(zenOpts, body, controller) {
     // times would waste two minutes and still fail.
     if (isHardQuotaWait(retryAfterMs)) {
       const mins = Math.round(retryAfterMs / 60000);
+      // Egress pool: a hard-quota 429 is the per-IP quota signal — retire the
+      // lane that served it and fail over ONCE to the next healthy lane.
+      if (egress.lanes) {
+        egressMarkSpent(zenOpts.__egress, retryAfterMs);
+        if (!swappedEgress && egressHasHealthy()) {
+          swappedEgress = true;
+          log(
+            "warn",
+            `[EGRESS SWAP] lane spent its free quota (resets in ~${mins} min) — failing over to the next lane`,
+          );
+          continue;
+        }
+        log(
+          "error",
+          `[ZEN 429 DAILY QUOTA] every egress lane is spent; resets in ~${mins} min — not retrying`,
+        );
+        return res;
+      }
       log(
         "error",
         `[ZEN 429 DAILY QUOTA] free quota exhausted for this egress IP; resets in ~${mins} min — not retrying`,
@@ -3673,6 +3860,12 @@ export {
   zenFetchWithRetry,
   setZenFetchImpl,
   rotateSessionHeaders,
+  configureEgress,
+  egressPick,
+  egressMarkSpent,
+  egressHasHealthy,
+  redactProxyUrl,
+  nextUtcMidnight,
   responsesNon200Raw,
   OFFICIAL_TOOLS,
   OFFICIAL_TOOL_NAMES,

@@ -1193,3 +1193,66 @@ dsh-providers-hub 的 wreq-js 方案）。
 
 > 註：上表為各專案自述快照（2026-10 ~ 11-06），上游門禁持續演進，引用前宜重驗。
 > 最終裁決準則不變：官方 opencode 源碼（`c:\work\opencode`）+ 本專案真機差分實測。
+
+---
+
+## 附錄 K: 出口 IP 代理池 MVP（J.2-2 採納實作）(v13.0, 2026-11-06)
+
+> 附錄 J.2 列為「本專案最大架構缺口」的**輪換出口 IP 代理池**，本輪以 MVP 形態落地。
+> 設計取自 opencode2api 的 transport crate（附錄 J.1），裁剪至三個環境變數可表達的最小集。
+
+### K.1 依據與前置驗證
+
+配額按**出口 IP** 計、UTC 午夜重置（附錄 F 跨 IP 證據；magpie 證實跨模型）。
+基石是 Bun 的 per-request `proxy` 選項——`review/probe_bun_fetch_proxy.mjs`
+（本地 CONNECT 探針，已入庫）驗證通過：Bun 1.4.4 fetch 只對帶 `proxy` 的請求
+發 CONNECT，隧道內 TLS 正常、ipify 200；直連請求完全不經代理（每請求級隔離成立）。
+Node/undici 忽略未知選項，代碼在 Node 下安全（但 Node 本就被傳輸閘拒絕）。
+
+### K.2 配置（opt-in，未設 = 現狀直連，逐位元組一致）
+
+| 環境變數 | 預設 | 語義 |
+|---------|------|------|
+| `ZEN_EGRESS_PROXIES` | unset | 逗號分隔的 HTTP 代理 URL；含 `{session}` = 住宅黏性 lane（mint 隨機 token→新 IP），不含 = 靜態 lane（固定 IP） |
+| `ZEN_EGRESS_SESSION_TTL` | `1800` | 黏性 token 壽命（秒） |
+| `ZEN_EGRESS_SESSION_LEN` | `10` | token 長度 |
+
+啟動時校驗：URL 解析失敗/scheme 非 http(s) ⇒ **拒絕啟動**（不靜默降級成單 IP）。
+日誌一律走 `redactProxyUrl()`（userinfo → `***`），憑證不入任何日誌/錯誤訊息。
+
+### K.3 狀態機與語義（逐條對齊 opencode2api，標注裁剪處）
+
+```
+pick()：round-robin per attempt，跳過 spent lane；lazy mint，黏性 TTL 到期自動重 mint
+markSpent(mint, retryAfter)：
+  靜態 lane  → spentUntil = min(now+Retry-After, 下一個 UTC 午夜)
+  黏性 lane  → 僅丟棄當前 mint（lane 立即可重 mint——這正是住宅代理的價值）
+硬配額 429（FreeUsageLimitError 且 Retry-After 過硬限）→ markSpent + 換 lane 重試一次
+滾動窗 429 / 5xx / 逾時 → 永不 retire lane（它們穿過的是完好的隧道）
+全部 spent → 上拋最後的 429；若一個請求都還沒發 → 合成同形 429（含 Retry-After 到午夜）
+             絕不靜默回落直連
+```
+
+與 opencode2api 的差異（裁剪）：無 ip_probe（小池子供應商可能 mint 到已花費 IP，
+徵兆=新 lane 立刻再 429）；無預熱（切換瞬間多付一次冷握手 ~300–700ms）；無閒置
+退役/自適應縮放/shards/指標端點。每請求至多換 lane 一次，避免單請求燒光池子信號。
+
+### K.4 掛鉤點
+
+- `zenFetchRaw`：fetch init 注入 `proxy: zenOpts.__egress.proxy`——**所有上游呼叫**
+  （chat/responses/7 個 pipe 位點）單點覆蓋
+- `zenFetchWithRetry`：每次迭代 `egressPick()`；硬配額分支改為 markSpent →
+  `swappedEgress` 旗標控制的一次 failover；`egressPick()` 為 null 時合成 429
+- 模型列表（`fetchUpstreamModels`）維持直連——非配額消費者，且讓探活不耗計費代理流量
+
+### K.5 測試（test/egress-pool.test.mjs，7 條，離線）
+
+round-robin 交替／硬配額 retire+一次 failover 後 200／最後健康 lane 花費後原樣上拋
+429／啟動即全 spent ⇒ 合成 429 且**零上游呼叫**／滾動窗 429 不 retire／黏性 token
+穩定+retire 後新 token／憑證脫敏+UTC 午夜邊界。全套 **75 pass / 0 fail**。
+
+### K.6 已知限制（與 J.3 同源）
+
+1. 無 IP 探測 ⇒ 黏性 lane 重 mint 可能撞回同一 IP（供應商池小時）；徵兆可觀察
+2. 資料中心 IP 段的上游態度未驗證——首次接真實代理時需 live 觀察是否有新形態拒絕
+3. 代理為計費流量；輪換放大供應商帳單（README 已聲明）

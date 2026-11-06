@@ -16,5 +16,6 @@ review/*.mjs
 !review/probe_tool_rename_readable.mjs
 !review/probe_tool_rename_digest.mjs
 !review/probe_bun_direct_shape.mjs
+!review/probe_bun_fetch_proxy.mjs
 review/*.py
 review/*.pptx
