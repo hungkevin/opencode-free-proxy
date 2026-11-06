@@ -5,9 +5,16 @@ oc-keys.json
 *.log
 .env
 .tmp-bun144/
+.gocache/
+.gopath/
+.tmp-gotest/
+utls-tunnel/utls-tunnel.exe
 
 review/*.mjs
 !review/probe_tls_fingerprint_node.mjs
 !review/probe_tls_fingerprint_bun.mjs
+!review/probe_tool_rename_readable.mjs
+!review/probe_tool_rename_digest.mjs
+!review/probe_bun_direct_shape.mjs
 review/*.py
 review/*.pptx

@@ -1,6 +1,10 @@
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import crypto from "node:crypto";
+
+// Digest rename (oc2api shape.Renames parity, Appendix H.3).
+const DIGEST = "oc2api_" + crypto.createHash("sha256").update("my.tool").digest("hex").slice(0, 12);
 
 let fake;
 let proxy;
@@ -16,7 +20,7 @@ before(async () => {
     req.on("end", () => {
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: '{"a":' } }] } }] })}\n\n`);
-      res.write(`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "oc2api_my_tool", arguments: "1}" } }] } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: DIGEST, arguments: "1}" } }] } }] })}\n\n`);
       res.write(`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
       res.end("data: [DONE]\n\n");
     });

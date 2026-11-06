@@ -229,6 +229,22 @@ test("quota classification wins over rate-limit text (official order)", () => {
   assert.equal(error.type, "rate_limit_error");
 });
 
+test("FreeTierError is its own gate type, not authentication_error", () => {
+  // dsh-providers-hub (2026-10-02 real traffic): the free lane's shape gate
+  // rejects with HTTP 403 FreeTierError. Classifying it as auth would send
+  // users to rotate keys — the actual fix is request shape (session algo,
+  // affinity headers, tool descriptions/schema), so keys/IP changes never help.
+  const raw = JSON.stringify({ type: "error", error: { type: "FreeTierError", message: "denied" } });
+  const { status, error } = upstreamErrorPayload(403, raw, null);
+  assert.equal(error.type, "free_tier_error");
+  assert.equal(status, 403);
+  assert.equal(error.code, "free_tier_gate");
+  assert.match(error.message, /protocol gate/);
+  // A bare 403 without the marker stays authentication_error.
+  const plain = upstreamErrorPayload(403, '{"error":{"message":"forbidden"}}', null);
+  assert.equal(plain.error.type, "authentication_error");
+});
+
 test("rate-limit headers from upstream are relayed to the client", () => {
   const set = {};
   const res = {
@@ -270,7 +286,10 @@ test("buildZenChatBody forwards whitelisted params and rewrites tool_choice", ()
   const parsed = JSON.parse(body);
   assert.equal(parsed.temperature, 0.4);
   assert.equal(parsed.top_p, 0.9);
-  assert.ok(parsed.tool_choice.function.name.startsWith("oc2api_"));
+  // Digest rename (Appendix H.3): oc2api_<sha256[:12]> — opaque, and the
+  // readable client vocabulary must NOT leak into the tool table.
+  assert.match(parsed.tool_choice.function.name, /^oc2api_[0-9a-f]{12}$/);
+  assert.ok(!parsed.tool_choice.function.name.includes("my_tool"), "readable rename leaked");
   assert.ok(parsed.tools.some((t) => t.function.name === parsed.tool_choice.function.name));
   assert.equal(parsed.stream, true);
 });
@@ -325,7 +344,7 @@ test("Anthropic-shaped tool_choice is translated for the chat body", () => {
     tool_choice: { type: "tool", name: "my_tool" },
   }).body);
   assert.equal(named.tool_choice.type, "function");
-  assert.ok(named.tool_choice.function.name.startsWith("oc2api_"));
+  assert.match(named.tool_choice.function.name, /^oc2api_[0-9a-f]{12}$/);
 
   // OpenAI-shaped input passes through unchanged in form.
   const oai = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", msgs, tools, {

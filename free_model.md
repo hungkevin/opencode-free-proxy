@@ -653,7 +653,7 @@ node --test test/responses-pipe.test.mjs
 
 | # | 項目 | 不改理由 |
 |---|------|----------|
-| N5 | 工具名改用 `oc2api_<sha256-12hex>` 摘要 | 官方 opencode 送真實名稱；摘要改名僅 oc2api 反指紋用，未實測前不動（現行可讀名已實測通過） |
+| N5 | 工具名改用 `oc2api_<sha256-12hex>` 摘要 | 官方 opencode 送真實名稱；摘要改名僅 oc2api 反指紋用，未實測前不動（現行可讀名已實測通過）**⚠️ 2026-11-06 已實測推翻：可讀名本身就會觸發 429，見附錄 H.3** |
 | R1 | 429 自動重試 | 官方將 `FreeUsageLimitError` 歸為 QuotaExceeded，`isRetryable=false`；「不重試 + 透傳 Retry-After」更接近官方語義 |
 | R2 | `MASK_KEYS` 預設遮罩 | 使用者明確要求本地網路完整顯示金鑰 |
 | R3 | 端點路徑改版 | oc2api v4.5.0 同樣使用 `/inference/v1/*`，無變更依據 |
@@ -814,6 +814,8 @@ ELAPSED = 153ms            ← 舊版需 ~120 秒
 ## 附錄 G: TLS 指紋閘門與 uTLS 隧道方案 (v11.5, 2026-11-05)
 
 > 本輪由使用者對照實驗驅動：發現 `oc2api`（Go + uTLS）可用、同機 `bun run`（BoringSSL 原生 ClientHello）全軍覆沒。確認差異在 **TLS ClientHello 指紋**，而非請求形狀。
+>
+> **⚠️ 2026-11-06 修正**：本輪「Bun ClientHello 必被拒」的因果結論已被附錄 H.4 的差分實測部分推翻——請求形狀正確時，Bun 1.4.4 原生 `fetch` 直連可 200。隧道方案本身有效且無害，可保留作為逃生口；但閘門的真實觸發點請以附錄 H 為準。
 
 ### 決定性對照實驗
 
@@ -881,6 +883,205 @@ tunnel  : 200 OK  (原本 429，修正 header 順序 + Accept-Encoding 後通過
 
 ---
 
+## 附錄 H: 三專案差異總檢與「可讀工具名 429」實證 (2026-11-06)
+
+> 本輪在免費額度耗盡前後，以差分探針對三方做逐項對照：
+> **opencode-free-proxy v0.16.0**（`server.mjs`）/ **oc2api v4.5.0**（`internal/zen` + `internal/shape`）/
+> **官方 opencode HEAD `ee6b87031c`**（`packages/core/src/session/model-request.ts`、`packages/ai/src/protocols/openai-chat.ts`）。
+> 重點結論：**一項實測推翻既有判斷**（N5 可讀改名，H.3）、**一項修正附錄 G 的 TLS 因果**（H.4）、
+> 其餘為行為差異清單（多數不觸發閘門，H.5）。本輪僅檢查未實作，修復清單見 H.7。
+
+### H.1 已驗證一致的部分（無需改動）
+
+| 項目 | 證據 |
+|------|------|
+| `oc-prompt.txt`（999 B）與 `oc-tools.json`（16602 B，13 個官方工具） | 與 `oc2api/internal/shape/assets/` SHA256 完全相同（`6EC754AD…` / `C2ED853E…`） |
+| 官方工具描述統一替換字串、`NO_TOOLS_NUDGE` 結尾句 | 兩邊逐字相同 |
+| system prompt 佔位符替換（`{{MODELNAME}}/{{MODEL}}/{{DATE}}/{{WORKDIR}}/{{GIT}}`，UTC `Mon Jan 02 2006`） | 演算法相同 |
+| 端點 `POST /inference/v1/chat/completions`、`stream:true` + `stream_options.include_usage`、`max_completion_tokens` 預設 32000 | 相同 |
+| `ses_` session id 演算法（12 hex = `~(ms×0x1000 + counter 1..15)` + 14 base62） | 兩 proxy 相同 |
+| body 鍵序 `model → messages → tools → stream → stream_options → max_completion_tokens → 白名單參數` | 相同；`JSON.stringify` 不轉義 HTML，與 oc2api `SetEscapeHTML(false)` 位元組等價 |
+
+### H.2 Header 逐項對照（大小寫／順序／數量／值）
+
+| 面向 | free-proxy | oc2api | 官方 opencode | 閘門影響（實測） |
+|------|-----------|--------|---------------|------------------|
+| 大小寫 | 原始碼寫小寫 `x-opencode-*`，Bun fetch 保留原樣 | **Go `Header.Set` 會 canonicalize 成 `X-Opencode-Client`**（標題式）上線 | Bun 原樣小寫 | **無**——oc2api 標題式長期 200 為證 |
+| 順序 | JS 物件插入序；開隧道後被隧道內 Go map **隨機序**重寫 | Go HTTP/1.1 依**字母排序**寫出 | Effect 客戶端自定 | **無**——隧道隨機序與 oc2api 排序序皆 200 |
+| 數量 | 10 個（含明寫 `Content-Length`；fetch 視為 forbidden header 自行重算，無線上效果，§6.2.1.5 已記） | 9 個（Go 自動補 `Content-Length`、`Accept-Encoding: gzip`） | 8 個自訂 + 客戶端庫補 `accept`/`accept-encoding` | 無 |
+| `Accept` | 不送（fetch 傳輸層自動補 `accept: */*`） | 完全不送（Go 不自動補） | 同 proxy（fetch 自動補） | 無——三種狀態皆通過 |
+| `Accept-Encoding` | Bun 自動（`gzip`/`br` 等） | Go 自動（僅 `gzip`） | Bun 自動 | 無 |
+| 四個 session header 值 | 四個同值 | 四個同值 | **`x-opencode-session-id` = 自己的 `session.id`，其餘三個 = affinity（父 id）**；有 parentID 時另送 `x-opencode-parent-session-id` / `x-parent-session-id` | 無（同值已過閘）；只影響上游 prompt-cache 路由 |
+| `Authorization`（chat） | 免費模型 `Bearer public`（`FREE_USES_OC_KEY=1` 才送 key） | 固定 `Bearer public` | 無 key 時 `apiKey:"public"`（`provider/opencode.ts:429-451`） | 一致 |
+| `Authorization`（**models 抓取**） | ⚠️ `fetchUpstreamModels()` 呼叫 `zenKey()` **不帶 model** → 有 `oc-keys.json` 時送 **`Bearer oc_sk_…`**（`zenKey`：model 為空 → `isFreeTierModel("")` 為 false → 回 `ocKeys[0]`） | 固定 `Bearer public`（`client.go:180`） | 不呼叫此端點（走 `models.opencode.ai/api.json`） | 不影響 chat 閘門；但把 Console key 送到非必要端點，且與 oc2api 行為不一致 |
+
+### H.3 🔴 決定性差分實測：可讀改名 → 429（推翻附錄 D 的 N5 決定）
+
+**時間**：2026-11-05 21:36–21:38（+08:00，額度尚存時段）。**模型**：`deepseek-v4.1-flash-free`。
+**方法**：同一個探針腳本，同一出口 IP、同一時刻，只改「客戶端工具的改名方式」。
+**客戶端工具**：`ReportFindings`、`ScheduleWakeup`、`TodoWrite`、`Task`（其餘形狀完全照 oc2api 對齊：官方 prompt + 13 官方工具 + `stream:true` + `max_completion_tokens` + 四 session header + 隨機 40-hex project id）。
+
+| # | 請求 | body 大小 | 結果 |
+|---|------|-----------|------|
+| 1 | Bun `fetch` 直連，**無客戶端工具** | 10561 B | **200** 串流 ✓ |
+| 2 | Bun `fetch` 直連，**可讀改名** `oc2api_ReportFindings`…（本專案 `renameTool()` 現行方案） | 11115 B | **429 `FreeUsageLimitError`** ✗ |
+| 3 | Bun `fetch` 直連，**摘要改名** `oc2api_<sha256 前 12 hex>`（oc2api `shape.Renames` 方案） | 11122 B | **200** 串流 ✓ |
+
+oc2api 的 AGENTS.md 早已明言此閘門：
+> **原始工具名一個字符都不能發往上游**：免費層會拒絕「工具列表里仍帶著別的客戶端詞彙」的請求體（Claude Code 的 `ReportFindings` + `ScheduleWakeup` 就夠觸發），回的是和額度耗盡一樣的 429。
+
+**結論**：
+1. 上游對請求體做詞彙指紋——`oc2api_` 前綴後夾帶可讀的客戶端詞彙（`ReportFindings`、`ScheduleWakeup`…）**本身就是 429 觸發點**，與額度無關（#2 與 #3 同時刻同 IP，一 429 一 200）。
+2. 附錄 D N5「現行可讀名已實測通過」的判斷**錯誤**——當時的「通過」案例沒有帶會觸發的客戶端詞彙。
+3. 這解釋了為什麼「opencode CLI 當客戶端時本代理 429、oc2api 卻可用」：CLI 會宣告 `read`/`grep`/`edit` 等真實工具名，可讀改名後 `oc2api_read` 等仍把客戶端詞彙送進了工具表。
+
+探針最小重現（額度可用時可重建為 `review/probe_tool_rename_{readable,digest}.mjs`；本輪臨時探針已清理）：
+
+```js
+// digest：oc2api 方案
+const digest = "oc2api_" + crypto.createHash("sha256").update(name).digest("hex").slice(0, 12);
+// readable：本專案現行方案（server.mjs renameTool()）
+const readable = "oc2api_" + name.replace(/[^A-Za-z0-9_-]/g, "_");
+// 兩者分別組進 tools 陣列後送 POST /inference/v1/chat/completions，其餘形狀照 §6.3
+```
+
+### H.4 對附錄 G「TLS 指紋」因果的修正
+
+H.3 的 #1 與 #3 顯示：**Bun 1.4.4 原生 `fetch` 直連、形狀正確時可 200**——與附錄 G「Bun ClientHello 必被拒（缺 `X25519MLKEM768`）」矛盾，與 §6.2 原始結論（Bun fetch 恆通過）一致。
+
+對附錄 G 當時「oc2api 200 / bun 直連 429」對照實驗的合理解釋：
+- 該實驗的 bun 直連請求若帶**可讀改名工具**（本專案當時的形狀），429 即由 H.3 的詞彙指紋觸發，與 TLS 無關；
+- 或實驗時該 IP 的每日配額已耗盡（附錄 F 的兩種 429 同文案陷阱）。
+
+**判定法則（更新 §6.1）**：`FreeUsageLimitError` 文案下疊了三種成因——
+1. 每日 IP 配額（`Retry-After` 倒數至 UTC 午夜，附錄 F）；
+2. 短時滾動窗（`Retry-After` 小或無，附錄 F）；
+3. **形狀觸發（可讀工具名等，H.3）**。
+
+單看文案無法區分；差分法（同時刻只換單一變因）是唯一可靠手段。隧道（附錄 G）實測有效且無害，保留為逃生口；「Bun 必須靠隧道」的敘述待額度重置後按 H.7-4 重驗再定稿。
+
+### H.5 其餘行為差異清單（不觸發閘門，記錄備查）
+
+| # | 差異 | free-proxy | oc2api | 官方 | 影響 |
+|---|------|-----------|--------|------|------|
+| 1 | **429 重試雙層疊加** | `zenFetchRaw` 內建重試 5 次（`UPSTREAM_RETRY_MAX`，單次等待上限 30s）**外面又包** `zenFetchWithRetry` 4 次（`RETRY_429_MAX`）。硬配額 429 時：內層先白睡 ≤5×30s（`Retry-After` 被壓到 30s 上限）→ 外層才 fail-fast（`isHardQuotaWait`） | 0 次重試，直接透傳 `Retry-After` | 0 次（`isRetryable=false`） | 硬配額時多浪費 ≤150s 與 ≤5 次上游命中 |
+| 2 | 白名單參數集 | 8 個（含 `frequency_penalty`、`presence_penalty`，E3 補） | 6 個 | 官方送 freq/presence（proxy 較近官方）；官方亦送 `seed`/`stop`（兩 proxy 都刻意不送，記錄有 400 風險） | 低 |
+| 3 | 無工具時 `tool_choice`/`parallel_tool_calls` 閘控 | 有（`TOOL_GATED_PARAMS`，E4） | **無**——客戶端給了就轉發 | 有（`openai-chat.ts:827-828,882`） | oc2api 側漂移 |
+| 4 | `prompt_cache_key` 64 字元截斷 | 有（E5，unicode-aware） | **無**（>64 字元可能 400） | 有（`shared.ts:86-100`） | oc2api 側漂移 |
+| 5 | 舊版 `function_call` 參數 | 不處理 | 有處理（摘要改名轉發） | 不送（現代客戶端） | 低 |
+| 6 | session 重用策略 | 每對話重用；**無對話 header → 每 API key 一桶**（跨對話共用同一 `ses_`） | **每請求全新**（AGENTS.md 自認已知限制） | 每對話重用（parentID/fork 感知） | proxy 的 key 桶可能把同 key 的不同對話在上游串成同一 session |
+| 7 | parent-session headers / body `prompt_cache_key` | 不送 | 不送 | 送（`model-request.ts:315-327`） | 僅影響上游快取路由 |
+| 8 | 連線行為（隧道模式） | 每請求新建 uTLS 連線（`Connection: close`） | keep-alive 連線池（`MaxIdleConnsPerHost: 32`） | 連線複用 | 握手開銷、效能 |
+| 9 | `OC_UA` 覆寫時 `x-opencode-client` 推導 | 取 UA 第 4 段；UA < 4 段 fallback `cli`，可能與 UA 不一致 | 固定 `cli` | `app.name`（CLI artifact = `cli`） | 低 |
+| 10 | models 清單來源 | 註冊表 `cost==0 && !deprecated` + 併入線上 `-free`/`big-pickle` | 僅線上 `-free`/`big-pickle` | 註冊表原樣（無 key 時停用付費模型） | 各自取捨，無閘門影響 |
+
+### H.6 額度耗盡期的交叉驗證（oc2api 同樣 429）
+
+2026-11-05 22:06–22:09（+08:00），同一出口 IP、同一模型（`deepseek-v4.1-flash-free`）：
+
+| 端點 | 結果 | `Retry-After` |
+|------|------|---------------|
+| oc2api（:8081，Go + uTLS） | 429 `FreeUsageLimitError` | 36458 s（≈10.1 h，倒數至 UTC 午夜） |
+| free-proxy（:6446，Bun 直連） | 429 `FreeUsageLimitError` | 36422 s（≈10.1 h） |
+
+兩者同時落入附錄 F 的「每日 IP 配額」型 429——**此時任何形狀/TLS 修正都無法驗證**，須待 UTC 午夜（台北 08:00）重置。
+
+### H.7 建議修復清單（待額度恢復後實作，本輪未動程式碼）
+
+| 優先 | 項目 | 觸點 | 依據 |
+|------|------|------|------|
+| 🔴 1 | `renameTool()` 改為 oc2api 摘要式 `oc2api_<sha256 前 12 hex>` | `server.mjs` `renameTool()`；測試 `test/spark-tools.test.mjs:28,31,35`、`test/review-fixes.test.mjs:273,328` 斷言同步；`§6.4`、附錄 D N5、README「oc2api_ prefix」敘述更新 | H.3（可重現 429 根因） |
+| 🟡 2 | 拆除 `zenFetchRaw` 內層 429 重試（或令內層同樣尊重 `isRetryableLimit`/`isHardQuotaWait`），只保留外層 `zenFetchWithRetry` | `server.mjs` `zenFetchRaw`/`zenFetchWithRetry`；README 的 `UPSTREAM_RETRY_*` 與 `RETRY_429_*` 兩組重疊參數說明 | H.5-1（硬配額白睡 ≤150s） |
+| 🟡 3 | `fetchUpstreamModels()` 的 `Authorization` 改固定 `Bearer public` | `server.mjs` `fetchUpstreamModels()` | H.2 末列（對齊 oc2api `client.go:180`，避免 Console key 外送） |
+| 🟡 4 | 額度重置後重跑 TLS 直連矩陣（Bun 直連 × {無工具, 可讀改名, 摘要改名} × {隧道開, 關}），定稿 §6.2 / 附錄 G 敘述 | 固化為 `review/probe_tool_rename_{readable,digest}.mjs` 與 `review/probe_bun_direct_shape.mjs`（程式碼見 H.3） | H.4 |
+| 🟢 5 | （可回饋 oc2api 上游，非本專案必改）tool_choice 無工具閘控、`prompt_cache_key` 64 字元截斷 | — | H.5-3、H.5-4 |
+
 ---
 
-以上內容已加入文件末尾。現在更新版本號並提交。
+## 附錄 I: 三專案再核對與 H.7 修復實作 (v12.0, 2026-11-06)
+
+> 本輪背景：oc2api 宣告停止維護（`0452801`，推薦 `zhuweiyou/codearts2api`）、
+> 官方 opencode 前進至 `97178e54b8`、附錄 H 由使用者補充差分實測。
+> 本輪**逐項實作 H.7 修復清單**並全數真機驗證，同時以 dsh-providers-hub
+> （codearts2api 的上游插件，`fddb875`）交叉驗證門禁模型。
+
+### I.1 三專案更新盤點（對免費層線路的影響）
+
+| 專案 | 更新 | 影響 |
+|------|------|------|
+| oc2api | 僅 README 加 EOL 公告 → **程式碼零變更**，參照基準不變 | 無 |
+| 官方 opencode | `openai-chat.ts` 內部旗標重構（`compatibility.*` → `capabilities.*`） | **線路格式零變更**：`stream/include_usage/max_completion_tokens/tool_choice` 閘控語義全同；`model-request.ts`/`opencode.ts`/`app.ts` 零改動；CLI 仍 2.2.5 |
+| codearts2api | oc2api 的後繼（JS 重寫），但架構是「薄膠水」包 `dsh-providers-hub` 插件 | opencode 通道的真正實作在上游插件，本輪直接核對該插件源碼（見 I.2） |
+
+### I.2 dsh-providers-hub 交叉驗證（獨立第三方實測，與本專案結論互補）
+
+`src/opencode-bun-tls.ts`（2026-10-26 真機實測）的傳輸層矩陣：
+
+| 執行環境 | 結果 |
+|---------|------|
+| Node `fetch`（undici/OpenSSL） | ❌ 429 |
+| `curl.exe`（OpenSSL） | ❌ 429 |
+| wreq-js + 瀏覽器預設（chrome_149/chrome_133/firefox_133/safari_18） | ❌ 全 429 |
+| **wreq-js + Bun 形狀 `tlsOptions`**（JA4 `t13d1713h1`：無 GREASE、ALPN 僅 `http/1.1`、首位 key share `X25519MLKEM768`、17 cipher 順序） | ✅ 200 |
+
+`src/opencode-messages.ts`（2026-10-26 實測）的形狀門禁三要素：
+
+1. **Bun TLS 指紋**（上表）；
+2. **system 第一條訊息必須是官方提示詞**（含 `<env>`/`Working directory`；官方提示詞不在首位 ⇒ 429）；
+3. **tools 含整套內置工具**（`read` 必需）。
+
+⇒ 與本專案 §6.2/§6.3 完全一致（oc-prompt.txt 首位 + 13 官方工具），三項全數符合。
+
+其他可遷移情報（本輪已吸收者標 ✅）：
+
+| 情報 | 出處 | 本輪處置 |
+|------|------|----------|
+| ✅ `FreeTierError`（HTTP 403）= 形狀門禁拒絕，與配額 429 不同；「換 key 或換出口都無效」 | `opencode-product.ts` `classifyOpencodeError`（2026-10-02 真實流量取證） | `upstreamErrorPayload()` 新增 `free_tier_error` 分類（quota 之後、auth 之前），不再誤報 `authentication_error` |
+| `x-opencode-session-id` 是四個親和頭中唯一必需；`x-opencode-request` 是毒藥（送了必 403） | `opencode.ts` 逐頭對照（2026-10-15） | 本專案四頭全送（貼合 CLI 外形）、從不送 `x-opencode-request`——維持不變 |
+| session 演算法上游校驗**降序時間**（不只外形）；`~(t*0x1000+counter) & 48bit` | `opencode.ts`（舊實作小端寫入被拒的教訓） | 本專案演算法相同，維持不變 |
+| UA 不參與聊天門禁（2×2×2 逐變因實測）；`opencode/latest/2.1.1/cli` 即其預設串 | `opencode.ts` | 維持不變 |
+| 該插件用**可讀** `dsh_<name>` 別名 + 描述明寫原名仍 200 | `opencode-messages.ts` `ALIAS_PREFIX` | 與 H.3（`oc2api_<可讀>` ⇒ 429）並存 ⇒ 詞彙閘門疑似**針對特定前綴/詞彙**而非「可讀」本身；本專案摘要式已實測 200，**不改**（更穩健） |
+| project id 用「身分+代次」派生的**穩定** 40-hex（`sha1(git-remote:opencode/sha256(identity+gen))`） | `opencode.ts` `deriveProjectId` | project 非門禁項；本專案維持 oc2api 式每請求隨機（`OC_PROJECT` 可釘選） |
+| 免費模型清單（2026-10-17）：+`deepseek-v4.1-flash-free`/`glm-5.3-flash-free`/`nemotron-3.5-super-vl-free`；`mimo-v2.5-free` 已 410 | `opencode-product.ts` | 本專案模型清單走註冊表 + 線上 `/v1/models` 併入，無需硬編碼 |
+
+### I.3 H.7 修復清單實作結果
+
+| # | H.7 項目 | 結果 |
+|---|---------|------|
+| 🔴 1 | `renameTool()` 改摘要式 | ✅ **已實作**：`oc2api_<sha256[:12]>`（oc2api `shape.Renames` 逐字對齊：12 hex、64 字元上限、`_2`/`_3` 防撞）。測試斷言同步（`spark-tools`/`anthropic-tools`/`review-fixes` 共 4 處），並加「不得殘留可讀詞彙」反向斷言。**真機驗證：摘要改名 ×4 客戶端工具 → 200 串流**（可讀改名同秒同 IP → 429） |
+| 🟡 2 | 拆除 `zenFetchRaw` 內層重試 | ✅ **核對後免改**：現行 `server.mjs` 從無 `UPSTREAM_RETRY`（全倉僅外層 `zenFetchWithRetry` 一個重試迴圈，含 `isHardQuotaWait` fail-fast）。H.5-1 描述與程式碼不符，視為文件謬誤 |
+| 🟡 3 | models 端點固定 `Bearer public` | ✅ **已實作**：`fetchUpstreamModels()` 不再經 `zenKey()`（避免有 ockeys 時把 `oc_sk_*` 送往非推理端點），對齊 oc2api `client.go:180` |
+| 🟡 4 | 差分探針固化 + 重跑 | ✅ **已固化並重跑**：`review/probe_tool_rename_{readable,digest}.mjs`、`review/probe_bun_direct_shape.mjs`（皆入 git 白名單）。2026-11-06 11:30 實測（Bun 直連、無隧道、額度已重置）：無工具表 429（探針早期版連官方工具也沒帶，已修正為恆帶 13 官方工具）／可讀改名 429／**摘要改名 200** |
+| 🟢 5 | 回饋 oc2api | oc2api 已 EOL，無回饋對象；兩項（tool_choice 閘控、64 字元截斷）本專案本來就有 |
+
+另加（I.2 情報吸收）：**`FreeTierError` → `free_tier_error` 獨立分類** + 測試（403 帶標記 vs 裸 403 對照）。
+
+### I.4 隧道（附錄 G）的最終定位
+
+dsh-providers-hub 的矩陣與本專案 §6.2 原始結論一致：**閘門認 Bun 的 ClientHello**。
+本專案跑在 Bun 下 ⇒ 原生 `fetch` 即過傳輸閘，**不需要隧道**；uTLS 隧道（`utls-tunnel/`，
+Bun 形狀 ClientHello）保留為 **Node 部署的逃生口**（該插件用 wreq-js 解同一問題，
+我們用 Go uTLS——兩者等價）。附錄 G「Bun 必被拒」的因果錯誤已在 H.4 修正，
+本輪實測進一步確認：Bun 直連 + 正確形狀 = 200（8962ms 串流）。
+
+### I.5 本輪真機驗證彙總（2026-11-06 11:23–11:45 +08:00，額度重置後）
+
+| 驗證 | 結果 |
+|------|------|
+| `probe_bun_direct_shape.mjs`：摘要改名 ×4 → 上游直連 | ✅ 200 串流 |
+| 同 probe：可讀改名 ×4 | ❌ 429（H.3 重現） |
+| 代理端到端（Bun、無隧道）：sync + 客戶端工具（摘要改名） | ✅ 200「E2E OK」 |
+| 代理端到端：stream + 客戶端工具 | ✅ 200 串流 |
+| 代理端到端：無客戶端工具 | ✅ 200 |
+| 代理端到端（修復後最終版）：sync + `ReportFindings` | ✅ 200「FINAL OK」 |
+| 測試套件 | **64 pass / 0 fail**（+1：FreeTierError 分類） |
+
+### I.6 遺留觀察（不阻塞，記錄備查）
+
+1. dsh-providers-hub 的 `dsh_<可讀>` 別名 200 與 H.3 的 `oc2api_<可讀>` 429 並存，
+   提示詞彙閘門可能有前綴/詞彙黑名單（`oc2api` 是知名免費層代理，被針對合理）。
+   未來若摘要式也被拒，可測 `dsh_` 前綴作為備援。
+2. 該插件的 `accept: text/event-stream` 明寫；本專案不送（fetch 自動補 `*/*`）——
+   兩形態皆過閘，維持現狀。
+3. `max_tokens`（該插件）與 `max_completion_tokens`（本專案/oc2api/官方）皆 200——
+   該端點兩欄位都收；維持官方形態 `max_completion_tokens`。

@@ -335,12 +335,16 @@ function zenSessionId() {
 }
 
 // ── Client-tool renames (oc2api parity) ────────────────────────────
-// Client tools go upstream renamed with an oc2api_ prefix so they can never
-// collide with the always-present official tools (an opencode CLI client
-// declares read/grep/edit/... — the same names). Responses restore the
-// original names and drop calls the client cannot execute (official tools
-// the model picked on its own).
-const UNSAFE_TOOL_CHARS = /[^A-Za-z0-9_-]/g;
+// Client tools go upstream renamed with an opaque `oc2api_<sha256[:12]>`
+// digest (oc2api shape.Renames parity). The rename must be a DIGEST, not a
+// readable `oc2api_<name>` — the free tier fingerprints the request body and
+// rejects any tool table that still carries recognizable client vocabulary
+// with the same 429 FreeUsageLimitError as a spent quota (Appendix H.3:
+// same second, same IP — readable rename → 429, digest rename → 200). Not a
+// single character of the original name may appear in the body.
+// Responses restore the original names and drop calls the client cannot
+// execute (official tools the model picked on its own).
+const TOOL_DIGEST_LEN = 12; // oc2api clientToolDigestLength
 function newRenames() {
   return { forward: new Map(), reverse: new Map() };
 }
@@ -348,7 +352,7 @@ function renameTool(renames, name) {
   if (!name) return name;
   const mapped = renames.forward.get(name);
   if (mapped) return mapped;
-  let base = TOOL_PREFIX + name.replace(UNSAFE_TOOL_CHARS, "_");
+  let base = TOOL_PREFIX + crypto.createHash("sha256").update(name).digest("hex").slice(0, TOOL_DIGEST_LEN);
   if (base.length > 64) base = base.slice(0, 64);
   let candidate = base;
   for (let i = 2; renames.reverse.has(candidate); i++) candidate = `${base}_${i}`;
@@ -669,6 +673,14 @@ const CONTENT_POLICY_CODES = new Set([
 const AUTH_ERROR_CODES = new Set([
   "authentication_error", "permission_error", "permission_denied", "api_key_invalid",
 ]);
+// FreeTierError = the free lane's PROTOCOL-shape gate rejection, observed as
+// HTTP 403 by dsh-providers-hub (2026-10-02, real traffic). Distinct from the
+// quota 429s: it fires when the request shape fails V2 validation (session
+// algorithm, affinity headers, tool descriptions/schema) — changing the API
+// key or egress IP does NOT help, which is exactly why it must not be
+// classified as `authentication_error` (that sends users to rotate keys).
+// The body type name is the only stable signal; classify before auth.
+const FREE_TIER_GATE_RE = /\bFreeTierError\b/;
 // Upstream rate-limit headers worth relaying so clients can pace themselves.
 const RATE_LIMIT_HEADER_RE = /^(?:x-ratelimit-|ratelimit-|retry-after)/i;
 
@@ -708,24 +720,36 @@ function upstreamErrorPayload(status, raw, headers) {
   const p = parseUpstreamError(raw);
   const quota = isQuotaError(status, raw, p);
   const contentPolicy = CONTENT_POLICY_CODES.has(p.code);
+  const freeTierGate = FREE_TIER_GATE_RE.test(String(raw || "")) || p.code === "freetiererror";
   const limited = quota || status === 429 || /\brate limit\b|quota/i.test(p.msg);
   let type = "upstream_error";
   let outStatus = status >= 400 ? status : 502;
-  // Order mirrors official classifyProviderFailure (provider-error.ts:225-258):
-  // content policy → quota → auth → rate limit → everything else.
+  // Order mirrors official classifyProviderFailure (provider-error.ts:225-258)
+  // plus dsh-providers-hub's measured FreeTierError priority (body type name
+  // before status code, before auth): content policy → quota → free-tier gate
+  // → auth → rate limit → everything else.
   if (contentPolicy) {
     type = "content_policy_error";
     if (outStatus === 502) outStatus = 400;
   } else if (quota) {
     type = "rate_limit_error";
     outStatus = 429;
+  } else if (freeTierGate) {
+    type = "free_tier_error";
+    if (outStatus === 502) outStatus = 403;
   } else if (status === 401 || status === 403 || AUTH_ERROR_CODES.has(p.code)) {
     type = "authentication_error";
   } else if (status === 429) type = "rate_limit_error";
   else if (status === 404) type = "not_found_error";
   else if (status === 400) type = "invalid_request_error";
-  const message = limited ? `${p.msg} (free model rate limit)` : p.msg;
-  const error = { message, type, code: limited ? "rate_limit_exceeded" : "upstream_error" };
+  const message = freeTierGate
+    ? `${p.msg} (free-tier protocol gate rejected the request shape; changing the API key or egress IP will not help — check session/headers/tool schema)`
+    : limited ? `${p.msg} (free model rate limit)` : p.msg;
+  const error = {
+    message,
+    type,
+    code: freeTierGate ? "free_tier_gate" : limited ? "rate_limit_exceeded" : "upstream_error",
+  };
   // Official client reads retry-after-ms first, then retry-after; oc2api passes
   // Retry-After through to the client. Preserve both for the caller to emit.
   const retryAfter = headers?.get?.("retry-after-ms") || headers?.get?.("retry-after") || "";
@@ -924,9 +948,14 @@ function mergeUpstreamModels(list) {
 
 async function fetchUpstreamModels() {
   try {
+    // Fixed `Bearer public` (oc2api client.go:180 parity). The models endpoint
+    // is not session-gated and needs no Console key; sending one here would
+    // leak `oc_sk_*` to a non-inference endpoint for no benefit. Note zenKey()
+    // is deliberately NOT used: with no model argument it would return the
+    // Console key when oc-keys.json exists.
     const res = await fetch(zenUrl(ZEN_MODELS_PATH), {
       method: "GET",
-      headers: { "Accept": "application/json", "Authorization": `Bearer ${zenKey()}`, "User-Agent": OC_UA },
+      headers: { "Accept": "application/json", "Authorization": "Bearer public", "User-Agent": OC_UA },
       signal: AbortSignal.timeout(15000),
     });
     const json = await res.json();

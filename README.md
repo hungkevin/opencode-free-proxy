@@ -25,7 +25,9 @@ Done. Server is at `http://localhost:6446`. API keys are in `api-keys.json` (aut
 > `429 FreeUsageLimitError` no matter what the request contains. Bun's TLS
 > hello is what OpenCode itself uses, so running the server under Bun passes.
 > If you start it with `node server.mjs` anyway, the proxy prints a warning
-> and every upstream call fails with a rate-limit error.
+> and every upstream call fails with a rate-limit error — unless you set
+> `ZEN_TUNNEL_URL` to the bundled uTLS tunnel, which speaks the accepted
+> Bun-shaped handshake on Node's behalf.
 
 ## What you get
 
@@ -238,7 +240,7 @@ sudo systemctl enable --now opencode-proxy
 | `RETRY_429_HARD_LIMIT_MS` | `300000` | A 429 whose `Retry-After` exceeds this (5 min) is a spent daily quota — fail fast instead of sleeping through pointless retries |
 | `RETRY_429_BASE_MS` | `2000` | Exponential backoff base for 429 retries |
 | `RETRY_429_CAP_MS` | `30000` | Max wait per single 429 retry |
-| `ZEN_TUNNEL_URL` | unset | **TLS fingerprint escape hatch.** The free tier fingerprints the TLS ClientHello. Neither Bun nor Node can customise the ClientHello, so the proxy can relay upstream requests through a local uTLS tunnel (`utls-tunnel/`) that performs the accepted handshake. Set `ZEN_TUNNEL_URL=http://127.0.0.1:8899` to enable it. See `utls-tunnel/` for the standalone Go binary. |
+| `ZEN_TUNNEL_URL` | unset | **TLS escape hatch for Node deployments.** The free tier's transport gate accepts Bun's BoringSSL ClientHello and rejects Node/OpenSSL (differential-verified; running this proxy under **Bun needs no tunnel** — native `fetch` already carries the accepted fingerprint). If you must run under Node.js, relay upstream requests through the bundled uTLS tunnel (`utls-tunnel/`), which performs the accepted Bun-shaped handshake: build it (`cd utls-tunnel && go build -o utls-tunnel.exe .`), run `utls-tunnel.exe -listen 127.0.0.1:8899`, and set `ZEN_TUNNEL_URL=http://127.0.0.1:8899`. |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 
@@ -328,10 +330,12 @@ Your tool (Cursor, CLI, curl, etc.)
 The proxy adds the `x-opencode-*` authentication headers the API requires and
 shapes every request to look exactly like the official OpenCode client
 (official system prompt + official tool set + `max_completion_tokens`).
-Client-declared tools ride along renamed with an `oc2api_` prefix so they can
-never collide with the built-in tools; on the way back the proxy restores the
-original names and silently drops any built-in tool the model picked on its
-own (the client has no way to execute those).
+Client-declared tools ride along renamed with an **opaque digest**
+`oc2api_<sha256(name)[:12]>` (oc2api `shape.Renames` parity) so they can never
+collide with the built-in tools and no readable client vocabulary leaks into
+the tool table; on the way back the proxy restores the original names and
+silently drops any built-in tool the model picked on its own (the client has
+no way to execute those).
 
 ### The two-layer free-tier gate (429 `FreeUsageLimitError`)
 
@@ -379,11 +383,16 @@ the old shape fails. The request must mirror the official client (the working
   appended after it
 - the 13 official OpenCode tools (`oc-tools.json` — including `patch`, missing
   one is a 429; descriptions replaced with a "do not call" marker) always
-  present, plus renamed client tools
+  present, plus client tools renamed to an opaque digest `oc2api_<sha256[:12]>`
+  — a readable `oc2api_<name>` rename **is a 429 trigger** (verified 2026-11-05
+  with a same-second differential: readable → 429, digest → 200; see
+  `free_model.md` Appendix H.3)
 - always `stream: true` + `stream_options.include_usage` — sync client
   requests are aggregated back into one JSON object locally
 - `max_completion_tokens` (never `max_tokens`), sampling params forwarded via
   a whitelist (`FORWARD_PARAMS=0` to drop), no `stop`/`seed`
+- a `403 FreeTierError` body (shape-gate rejection, distinct from quota) is
+  surfaced as `free_tier_error`, not `authentication_error`
 
 ### Upstream request headers (for the curious)
 
