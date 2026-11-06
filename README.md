@@ -430,6 +430,19 @@ metered traffic — rotation multiplies the provider bill. Bun's per-request
 `proxy` option is verified working (`review/probe_bun_fetch_proxy.mjs`);
 under Node the option is ignored (one more reason to run Bun).
 
+**What the logs show** (all egress lines carry the host only, never
+credentials):
+
+| Line | Level | Meaning |
+|------|-------|---------|
+| `[EGRESS] pool on: 2 lane(s) — a:1338 (static), b:1338 (sticky-session)` | boot | Roster at startup |
+| `[EGRESS] a:1338 serving OAI admin <model>` | info | One per upstream attempt — which lane served it |
+| `[EGRESS MINT] b:1338 new sticky session …9tQz (ttl 1800s)` | debug | Fresh session token minted (fingerprint only) |
+| `[EGRESS SWAP] a:1338 spent its free quota (resets in ~600 min) — failing over (1/2 lane(s) healthy)` | warn | Hard-quota 429 → lane retired, failover |
+| `[EGRESS RECOVER] a:1338 back in rotation (quota window reset)` | info | Spent horizon lapsed (UTC midnight) |
+| `[ZEN 429 DAILY QUOTA] a:1338 was the last healthy lane (0/2 healthy) …` | error | Pool exhausted, surfaced 429 |
+| `[EGRESS] all 2 lane(s) spent … answering 429 without an upstream call` | error | Request arrived with nothing healthy |
+
 ### Upstream request headers (for the curious)
 
 ```

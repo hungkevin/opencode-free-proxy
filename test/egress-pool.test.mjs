@@ -55,13 +55,14 @@ function script(steps) {
   setZenFetchImpl((zenOpts) => {
     const step = steps[Math.min(calls, steps.length - 1)];
     calls++;
-    seen.push({ proxy: zenOpts.__egress?.proxy ?? null, step });
+    seen.push({ proxy: zenOpts.__egress?.proxy ?? null, tag: zenOpts._tag, step });
     return Promise.resolve(fakeResponse(step));
   });
   return {
     seen,
     calls: () => calls,
     proxies: () => seen.map((s) => s.proxy),
+    tags: () => seen.map((s) => s.tag),
   };
 }
 
@@ -85,14 +86,36 @@ test("hard-quota 429 retires the lane and fails over once — second lane answer
   configureEgress("http://u1:p1@lane-a:1338,http://u2:p2@lane-b:1338");
   try {
     const run = script([HARD_429(12), OK]);
-    const res = await zenFetchWithRetry({ headers: {} }, "{}", new AbortController());
+    const res = await zenFetchWithRetry({ headers: {}, _tag: "openai" }, "{}", new AbortController());
     assert.equal(res.status, 200);
     assert.equal(run.calls(), 2, "exactly one lane-swap retry");
     assert.notEqual(run.proxies()[1], run.proxies()[0]);
+    // Per-request lane visibility comes from the [EGRESS] log line, not the
+    // REQ DONE tag — the tag must stay exactly what the caller set.
+    assert.equal(run.tags()[0], "openai");
+    assert.equal(run.tags()[1], "openai");
     assert.ok(egressHasHealthy(), "lane B still healthy");
   } finally {
     configureEgress("");
     setZenFetchImpl(null);
+  }
+});
+
+test("static lane recovery: after the spent horizon lapses the lane is picked again and unflagged", async () => {
+  configureEgress("http://u1:p1@lane-a:1338");
+  try {
+    const mint = egressPick();
+    egressMarkSpent(mint, 1100); // spentUntil = now + 1.1s (still before midnight)
+    assert.equal(egressHasHealthy(), false);
+    assert.equal(egressPick(), null, "parked lane is skipped");
+    await new Promise((r) => setTimeout(r, 1300));
+    assert.equal(egressHasHealthy(), true, "horizon lapsed → healthy again");
+    const back = egressPick();
+    assert.ok(back, "lane re-picked after recovery");
+    assert.equal(back.lane.spentFlag, false, "RECOVER transition consumed");
+    assert.equal(back.lane.host, "lane-a:1338");
+  } finally {
+    configureEgress("");
   }
 });
 

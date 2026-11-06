@@ -528,6 +528,14 @@ function mintLane(lane) {
     for (let i = 0; i < EGRESS_SESSION_LEN; i++) token += EGRESS_TOKEN_CHARS[rnd[i] % EGRESS_TOKEN_CHARS.length];
     mint.proxy = lane.template.replaceAll("{session}", token);
     mint.expiresAt = Date.now() + EGRESS_SESSION_TTL_MS;
+    // Fingerprint only (last 4 chars) — the token rides a URL that also
+    // carries credentials, so the full string never reaches a log line.
+    log(
+      "debug",
+      `[EGRESS MINT] ${lane.host} new sticky session …${token.slice(-4)} (ttl ${EGRESS_SESSION_TTL_MS / 1000}s)`,
+    );
+  } else {
+    log("debug", `[EGRESS MINT] ${lane.host} (static lane in use)`);
   }
   return mint;
 }
@@ -542,6 +550,11 @@ function egressPick() {
     const lane = egress.lanes[egress.cursor % n];
     egress.cursor++;
     if (lane.spentUntil > now) continue;
+    // A parked static lane just came back (quota window reset) — say so once.
+    if (lane.spentFlag) {
+      lane.spentFlag = false;
+      log("info", `[EGRESS RECOVER] ${lane.host} back in rotation (quota window reset)`);
+    }
     if (!lane.current || lane.current.expiresAt <= now) lane.current = mintLane(lane);
     return lane.current;
   }
@@ -565,6 +578,7 @@ function egressMarkSpent(mint, retryAfterMs) {
         ? Math.min(Date.now() + retryAfterMs, nextUtcMidnight())
         : nextUtcMidnight();
     lane.spentUntil = horizon;
+    lane.spentFlag = true; // the RECOVER log fires when pick() takes it back
   }
 }
 
@@ -660,6 +674,7 @@ async function zenFetchWithRetry(zenOpts, body, controller) {
   let jitter403Used = 0;
   let swappedEgress = false;
   let lastRes = null;
+  const baseTag = zenOpts._tag || "??"; // lane suffix is re-attached per attempt
   for (let attempt = 0; ; attempt++) {
     if (egress.lanes) {
       const mint = egressPick();
@@ -684,6 +699,10 @@ async function zenFetchWithRetry(zenOpts, body, controller) {
         );
       }
       zenOpts.__egress = mint;
+      // Per-request lane visibility: one line per upstream attempt, pool on
+      // only. (The REQ DONE tags are snapshotted before the fetch, so the
+      // lane is announced here rather than appended to _tag.)
+      log("info", `[EGRESS] ${mint.lane.host} serving ${baseTag}`);
     }
     const res = await zenFetchImpl(zenOpts, body, controller);
     lastRes = res;
@@ -732,18 +751,20 @@ async function zenFetchWithRetry(zenOpts, body, controller) {
       // Egress pool: a hard-quota 429 is the per-IP quota signal — retire the
       // lane that served it and fail over ONCE to the next healthy lane.
       if (egress.lanes) {
+        const retiredHost = zenOpts.__egress?.lane?.host || "?";
         egressMarkSpent(zenOpts.__egress, retryAfterMs);
+        const healthy = egress.lanes.filter((l) => l.spentUntil <= Date.now()).length;
         if (!swappedEgress && egressHasHealthy()) {
           swappedEgress = true;
           log(
             "warn",
-            `[EGRESS SWAP] lane spent its free quota (resets in ~${mins} min) — failing over to the next lane`,
+            `[EGRESS SWAP] ${retiredHost} spent its free quota (resets in ~${mins} min) — failing over (${healthy}/${egress.lanes.length} lane(s) healthy)`,
           );
           continue;
         }
         log(
           "error",
-          `[ZEN 429 DAILY QUOTA] every egress lane is spent; resets in ~${mins} min — not retrying`,
+          `[ZEN 429 DAILY QUOTA] ${retiredHost} was the last healthy lane (0/${egress.lanes.length} healthy); resets in ~${mins} min — not retrying`,
         );
         return res;
       }
