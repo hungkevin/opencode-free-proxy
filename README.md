@@ -25,9 +25,9 @@ Done. Server is at `http://localhost:6446`. API keys are in `api-keys.json` (aut
 > `429 FreeUsageLimitError` no matter what the request contains. Bun's TLS
 > hello is what OpenCode itself uses, so running the server under Bun passes.
 > If you start it with `node server.mjs` anyway, the proxy prints a warning
-> and every upstream call fails with a rate-limit error — unless you set
-> `ZEN_TUNNEL_URL` to the bundled uTLS tunnel, which speaks the accepted
-> Bun-shaped handshake on Node's behalf.
+> and every upstream call fails with a rate-limit error. (A uTLS relay escape
+> hatch existed until 2026-11-06 and can be restored from git history if a
+> Node deployment is ever required.)
 
 ## What you get
 
@@ -240,7 +240,6 @@ sudo systemctl enable --now opencode-proxy
 | `RETRY_429_HARD_LIMIT_MS` | `300000` | A 429 whose `Retry-After` exceeds this (5 min) is a spent daily quota — fail fast instead of sleeping through pointless retries |
 | `RETRY_429_BASE_MS` | `2000` | Exponential backoff base for 429 retries |
 | `RETRY_429_CAP_MS` | `30000` | Max wait per single 429 retry |
-| `ZEN_TUNNEL_URL` | unset | **TLS escape hatch for Node deployments.** The free tier's transport gate accepts Bun's BoringSSL ClientHello and rejects Node/OpenSSL (differential-verified; running this proxy under **Bun needs no tunnel** — native `fetch` already carries the accepted fingerprint). If you must run under Node.js, relay upstream requests through the bundled uTLS tunnel (`utls-tunnel/`), which performs the accepted Bun-shaped handshake: build it (`cd utls-tunnel && go build -o utls-tunnel.exe .`), run `utls-tunnel.exe -listen 127.0.0.1:8899`, and set `ZEN_TUNNEL_URL=http://127.0.0.1:8899`. |
 | `LOG_LEVEL` | `info` | Console log level: `debug`/`info`/`warn`/`error`/`silent`. Requests=`info`, aborts/degrades=`warn`, upstream failures=`error` |
 | `MASK_KEYS` | unset | Set `1` (or `true`) to mask API keys in the startup banner (`oc-5921c9…e3b5`); default prints them in full |
 

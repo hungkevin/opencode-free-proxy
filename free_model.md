@@ -1085,3 +1085,12 @@ Bun 形狀 ClientHello）保留為 **Node 部署的逃生口**（該插件用 wr
    兩形態皆過閘，維持現狀。
 3. `max_tokens`（該插件）與 `max_completion_tokens`（本專案/oc2api/官方）皆 200——
    該端點兩欄位都收；維持官方形態 `max_completion_tokens`。
+
+### I.7 後記：uTLS 隧道移除 (2026-11-06)
+
+使用者裁決：代理採 **Bun-only** 足跡，`utls-tunnel/`（Go 源碼）已從倉庫刪除，
+`ZEN_TUNNEL_URL` 接入點亦從 `server.mjs` 移除。依據即本附錄 I.4 的定位——
+Bun 原生 `fetch` 已攜帶被接受的 ClientHello，隧道僅對 Node 部署有價值，而本專案
+不承諾 Node 部署。附錄 G 的實驗數據與 I.2 的交叉驗證**仍為有效歷史記錄**
+（若日後需要 Node 部署，可從 git 歷史（`3e3461d`）取回隧道源碼，或改用
+dsh-providers-hub 的 wreq-js 方案）。

@@ -8,7 +8,7 @@ oc-keys.json
 .gocache/
 .gopath/
 .tmp-gotest/
-utls-tunnel/utls-tunnel.exe
+utls-tunnel/
 
 review/*.mjs
 !review/probe_tls_fingerprint_node.mjs
