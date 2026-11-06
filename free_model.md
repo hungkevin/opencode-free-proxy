@@ -4,7 +4,7 @@
 > - 註冊表:`https://models.opencode.ai/api.json` → `["opencode"].models`(官方客戶端同一來源)
 > - 線上端點:`https://opencode.ai/inference/v1`(實際服務,`Bearer public` 免認證;
 >   舊 `/zen/v1` 端點已於 2026-10 停用,見 §6)
-> 最後更新:**2026-11-06(v0.19.1 / 附錄 K;下方「現況速查」為唯一有效錨點)**
+> 最後更新:**2026-11-07(v0.19.1 + server.mjs 審查修復 / 附錄 L.5;下方「現況速查」為唯一有效錨點)**
 
 ---
 
@@ -15,7 +15,7 @@
 
 | 面向 | 目前有效結論 | 依據 |
 |------|-------------|------|
-| 版本 / 測試 | **v0.19.1**;測試 **76 pass / 0 fail**(`bun test`) | `package.json`、`8457147` |
+| 版本 / 測試 | **v0.19.1 + 2026-11-07 審查修復**;測試 **87 pass / 0 fail**(`bun test`,13 檔) | `package.json`、`8457147`、附錄 L.5 |
 | 端點 | `POST /inference/v1/chat/completions`(兩 proxy);官方源碼為 `/inference/openai/v1`(別名並存,維持不變) | 附錄 E、J.4 |
 | 傳輸 | **Bun 原生 `fetch` 即過 TLS 閘**;uTLS 隧道與 `ZEN_TUNNEL_URL` 已移除(Bun-only 足跡) | 附錄 H.4 / I.4 / I.7 |
 | 認證 | 免費模型 `Bearer public`;models 抓取亦固定 `Bearer public` | 附錄 D A1 / H.2 / I.3 |
@@ -1407,10 +1407,37 @@ SWAP 帶健全數**。全套 **76 pass / 0 fail**（`bun test`,2026-11-06 實測
 | UA 版本下限 1.18 / `x-opencode-request` 毒藥 / 請求體禁 gzip / session 降序時間校驗 | 記於 M.3,列為待自家重驗(與 jcleng 的「時間戳不驗」矛盾) |
 | 附錄 K 的 egress pool vs 12errh「刻意不輪換 caller IP」、azrinaldi 動態派生 recipe | 記於 M.3 衝突表與 M.4 🟢4/🟢5/🟢8,未實作 |
 
+### L.5 2026-11-07 server.mjs 審查修復（87 pass / 0 fail）
+
+> 對 `server.mjs`(3925 行) 做完整審查(自行逐段 + 三個分區獨立審查),修復 11 項;
+> 全部以**離線 fixture / 假上游**驗證,未消耗免費額度。新增 `test/audit-fixes.test.mjs`(11 條),
+> 並更新 `test/review-fixes.test.mjs` 的 Retry-After 斷言(#3 修正後舊斷言即為錯誤行為)。
+
+| # | 級 | 問題 | 修復 | 驗證 |
+|---|---|------|------|------|
+| 1 | 🔴 | `createChatStreamRewriter.feed("[DONE]")` 直接丟棄 `buffered`,連同裡面的 `content`/`finish_reason` → 客戶端只收到 `[DONE]`(空答案) | 抽出 `flushBuffered()`,`[DONE]` 與「name 到達」時都先 flush;`rewrite()` 只丟「name 未到」的 tool_call,其餘幀保留 | `audit-fixes` #1 兩條(含同幀 content+args) |
+| 2 | 🔴 | Anthropic reasoning-cap 檢查在 `textOpen`/`sawToolDelta` 設定**之前**;同幀帶 reasoning+content 時誤觸 `max_tokens` 並吞掉最終答案 | 檢查前先算 `hasProgressThisFrame`,並把它納入 cap 條件 | `audit-fixes` #2(REASONING_CAP=1 假上游) |
+| 3 | 🔴 | `retry-after-ms` 的**毫秒值**被寫入秒制 `Retry-After`,且覆蓋 `relayRateLimitHeaders` 已轉發的正確秒值(500ms → 等 500 秒) | `upstreamErrorPayload` 只在上游**完全沒給** `retry-after` 時,把 ms 轉成秒(`ceil`)後才回傳;其餘交給 relay | `audit-fixes` #3 + `review-fixes` 更新(含 `sendUpstreamError` 整合斷言) |
+| 4 | 🟠 | 200 SSE 中段插入 `data: {"error":...}` 時,`aggregateChatSSE` 先成功 → 回傳截斷的 200 成功 | `coerceChatSyncBody`/`coerceResponsesSyncBody` 改為**先** `sseErrorPayload` 再聚合 | `audit-fixes` #4 三條(含乾淨 SSE 不回歸) |
+| 5 | 🟠 | 429 重試只 `res.clone().text()`,原 `res` body 未 drain → 每次退避留一條 undici tee 分支(403 路徑已有 drain) | 退避前 `await res.arrayBuffer()` | 既有 `retry-429` 測試 + 人工核對 |
+| 6 | 🟠 | Anthropic `if (!delta) continue` 擋掉整圈,連無 delta 的 `finish_reason:"length"` 尾幀也被跳過 → 被合成 `end_turn` | delta 閘之前先處理「無 delta 但有 finish_reason」的終端幀 | `audit-fixes` #6(假上游) |
+| 7 | 🟠 | `anthropicToOpenAI` 的 `tool_result` 分支丟棄同訊息的兄弟 `text` 區塊 | 額外 push 一則 `role:"user"` 保留該文字 | `audit-fixes` #7 |
+| 8 | 🟠 | 全域 body-parser error handler 固定回 OpenAI envelope;`/v1/messages` 壞 JSON 收到錯形狀,413 落到 Express HTML 500 | 依 `req.path` 分形狀(Anthropic vs OpenAI),並處理 `entity.too.large` → 413 JSON | `audit-fixes` #8 |
+| 9 | 🟠 | SIGTERM 時 `server.close()` 等不到進行中的 SSE,10s 後 force `exit(1)` → 正常關機被當 crash | 加 `closeIdleConnections()`;force 分支改 `exit(0)`(降級關機非崩潰) | 人工核對(關機路徑無離線測試) |
+| 10 | 🟠 | `userSessions` 以客戶端可控 header 為 key,只有時間 sweep、無數量上限 → 每請求換 id 可無限累積 | 新增 `SESSION_MAX_ENTRIES=4096`,滿時先清過期、再逐出最舊 | 既有 `session.test.mjs` 不回歸 |
+| 11 | 🟠 | 只重命名 `tools` 陣列,`messages` 歷史的 `tool_calls[].function.name` 仍是原名(工具表已改 digest) → 歷史參照不到 + 原詞彙進 body | `buildZenChatBody` 用 `rewrittenRest` 一併 rename 歷史的 assistant.tool_calls 與 legacy tool.name(不原地改 req.body) | `audit-fixes` #11(斷言 body 無 `get_weather`) |
+
+**刻意不修(記錄)**:啟動橫幅預設印出完整 API key(使用者明確要求,附錄 D R2)、`/health` 無 auth(probe-friendly)、`renameTool` 對非字串 name 會 throw(兩條路由的 validator 已擋,僅 responses 落到 502)、`attempt` 計數被 403-jitter/egress-swap 共用(K.6-4 已記錄)、`applyRegistry` 不清 `MODEL_META`(目前無 refresh 機制)。
+
+**低優先未修(列入 L.4)**:三處無上限緩衝(`buffered`/`pendingArgs`/`errChunks`)、`terminalSeen` 對 raw TCP chunk 做 regex、無換行尾幀、`responsesSSEParser` 的 `catch {}`、`/v1/responses` 原生路徑無 tool-call 過濾(休眠路徑)。
+
 ### L.4 仍待處理（不阻塞,記錄備查）
 
 1. **H.3 嚴謹差分**：固定字串長度 + 交錯重複 + 反序 + 記錄 `Retry-After`,以定稿
    「`oc2api_` 前綴黑名單」假說(目前修復已生效,純學術補強)。
+   **2026-11-07 補充**:L.5 #11 已把 `messages` 歷史的工具名一併摘要化,此後
+   「body 完全無原詞彙」的不變式才真正成立(此前多輪對話仍會漏)。重跑 H.3 時應
+   一併帶多輪 tool_calls 歷史。
 2. **重置時點單一來源**：待上游或 opencode UI 给出可重現證據,收斂 08:00/08:38。
 3. **外部專案情報時效**：附錄 J.1 各連結為 2026-10~11-06 自述快照,引用前宜重驗
    (J.4 已自註);可補「本專案最後複核日期」。
@@ -1509,6 +1536,7 @@ SWAP 帶健全數**。全套 **76 pass / 0 fail**（`bun test`,2026-11-06 實測
 | 🟢 7 | **ClientHello 基準校驗腳本**(比對 17 cipher / 12 extension 順序) | azrinaldi / opencode2api | 本專案曾做 `probe_tls_fingerprint_*`;可改為「啟動即校驗 bun 版本」防升級漂移 |
 | 🟢 8 | egress pool 補 **IP 探測 / 冷卻持久化 / `direct` 一等公民 / 冷卻倍數(429×4)** | azrinaldi / opencode2api | 附錄 K.6 已列「無 ip_probe」為已知限制;此為完整版藍圖 |
 | ⚪ 9 | 多來源 failover / LiteLLM 聚合 / CLI 委託 | FreeAIRouter / bansos / zengate | 與本專案「匿名 /inference 單通道」定位不同,列為結構性備援(呼應 J.1 四通道) |
+| ✅ 10 | **server.mjs 全檔審查修復 11 項**(靜默空答案、reasoning-cap 順序、Retry-After 單位、inline error、連線/關機/記憶體/歷史工具名) | 2026-11-07 本輪審查 | **已實作**,詳 **附錄 L.5**;87 pass / 0 fail |
 
 ### M.5 方法論小結
 

@@ -776,6 +776,10 @@ async function zenFetchWithRetry(zenOpts, body, controller) {
     }
     const wait = retryDelay(attempt, retryAfterMs);
     log("warn", `[ZEN 429 RETRY ${attempt + 1}/${RETRY_429_MAX}] upstream rate limit, waiting ${wait}ms`);
+    // Drain the original body before abandoning this Response. The 403-jitter
+    // path already does this ("socket closes instead of leaking"); without it
+    // every retried 429 leaves an undici tee branch open for the whole backoff.
+    try { await res.arrayBuffer(); } catch {}
     await sleep(wait);
     if (controller.signal.aborted) return res;
   }
@@ -1005,10 +1009,21 @@ function upstreamErrorPayload(status, raw, headers) {
     type,
     code: freeTierGate ? "free_tier_gate" : limited ? "rate_limit_exceeded" : "upstream_error",
   };
-  // Official client reads retry-after-ms first, then retry-after; oc2api passes
-  // Retry-After through to the client. Preserve both for the caller to emit.
-  const retryAfter = headers?.get?.("retry-after-ms") || headers?.get?.("retry-after") || "";
-  return { status: outStatus, error, retryAfter: String(retryAfter || "").trim() };
+  // Retry-After is a SECONDS-valued header (RFC 7231). The official client
+  // prefers retry-after-ms when *deciding how long to wait*, but that value
+  // must never be written into Retry-After verbatim: `relayRateLimitHeaders`
+  // already relays both upstream headers (including the correct seconds one),
+  // and overwriting it with a millisecond number would make clients wait 1000×
+  // too long. Only emit a Retry-After ourselves when the upstream supplied
+  // none — and then convert ms → seconds.
+  const raMs = headers?.get?.("retry-after-ms");
+  const raSec = headers?.get?.("retry-after");
+  let retryAfter = "";
+  if (!raSec && raMs !== null && raMs !== undefined && String(raMs).trim() !== "") {
+    const ms = Number(raMs);
+    if (Number.isFinite(ms) && ms >= 0) retryAfter = String(Math.ceil(ms / 1000));
+  }
+  return { status: outStatus, error, retryAfter };
 }
 // Emit a classified upstream error in OpenAI or Anthropic shape. `res` is the
 // Express response; `zenHeaders` is the upstream Response headers (or null).
@@ -1228,6 +1243,11 @@ async function fetchUpstreamModels() {
 // SESSION_TTL_MS bounds reuse; 0 disables it entirely (fresh id per request).
 const SESSION_TTL_MS = envInt("SESSION_TTL_MS", 1800000);
 const SESSION_JITTER_MS = 15 * 60 * 1000;
+// Hard cap: the session key is derived from a CLIENT-CONTROLLED header, so a
+// caller sending a fresh conversation id per request could otherwise grow this
+// object without bound for the whole TTL window. Sweep is time-based only;
+// this is the size bound (oldest entries evicted first).
+const SESSION_MAX_ENTRIES = 4096;
 const userSessions = {};
 function conversationHeader(req) {
   const h = req?.headers || {};
@@ -1246,6 +1266,16 @@ function getSession(user, req) {
     : `user:${user}`;
   const s = userSessions[keyUser];
   if (!s || SESSION_TTL_MS <= 0 || now - s.ts > s.ttl) {
+    if (!s) {
+      // Evict expired entries first, then (if still at cap) the oldest ones.
+      const keys = Object.keys(userSessions);
+      if (keys.length >= SESSION_MAX_ENTRIES) {
+        const expired = keys.filter((k) => now - userSessions[k].ts > (userSessions[k].ttl || SESSION_TTL_MS));
+        const pool = expired.length ? expired : keys;
+        pool.sort((a, b) => userSessions[a].ts - userSessions[b].ts);
+        for (const k of pool.slice(0, Math.max(1, keys.length - SESSION_MAX_ENTRIES + 1))) delete userSessions[k];
+      }
+    }
     const ttl = SESSION_TTL_MS + Math.floor(Math.random() * (SESSION_JITTER_MS + 1));
     userSessions[keyUser] = { id: zenSessionId(), ts: now, ttl };
   }
@@ -1319,6 +1349,29 @@ function buildZenChatBody(model, messages, clientTools, extra = {}) {
       tools.push({ type: "function", function: { ...fn, name: renameTool(renames, fn.name) } });
     }
   }
+  // Multi-turn history carries the ORIGINAL client tool names in
+  // assistant.tool_calls and (legacy) tool messages. The tool table above now
+  // holds only digest names, so rewrite those references to the same digests —
+  // otherwise the model sees a history call whose name it cannot find, and the
+  // raw client vocabulary leaks into the body (breaking the digest-only
+  // invariant the free-tier gate checks).
+  const rewrittenRest = rest.map((m) => {
+    if (!m || typeof m !== "object") return m;
+    let out = m;
+    if (Array.isArray(m.tool_calls)) {
+      out = {
+        ...out,
+        tool_calls: m.tool_calls.map((tc) =>
+          tc && typeof tc === "object" && tc.function && typeof tc.function.name === "string"
+            ? { ...tc, function: { ...tc.function, name: renameTool(renames, tc.function.name) } }
+            : tc),
+      };
+    }
+    if (out.role === "tool" && typeof out.name === "string") {
+      out = { ...out, name: renameTool(renames, out.name) };
+    }
+    return out;
+  });
 
   // Key order mirrors the official client: model, messages, tools, stream,
   // stream_options, max_completion_tokens. The official client DOES forward
@@ -1329,7 +1382,7 @@ function buildZenChatBody(model, messages, clientTools, extra = {}) {
   // set FORWARD_PARAMS=0 to restore the old degenerate behaviour.
   const body = {
     model,
-    messages: [{ role: "system", content: system }, ...rest],
+    messages: [{ role: "system", content: system }, ...rewrittenRest],
     tools,
     stream: true,
     stream_options: { include_usage: true },
@@ -1554,10 +1607,14 @@ function coerceChatSyncBody(raw) {
   if (t.startsWith("{")) {
     try { return { json: JSON.parse(raw) }; } catch { return {}; }
   }
+  // An inline error frame can appear AFTER a few normal choice frames (200
+  // with a mid-stream error). Check for it before accepting an aggregated
+  // success, or the client gets a truncated answer with a 200 status.
+  const err = sseErrorPayload(raw);
+  if (err) return { json: err };
   const data = aggregateChatSSE(raw);
   if (data) return { json: data };
-  const err = sseErrorPayload(raw);
-  return err ? { json: err } : {};
+  return {};
 }
 
 // Buffer → { json } (Responses object / error object) | {} when unusable.
@@ -1567,10 +1624,11 @@ function coerceResponsesSyncBody(raw) {
   if (t.startsWith("{")) {
     try { return { json: JSON.parse(raw) }; } catch { return {}; }
   }
+  const err = sseErrorPayload(raw);
+  if (err) return { json: err };
   const data = aggregateResponsesSSE(raw);
   if (data) return { json: data };
-  const err = sseErrorPayload(raw);
-  return err ? { json: err } : {};
+  return {};
 }
 
 // Post-aggregation pass (sync replies): restore renamed client tool names,
@@ -1658,10 +1716,25 @@ function createChatStreamRewriter(renames, onFrame) {
     return JSON.stringify(chunk);
   }
 
+  // Flush held frames. A frame was held only because SOME tool_call's name had
+  // not arrived yet; rewrite() drops exactly those unnamed calls (no decision
+  // → keep=false) while preserving the rest of the frame (content,
+  // finish_reason, already-decided calls). Clearing the buffer at [DONE] used
+  // to lose the final answer + finish_reason silently (client got only [DONE]).
+  function flushBuffered() {
+    if (!buffered.length) return;
+    const held = buffered;
+    buffered = [];
+    for (const b of held) {
+      const t = rewrite(b, true);
+      if (t) onFrame(t);
+    }
+  }
+
   return {
     feed(payload) {
       if (payload === "[DONE]") {
-        buffered = []; // calls whose name never arrived are dropped
+        flushBuffered();
         onFrame("[DONE]");
         return;
       }
@@ -1669,13 +1742,7 @@ function createChatStreamRewriter(renames, onFrame) {
         buffered.push(payload); // hold the whole frame until names are known
         return;
       }
-      if (buffered.length) {
-        for (const b of buffered) {
-          const t = rewrite(b, true);
-          if (t) onFrame(t);
-        }
-        buffered = [];
-      }
+      flushBuffered();
       const t = rewrite(payload, false);
       if (t) onFrame(t);
     },
@@ -2042,6 +2109,10 @@ function anthropicToOpenAI(body) {
             : Array.isArray(b.content) ? b.content.map(c => c.text || "").join("\n") : "";
           messages.push({ role: "tool", tool_call_id: b.tool_use_id, content: resultText });
         }
+        // A user message may mix tool_result blocks with sibling text
+        // ("here is the result — now do X"). Preserve that text as a user
+        // message instead of silently dropping it.
+        if (text) messages.push({ role: "user", content: text });
       } else {
         messages.push({ role: msg.role, content: text });
       }
@@ -2266,15 +2337,37 @@ async function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, rename
 
       let parsed;
       try { parsed = JSON.parse(payload); } catch { continue; }
-      const delta = parsed.choices?.[0]?.delta;
+      const ch0 = parsed.choices?.[0];
+      // A terminal frame may carry only finish_reason with NO delta. Handle it
+      // before the delta gate, otherwise length→max_tokens is lost and the
+      // end-of-pump fallback synthesizes a plain end_turn.
+      if (!ch0?.delta && ch0?.finish_reason && !finishHandled) {
+        finishHandled = true;
+        const fr = ch0.finish_reason;
+        let stopReason = "end_turn";
+        if (fr === "tool_calls") stopReason = anyKeptTool ? "tool_use" : "end_turn";
+        else if (fr === "length") stopReason = "max_tokens";
+        finishUp(stopReason, outputTokens);
+        log("info", `[REQ DONE ${TAG} +${Date.now() - t0}ms rx=${rxBytes}B stream]`);
+        continue;
+      }
+      const delta = ch0?.delta;
       if (!delta) continue;
+
+      // Progress in THIS frame must be known BEFORE the cap check: a single
+      // delta carrying both reasoning_content AND content (or tool_calls) is
+      // real progress even if accumulated reasoning just crossed the cap.
+      // (The chat path sets contentStarted/toolStarted before its check too.)
+      const hasProgressThisFrame = Boolean(delta.content) ||
+        (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0);
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) sawToolDelta = true;
 
       // Reasoning sniffer (Anthropic path): count reasoning tokens from any of
       // the upstream field names. Tool deltas count as progress too.
       const rt = reasoningText(delta);
       if (rt) {
         reasoningTokens += Math.ceil(rt.length / 4);
-        if (reasoningTokens > REASONING_CAP && !textOpen && !anyKeptTool && !sawToolDelta) {
+        if (reasoningTokens > REASONING_CAP && !hasProgressThisFrame && !textOpen && !anyKeptTool && !sawToolDelta) {
           log("warn", `[ZEN REASONING CAP] ${reasoningTokens} reasoning tokens, no content → force stop`);
           abortUpstream(controller, "reasoning cap force stop");
           selfStopped = true;
@@ -3715,13 +3808,19 @@ app.get("/health", (_req, res) => res.json({
   endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
 }));
 
-// P2.5: malformed JSON body → JSON 400 (not Express default HTML error page).
-// Must be registered after all routes.
-app.use((err, _req, res, _next) => {
-  if (err?.type === "entity.parse.failed" || (err instanceof SyntaxError && "body" in err)) {
-    return res.status(400).json({ error: { message: "Invalid JSON body", type: "invalid_request_error" } });
+// P2.5: body-parser errors → JSON in the CLIENT's shape (not Express's
+// default HTML error page). Must be registered after all routes.
+app.use((err, req, res, _next) => {
+  const parseFailed = err?.type === "entity.parse.failed" || (err instanceof SyntaxError && "body" in err);
+  const tooLarge = err?.type === "entity.too.large";
+  if (!parseFailed && !tooLarge) return _next(err);
+  const status = tooLarge ? 413 : 400;
+  const message = tooLarge ? "Request body too large" : "Invalid JSON body";
+  // /v1/messages speaks Anthropic; everything else speaks OpenAI.
+  if (req.path === "/v1/messages" || req.path.startsWith("/v1/messages/")) {
+    return res.status(status).json({ type: "error", error: { type: "invalid_request_error", message } });
   }
-  _next(err);
+  return res.status(status).json({ error: { message, type: "invalid_request_error" } });
 });
 
 // ── Startup model report ────────────────────────────────────────────
@@ -3809,10 +3908,16 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[SHUTDOWN] ${signal} received — closing server`);
+    // Idle keep-alive sockets must be proactively closed or server.close()
+    // never completes while they linger (Node <19 has no automatic idle reap).
+    server.closeIdleConnections?.();
     const force = setTimeout(() => {
-      console.error("[SHUTDOWN] forced after 10s");
+      // A forced close after a still-active SSE stream is a normal degraded
+      // shutdown for this proxy, not a crash — exit 0 so systemd/supervisors
+      // don't report a failure (and don't restart-loop on every SIGTERM).
+      console.error("[SHUTDOWN] forced after 10s (active stream did not drain)");
       server.closeAllConnections?.();
-      process.exit(1);
+      process.exit(0);
     }, 10000);
     force.unref?.();
     server.close(() => {

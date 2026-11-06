@@ -152,11 +152,39 @@ test("HTTP 429 / 402 map to rate_limit_error, other statuses keep their type", (
   assert.equal(upstreamErrorPayload(404, "missing", null).error.type, "not_found_error");
 });
 
-test("Retry-After (and retry-after-ms) are preserved for the client", () => {
+test("Retry-After is relayed verbatim; ms hints are converted to seconds, never clobbered", () => {
+  // 2026-11-07 audit #3: Retry-After is SECONDS (RFC 7231). relayRateLimitHeaders
+  // already forwards the upstream headers, so upstreamErrorPayload must NOT
+  // emit its own Retry-After when either header is present — otherwise it
+  // clobbers the correct value with a millisecond number.
   const h = new Headers({ "retry-after": "120" });
-  assert.equal(upstreamErrorPayload(429, "", h).retryAfter, "120");
-  const h2 = new Headers({ "retry-after-ms": "500" });
-  assert.equal(upstreamErrorPayload(429, "", h2).retryAfter, "500");
+  assert.equal(upstreamErrorPayload(429, "", h).retryAfter, "", "relay handles the seconds header");
+  const h2 = new Headers({ "retry-after-ms": "500", "retry-after": "60" });
+  assert.equal(upstreamErrorPayload(429, "", h2).retryAfter, "", "never clobber a correct Retry-After");
+  // Only when the upstream sends just a millisecond hint do we synthesize a
+  // seconds value — and it must be 1, not 500.
+  const h3 = new Headers({ "retry-after-ms": "500" });
+  assert.equal(upstreamErrorPayload(429, "", h3).retryAfter, "1");
+
+  // Integration: sendUpstreamError must actually put Retry-After: 120 on the
+  // response (relay path), and must not turn 500ms into 500 seconds.
+  const mkRes = () => {
+    const headers = {};
+    return {
+      headersSent: false,
+      setHeader(k, v) { headers[k.toLowerCase()] = v; },
+      status() { return this; },
+      json() { this.ended = true; return this; },
+      headers,
+      ended: false,
+    };
+  };
+  const r1 = mkRes();
+  sendUpstreamError(r1, 429, "", new Headers({ "retry-after": "120" }), "openai");
+  assert.equal(r1.headers["retry-after"], "120");
+  const r2 = mkRes();
+  sendUpstreamError(r2, 429, "", new Headers({ "retry-after-ms": "500", "retry-after": "60" }), "openai");
+  assert.equal(r2.headers["retry-after"], "60", "seconds header kept, not overwritten by 500");
 });
 
 // ── 429 retry: measured upstream behaviour is a rolling rate limit ──
