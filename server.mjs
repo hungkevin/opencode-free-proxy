@@ -127,7 +127,24 @@ function loadOcKeys() {
     ocKeys = [];
     freeUsesOcKey = false;
   }
-  if (ocKeys.length) console.log(`[OCKEYS] Loaded ${ocKeys.length} upstream key(s) from ${ocKeysFile}`);
+  if (ocKeys.length) {
+    console.log(`[OCKEYS] Loaded ${ocKeys.length} upstream key(s) from ${ocKeysFile}`);
+    // Determine whether Console keys will actually be used
+    if (freeUsesOcKey) {
+      console.log(`[OCKEYS] Using Console key(s) — ALL models (free + paid) send Console key authorization`);
+    } else {
+      console.log(`[OCKEYS] Using Console key(s) — paid models send Console key, free models send "public"`);
+    }
+    // Validate key format: expected oc_sk_* prefix
+    const invalidFormat = ocKeys.filter(k => !k.startsWith("oc_sk_"));
+    if (invalidFormat.length === 0) {
+      console.log(`[OCKEYS] Key format check: all ${ocKeys.length} key(s) have valid prefix (oc_sk_*)`);
+    } else {
+      console.log(`[OCKEYS] Key format check: ${invalidFormat.length}/${ocKeys.length} key(s) do NOT start with "oc_sk_" — may be rejected by upstream`);
+    }
+  } else {
+    console.log(`[OCKEYS] No Console key loaded — fallback to "public" token for all upstream requests`);
+  }
   if (freeUsesOcKey) console.log("[OCKEYS] FREE_USES_OC_KEY=1 — free-tier models send the Console key (official client sends public)");
 }
 
