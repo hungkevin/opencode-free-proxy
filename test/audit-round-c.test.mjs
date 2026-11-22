@@ -136,7 +136,7 @@ test("C5 zenResponsesRequest digest-renames client tools on the native path", ()
   );
   const parsed = JSON.parse(body);
   const digest = renames.forward.get("get_weather");
-  assert.ok(digest?.startsWith("oc2api_"));
+  assert.ok(digest?.startsWith("mcp_"));
   assert.ok(parsed.tools.some((t) => t.name === digest), "client tool renamed upstream");
   assert.ok(!body.includes("get_weather"), "raw name absent from body");
   assert.ok(parsed.tools.some((t) => t.name === "read"), "official marker set still present");

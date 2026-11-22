@@ -4,7 +4,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 
 // Digest rename (oc2api shape.Renames parity, Appendix H.3).
-const DIGEST = "oc2api_" + crypto.createHash("sha256").update("my.tool").digest("hex").slice(0, 12);
+const DIGEST = "mcp_" + crypto.createHash("sha256").update("my.tool").digest("hex").slice(0, 12);
 
 let fake;
 let proxy;

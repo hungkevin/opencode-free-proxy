@@ -8,8 +8,8 @@ import {
 } from "../server.mjs";
 
 // Digest rename (oc2api shape.Renames parity, Appendix H.3): the upstream name
-// is `oc2api_<sha256(name)[:12]>` — no readable client vocabulary may leak.
-const digestOf = (name) => "oc2api_" + crypto.createHash("sha256").update(name).digest("hex").slice(0, 12);
+// is `mcp_<sha256(name)[:12]>` — no readable client vocabulary may leak.
+const digestOf = (name) => "mcp_" + crypto.createHash("sha256").update(name).digest("hex").slice(0, 12);
 
 test("Spark request renames client tools and keeps official compat tools", () => {
   const { body, renames } = zenResponsesRequest(

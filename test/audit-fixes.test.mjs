@@ -113,7 +113,7 @@ test("#11 buildZenChatBody rewrites tool names in multi-turn history", () => {
   );
   const parsed = JSON.parse(body);
   const upstreamName = renames.forward.get("get_weather");
-  assert.ok(upstreamName?.startsWith("oc2api_"));
+  assert.ok(upstreamName?.startsWith("mcp_"));
   assert.equal(parsed.messages[2].tool_calls[0].function.name, upstreamName,
     "assistant tool_calls use the digest name");
   assert.equal(parsed.messages[3].name, upstreamName, "legacy tool message name uses digest");

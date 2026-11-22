@@ -411,9 +411,9 @@ test("buildZenChatBody forwards whitelisted params and rewrites tool_choice", ()
   const parsed = JSON.parse(body);
   assert.equal(parsed.temperature, 0.4);
   assert.equal(parsed.top_p, 0.9);
-  // Digest rename (Appendix H.3): oc2api_<sha256[:12]> — opaque, and the
+  // Digest rename (Appendix H.3): mcp_<sha256[:12]> — opaque, and the
   // readable client vocabulary must NOT leak into the tool table.
-  assert.match(parsed.tool_choice.function.name, /^oc2api_[0-9a-f]{12}$/);
+  assert.match(parsed.tool_choice.function.name, /^mcp_[0-9a-f]{12}$/);
   assert.ok(!parsed.tool_choice.function.name.includes("my_tool"), "readable rename leaked");
   assert.ok(parsed.tools.some((t) => t.function.name === parsed.tool_choice.function.name));
   assert.equal(parsed.stream, true);
@@ -469,7 +469,7 @@ test("Anthropic-shaped tool_choice is translated for the chat body", () => {
     tool_choice: { type: "tool", name: "my_tool" },
   }).body);
   assert.equal(named.tool_choice.type, "function");
-  assert.match(named.tool_choice.function.name, /^oc2api_[0-9a-f]{12}$/);
+  assert.match(named.tool_choice.function.name, /^mcp_[0-9a-f]{12}$/);
 
   // OpenAI-shaped input passes through unchanged in form.
   const oai = JSON.parse(buildZenChatBody("mimo-v2.6-flash-free", msgs, tools, {

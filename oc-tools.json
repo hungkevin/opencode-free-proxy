@@ -114,6 +114,27 @@
  {
   "type": "function",
   "function": {
+   "name": "patch",
+   "description": "Use the `patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:\n\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nWithin that envelope, you get a sequence of file operations.\nYou MUST include a header to specify the action you are taking.\nEach operation starts with one of three headers:\n\n*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).\n*** Delete File: <path> - remove an existing file. Nothing follows.\n*** Update File: <path> - patch an existing file in place (optionally with a rename).\n\nExample patch:\n\n```\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n```\n\nIt is important to remember:\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You must prefix new lines with `+` even when creating a new file\n",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "patchText": {
+      "type": "string",
+      "description": "The full patch text describing add, update, and delete operations"
+     }
+    },
+    "required": [
+     "patchText"
+    ],
+    "additionalProperties": false
+   },
+   "strict": false
+  }
+ },
+ {
+  "type": "function",
+  "function": {
    "name": "question",
    "description": "Use this tool when you need to ask the user questions during execution. This allows you to:\n1. Gather user preferences or requirements\n2. Clarify ambiguous instructions\n3. Get decisions on implementation choices as you work\n4. Offer choices to the user about what direction to take.\n\nUsage notes:\n- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers\n- Set `multiple: true` to allow selecting more than one option\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
    "parameters": {
@@ -125,12 +146,10 @@
        "type": "object",
        "properties": {
         "question": {
-         "type": "string",
-         "description": "Complete question"
+         "type": "string"
         },
         "header": {
-         "type": "string",
-         "description": "Very short label (max 30 chars)"
+         "type": "string"
         },
         "options": {
          "type": "array",
@@ -138,12 +157,10 @@
           "type": "object",
           "properties": {
            "label": {
-            "type": "string",
-            "description": "Display text (1-5 words, concise)"
+            "type": "string"
            },
            "description": {
-            "type": "string",
-            "description": "Explanation of choice"
+            "type": "string"
            }
           },
           "required": [
@@ -151,8 +168,7 @@
            "description"
           ],
           "additionalProperties": false
-         },
-         "description": "Available choices"
+         }
         },
         "multiple": {
          "type": "boolean"
@@ -212,7 +228,7 @@
   "type": "function",
   "function": {
    "name": "shell",
-   "description": "Execute a shell command and return its output. Commands run on macOS using zsh. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+   "description": "Execute a shell command and return its output. Commands run on ${OS} using ${shell}. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
    "parameters": {
     "type": "object",
     "properties": {
@@ -267,7 +283,7 @@
   "type": "function",
   "function": {
    "name": "subagent",
-   "description": "Spawns an agent in a child session to work on the specified task.\nThe output includes a sessionID you can pass back later to continue that specific conversation with the subagent.\nNew child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\nForeground (default) runs the subagent to completion and returns its final response.\nBackground mode (background=true) launches it asynchronously and returns immediately; you are notified when it finishes.\nUse background only for independent work that can run while you continue elsewhere.\n\nAvailable subagents:\n- explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. \"src/components/**/*.tsx\"), search code for keywords (eg. \"API endpoints\"), or answer questions about the codebase (eg. \"how do API endpoints work?\"). When calling this agent, specify the desired thoroughness level: \"quick\" for basic searches, \"medium\" for moderate exploration, or \"very thorough\" for comprehensive analysis across multiple locations and naming conventions.\n- general: General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.",
+   "description": "Spawns an agent in a child session to work on the specified task.\nThe output includes a sessionID you can pass back later to continue that specific conversation with the subagent.\nNew child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\nForeground (default) runs the subagent to completion and returns its final response.\nBackground mode (background=true) launches it asynchronously and returns immediately; you are notified when it finishes.\nUse background only for independent work that can run while you continue elsewhere.",
    "parameters": {
     "type": "object",
     "properties": {
@@ -285,12 +301,11 @@
      },
      "model": {
       "type": "string",
-      "description": "NEVER set this unless the user explicitly asks for a particular model or variant. The value is written as \"providerID/modelID\", or \"providerID/modelID#variant\" to include a variant. Do not guess the ID: look the model up with the models tool, filtering to your own provider first."
+      "description": "NEVER set this unless the user explicitly asks for a particular model or variant. It must be a chat model; image and decision models can't run subagents. The value is written as \"providerID/modelID\", or \"providerID/modelID#variant\" to include a variant. Do not guess the ID: look the model up with the models tool, filtering to your own provider first."
      },
      "sessionID": {
       "type": "string",
-      "pattern": "^ses",
-      "description": "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation."
+      "description": "Send a follow-up to an existing subagent, running or finished. Omit to start a new one."
      },
      "background": {
       "type": "boolean",
@@ -310,6 +325,50 @@
  {
   "type": "function",
   "function": {
+   "name": "todowrite",
+   "description": "Create and update a todo list for the current session. The user sees it as your working plan.\n\nUse it proactively when a task has 3 or more distinct steps, or when the user gives several tasks or asks for a todo list. Skip it for a single simple task or a purely conversational request. When in doubt, use it.\n\n- Send the full list on every call; it replaces the previous one.\n- Mark items `in_progress` when you start them and `completed` as soon as they're actually done.\n- Only call it when the list changes.\n",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "todos": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "content": {
+         "type": "string",
+         "description": "Brief description of the task"
+        },
+        "status": {
+         "enum": [
+          "pending",
+          "in_progress",
+          "completed",
+          "cancelled"
+         ],
+         "description": "Current status of the task: pending, in_progress, completed, cancelled"
+        }
+       },
+       "required": [
+        "content",
+        "status"
+       ],
+       "additionalProperties": false
+      },
+      "description": "The updated todo list"
+     }
+    },
+    "required": [
+     "todos"
+    ],
+    "additionalProperties": false
+   },
+   "strict": false
+  }
+ },
+ {
+  "type": "function",
+  "function": {
    "name": "webfetch",
    "description": "Fetch content from an HTTP or HTTPS URL and return it as text, markdown, or HTML. Markdown is the default.\n\nUse a more targeted tool when one is available. This tool is read-only. Large text results may be replaced with a preview while the complete output is retained in managed storage.",
    "parameters": {
@@ -320,7 +379,6 @@
       "description": "The HTTP or HTTPS URL to fetch content from"
      },
      "format": {
-      "type": "string",
       "enum": [
        "text",
        "markdown",
@@ -336,7 +394,8 @@
      }
     },
     "required": [
-     "url"
+     "url",
+     "format"
     ],
     "additionalProperties": false
    },
@@ -384,47 +443,6 @@
     "required": [
      "path",
      "content"
-    ],
-    "additionalProperties": false
-   },
-   "strict": false
-  }
- },
- {
-  "type": "function",
-  "function": {
-   "name": "execute",
-   "description": "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results.\n`fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable; all other external access goes through `tools`.\nWithin `{ code }`, the only callable tools are those explicitly listed in the Code Mode catalog instructions or returned by the `search` function. Inside `{ code }`, ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.\nCall tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>[\"tool-name\"](input)`.\nPrefer an explicit `return`; if omitted, the final top-level expression becomes the result.\nAwait every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
-   "parameters": {
-    "type": "object",
-    "properties": {
-     "code": {
-      "type": "string"
-     }
-    },
-    "required": [
-     "code"
-    ],
-    "additionalProperties": false
-   },
-   "strict": false
-  }
- },
- {
-  "type": "function",
-  "function": {
-   "name": "patch",
-   "description": "Reserved for the host runtime; do not call or select this function.",
-   "parameters": {
-    "type": "object",
-    "properties": {
-     "patchText": {
-      "type": "string",
-      "description": "The full patch text describing add, update, and delete operations"
-     }
-    },
-    "required": [
-     "patchText"
     ],
     "additionalProperties": false
    },
