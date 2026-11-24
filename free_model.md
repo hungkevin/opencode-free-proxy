@@ -4,7 +4,7 @@
 > - 註冊表:`https://models.opencode.ai/api.json` → `["opencode"].models`(官方客戶端同一來源)
 > - 線上端點:`https://opencode.ai/inference/v1`(實際服務,`Bearer public` 免認證;
 >   舊 `/zen/v1` 端點已於 2026-10 停用,見 §6)
-> 最後更新:**2026-11-07(v0.19.1 + 兩輪 server.mjs 審查修復 / 附錄 L.5-L.6;下方「現況速查」為唯一有效錨點)**
+> 最後更新:**2026-11-24(v0.19.2;v2.2.3 線纜契約升級 + 上游變更查核 / 附錄 N;下方「現況速查」為唯一有效錨點)**
 
 ---
 
@@ -15,12 +15,12 @@
 
 | 面向 | 目前有效結論 | 依據 |
 |------|-------------|------|
-| 版本 / 測試 | **v0.19.1 + 2026-11-07 兩輪審查修復**;測試 **95 pass / 0 fail**(`bun test`,14 檔) | `package.json`、`8457147`、附錄 L.5 / L.6 |
+| 版本 / 測試 | **v0.19.2**;測試 **95 pass / 0 fail**(`bun test`,14 檔) | `package.json`、附錄 L.5 / L.6、**附錄 N** |
 | 端點 | `POST /inference/v1/chat/completions`(兩 proxy);官方源碼為 `/inference/openai/v1`(別名並存,維持不變) | 附錄 E、J.4 |
 | 傳輸 | **Bun 原生 `fetch` 即過 TLS 閘**;uTLS 隧道與 `ZEN_TUNNEL_URL` 已移除(Bun-only 足跡) | 附錄 H.4 / I.4 / I.7 |
 | 認證 | 免費模型 `Bearer public`;models 抓取亦固定 `Bearer public` | 附錄 D A1 / H.2 / I.3 |
-| 形狀 | 官方 prompt 置頂 + 13 官方工具 + `stream:true` + `max_completion_tokens`;**客戶端工具一律摘要式** `oc2api_<sha256[:12]>` | 附錄 H.1 / H.3 / I.3 |
-| 詞彙閘門 | 可讀 `oc2api_<name>` 曾被實測 429、摘要式 200;**成因已下修為「疑似前綴/詞彙黑名單」,非「可讀本身」** | 附錄 H.3 / I.2 / I.6 / J.2 |
+| 形狀 | 官方 v2.2.3 prompt 置頂(含 `${OPENCODE_TOOL_GUIDANCE}` 填充 + `<env>` 塊 + placeholder note)+ 13 官方工具逐字定義 + `stream:true` + `max_completion_tokens`;**客戶端工具一律摘要式** `mcp_<sha256[:12]>` | 附錄 H.1 / H.3 / I.3、**附錄 N** |
+| 詞彙閘門 | 可讀 `oc2api_<name>` 曾被實測 429、摘要式 200;前綴本身也會被匹配(`clint_` → 429),現用 `mcp_`;**成因已下修為「疑似前綴/詞彙黑名單」,非「可讀本身」** | 附錄 H.3 / I.2 / I.6 / J.2 |
 | 429 | `FreeUsageLimitError` 有**多種成因**(每日 IP 配額 / 滾動窗 / **形狀:可讀工具名或 system 缺 `<env>Working directory:` 塊**),文案不可判因;硬配額 fail-fast。**缺 `<env>` 是最易誤判為配額的一種**(四家外部 ablation 一致,見 M.3) | 附錄 F / H.4 / J.2-6 / **M.3** |
 | 403 | `FreeTierError` → `free_tier_error` 獨立分類 + 一次抖動重試(換新 session) | 附錄 I.2 / J.3 |
 | 配額策略 | **不再是單 IP**:`ZEN_EGRESS_PROXIES` opt-in 出口 IP 輪換池(硬配額換 lane 一次);未設才直連 | 附錄 K(v13.0) |
@@ -1568,3 +1568,119 @@ SWAP 帶健全數**。全套 **76 pass / 0 fail**（`bun test`,2026-11-06 實測
 
 > 附錄 M 為 2026-11-07 普查快照;各 repo 會持續更新,引用前宜重驗 `pushed_at` 與 README。
 > 本輪**未動任何程式碼、未消耗免費額度**;M.4 全部為待議項。
+
+---
+
+## 附錄 N: 上游變更查核與 v2.3.2 措辭驗證 (v0.19.2,2026-11-24)
+
+> 本輪為純查核:**未改動 server.mjs 任何一行**,`bun test` 仍為 95 pass / 0 fail。
+> 結論寫在這裡,是為了讓下次「要不要跟進上游」的判斷有依據,而不是重新推論一遍。
+
+### N.1 查核範圍
+
+| 來源 | 本地狀態 | 本輪讀了什麼 |
+|------|---------|-------------|
+| `c:\work\opencode` (sst/opencode) | 802 個 commit 落後 HEAD,tag 最遠到 `v2.3.2` | `packages/core/src/session/runner/prompt/system.txt`、`packages/core/src/tool/plugin/*`、`packages/core/src/instructions/builtins.ts` 在 `v2.3.2` 的版本 |
+| `c:\work\dsh-our-free-model` (OFM) | 11-24 合併 #926 | `docs/free-lane-wire.md`、`docs/opencode-assets.md`、`src/o2a/version.js`、`src/o2a/assets/*` |
+### N.2 上游工具集是否變動:沒有
+
+在 `v2.3.2` 標籤下,`packages/core/src/tool/plugin/` 中宣告 `export const name = ...` 的插件仍是同一個集合:
+
+```
+edit glob grep patch question read shell skill subagent todowrite webfetch websearch write
+```
+
+共 13 個,與本專案 `oc-tools.json` 的 roster 逐字相同。tag 之後才出現的 `cd`、`machine`、`session-search`、`artifact`、`automation`、`mcp-events`、`image-generate`、`video-generate` 等:
+
+- 全部落在 `v2.3.2` **之後**,不屬於任何已發布客戶端的形狀;
+- 且皆為 opt-in(需要對應的 flag/config 才會進 tool table),不會出現在預設免費層請求裡。
+
+**判定:官方 13 工具名單不需改動。**
+
+
+### N.3 措辭變更:有,但非閘門
+
+`v2.2.3` → `v2.3.2` 期間,部分工具描述文字被上游改寫。逐個對照本專案現存資產:
+
+| 工具 | `v2.3.2` 的差異 | 性質 |
+|------|------------------------|------|
+| `read` | 刪去「Images and PDFs are presented directly to the model.」,其餘句子重新併句 | 措辭 |
+| `shell` | 刪去「Commands accept an optional timeout…」併入參數描述;新增「The current session ID is available in the `OPENCODE_SESSION_ID` environment variable.」 | 措辭 + 新事實 |
+| `subagent` | 移除 `background` 參數;`sessionID` 改為「Send a follow-up to an existing subagent, running or finished. Omit to start a new one.」 | **語意**(官方 CLI 能力變更) |
+| `todowrite` | 描述文字未變 | — |
+| 其餘 9 個 | 與 `v2.2.3` 逐字相同 | — |
+
+
+### N.4 實測:兩組措辭都被接受
+
+A/B 探針(`review/probe_v232_assets.mjs`,一次性工具,未入版控)在同一出口、同一分鐘送出兩個 body,
+唯一差別是官方 `read` 與 `shell` 的描述文字:
+
+| 組別 | 官方描述文字 | 上游回應 |
+|------|-------------|---------|
+| A(現行 `oc-tools.json` v2.2.3 措辭) | `v2.2.3` 措辭(含「Images and PDFs are presented…」「Commands accept an optional timeout…」) | **200** |
+| B(改寫為 `v2.3.2` 措辭) | `read`/`shell` 兩者都改寫為 `v2.3.2` 措辭(`shell` 含新的 `OPENCODE_SESSION_ID` 一句) | **200** |
+
+其餘全部相同:官方 base prompt、`${OPENCODE_TOOL_GUIDANCE}` 填充(shell/write/edit 三條)、
+`Model:` + `<env>` 環境塊、`Use only skills …` 尾句、placeholder note、
+四條 session header、UA `opencode/latest/2.2.3/cli`、`stream:true` + `include_usage`、`max_completion_tokens:32`。
+
+### N.5 另一組對照:裸請求 429
+
+同一出口、同一分鐘,只帶 `model` + `messages` + `stream`(無官方 prompt、無官方工具)的裸請求
+回 **429 FreeUsageLimitError**,文案與配額耗盡完全相同。
+
+這條對照確立兩件事:
+
+1. **429 文案不可判因**(延續附錄 F/H.4):它同時代表「配額用完」與「形狀不對」,
+   N.4 的兩組 200 若換成裸形狀就會是 429,與措辭無關。
+2. **N.4 的 200 不是「今天還有額度」的偶然**:裸請求在同一分鐘被打掉,
+   說明 N.4 的形狀確實通過了閘門比對,不只是配額沒用完。
+
+
+本輪三次探針的實際輸出(同機、同出口):
+
+```text
+bare  (no official prompt/tools)  -> 429 FreeUsageLimitError
+official shape (v2.2.3 wording)   -> 200  prompt_tokens 3973  "PONG"
+v2.3.2 read+shell wording         -> 200
+```
+### N.6 結論與決定
+
+| 問題 | 結論 |
+|------|------|
+| 官方 13 工具 roster 要不要改? | **不改**。`v2.3.2` 與本專案一致。 |
+| `v2.3.2` 改寫的 `read`/`shell` 措辭要不要跟進? | **可跟,但非必要**。實測兩版皆 200,不跟進不會壞。 |
+| `subagent` 移除 `background` 要不要跟進? | **不跟**。這是官方 CLI 的能力變更,不是閘門;跟進需改工具轉換邏輯,風險大於收益。 |
+| OFM 11-24 的修復要不要移植? | **不需要**。全部是 DSH 插件自用(http 分類、visibility、trae SSE),與本代理的線纜契約無關;OFM 仍釘 `2.2.3`。 |
+| 要不要 commit 程式碼? | **不用**。`bun test` 95 pass / 0 fail,工作樹乾淨。本輪只新增本節文件。 |
+
+### N.7 為什麼「措辭也會閘」與「措辭可換」不矛盾
+
+OFM 2026-11-21 的結論是「description 與參數 schema 必須與官方客戶端**逐字一致**」,
+本輪 N.4 卻顯示 `read`/`shell` 兩版措辭都通。兩者不衝突,差別在**哪一層**:
+
+- OFM 的故障體是**自撰版**:`read` 只剩 1 句,所有參數**一個描述都沒有**。
+  那不是「換句話說」,是**丟掉了逐字資產的結構**(每屬性必帶 description)。
+- `v2.3.2` 的措辭是**官方自己改的**:句子數量、每個 property 的 description、
+  `additionalProperties:false`、`required` 列表全部完整,只是用字不同。
+
+所以真正的閘門不是「某一段字面」,而是「**是不是官方客戶端會送出的那個形狀**」。
+上游改版時,新措辭自動屬於「官方會送出的」;自撰精簡版永遠不是。
+
+> 這條也解釋了為什麼本專案的作法是「從 tag 取資產」而不是「照著描述手打」:
+> 手打的句子即使語意等價,也已經不是官方會送的形狀。
+
+
+### N.8 下次查核清單
+
+上游再有更新時,依序跑這幾條就能在幾分鐘內判斷「要不要跟」:
+
+1. `git -C c:\work\opencode tag --sort=-creatordate | Select-Object -First 5` — 有無新 tag。
+2. `git -C c:\work\opencode show <tag>:packages/core/src/tool/plugin/` 逐檔抓 `export const name` — roster 有無變。
+3. `git -C c:\work\opencode show <tag>:packages/core/src/session/runner/prompt/system.txt` — 與 `oc-prompt.txt` 比對 placeholder 是否還在、句子有無增刪。
+4. `git -C c:\work\dsh-our-free-model log --since=<上次> -- docs/free-lane-wire.md src/o2a/version.js src/o2a/assets/` — OFM 若沒動這三處,通常沒有新閘門情報。
+5. `bun review/probe_live_shape.mjs official none <model>` — 現行形狀是否仍 200。
+6. `bun test` — 95 pass 是否維持。
+
+> 附錄 N 為 2026-11-24 當日快照。上游措辭與 roster 隨時會變,引用前宜重跑 N.8。

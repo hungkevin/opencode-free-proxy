@@ -38,17 +38,17 @@ then merges any extra ids served by the live inference endpoint
 (`GET https://opencode.ai/inference/v1/models`).
 Always check `GET /v1/models` for the live list; the table below is a snapshot.
 
-| Model (snapshot 2026-10-28) | What it is | Reliability |
+| Model (snapshot 2026-11-24) | What it is | Reliability |
 |-------|-----------|-------------|
-| `flint-40b-free` | Flint 40B Free | new |
-| `nemotron-3.5-super-vl-free` | NVIDIA Nemotron 3.5 Super VL (**image input**) | new |
-| `beam-free` | Beam Free | new |
+| `tidepool-alpha-free` | Tidepool Alpha | new |
+| `hy4-flash-free` | Hy4 Flash (**image input**) | new |
+| `iceman-free` | Iceman | new |
+| `flint-40b-free` | Flint 40B Free | Solid |
+| `deepseek-v4.1-flash-free` | DeepSeek V4.1 Flash (**image input**) | Solid |
+| `nemotron-3.5-super-vl-free` | NVIDIA Nemotron 3.5 Super VL (**image input**) | Solid |
+| `beam-free` | Beam Free | Solid |
 | `mimo-v2.6-flash-free` | MiMo V2.6 Flash | Solid |
-| `deepseek-v4.1-flash-free` | DeepSeek V4.1 Flash | Solid |
-| `glm-5.3-flash-free` | GLM 5.3 Flash | Solid |
 | `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning | Solid |
-| `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | Hit or miss |
-| `jev-1.13-free` | Jev 1.13 (live endpoint only) | new |
 | `big-pickle` | Big Pickle (alias, name has no `free`) | Solid |
 
 All models support streaming, tool calls, and system messages.
