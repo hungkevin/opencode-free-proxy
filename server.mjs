@@ -119,14 +119,17 @@ function parseFreeUsesOcKey(v) {
 }
 
 function loadOcKeys() {
+  let parsed = null;
   try {
-    const parsed = JSON.parse(fs.readFileSync(ocKeysFile, "utf8"));
-    ocKeys = normalizeOcKeys(parsed?.ockeys);
-    freeUsesOcKey = parseFreeUsesOcKey(parsed?.FREE_USES_OC_KEY);
+    parsed = JSON.parse(fs.readFileSync(ocKeysFile, "utf8"));
   } catch {
-    ocKeys = [];
-    freeUsesOcKey = false;
+    parsed = null;
   }
+  // Always assign BOTH values, even when the file is missing/invalid:
+  // `freeUsesOcKey` is a module-level let shared with setFreeUsesOcKey, and a
+  // previous loadOcKeys() early-exit left it at a stale value (B.1).
+  ocKeys = normalizeOcKeys(parsed?.ockeys);
+  freeUsesOcKey = parseFreeUsesOcKey(parsed?.FREE_USES_OC_KEY);
   if (ocKeys.length) {
     console.log(`[OCKEYS] Loaded ${ocKeys.length} upstream key(s) from ${ocKeysFile}`);
     // Determine whether Console keys will actually be used
@@ -154,6 +157,12 @@ function setOcKeys(keys) {
 
 function setFreeUsesOcKey(v) {
   freeUsesOcKey = parseFreeUsesOcKey(v);
+}
+
+// One place to snapshot current auth-relevant state (used by /health and for
+// debugging): the fixed API keys exist separately; here we report OC-key state.
+function ocKeyState() {
+  return { count: ocKeys.length, freeUsesOcKey };
 }
 
 // Upstream auth (official-opencode parity): the opencode provider sets
@@ -3897,10 +3906,17 @@ app.post("/v1/responses", async (req, res) => {
     return res.status(400).json({ error: nonSparkWrongEndpoint(model) });
   }
   // P2.7: reject missing/empty input locally (mirrors messages checks on chat routes).
-  if (req.body.input === undefined || req.body.input === null ||
-      (typeof req.body.input === "string" && !req.body.input.trim()) ||
-      (Array.isArray(req.body.input) && req.body.input.length === 0)) {
-    return res.status(400).json({ error: { message: "input must be a non-empty string or array", type: "invalid_request_error" } });
+  // OpenAI Responses: `input` is required, non-empty — string, array (non-empty),
+  // or object (non-empty). Objects ride through to `chatToResponsesRequest`
+  // (object → user message).
+  const ri = req.body.input;
+  const riIsObj = isPlainObject(ri);
+  const riEmptyObj = riIsObj && Object.keys(ri).length === 0;
+  if (ri === undefined || ri === null ||
+      (typeof ri === "string" && !ri.trim()) ||
+      (Array.isArray(ri) && ri.length === 0) ||
+      riEmptyObj) {
+    return res.status(400).json({ error: { message: "input must be a non-empty string, array or object", type: "invalid_request_error" } });
   }
   // Q3: generation-param validation (was chat-route only).
   {
@@ -4053,6 +4069,7 @@ app.get("/health", (_req, res) => res.json({
   responses_available: hasFreeSparkModel(),
   upstream_auth: zenKey(MODELS[0]) === "public" ? "public (free tier)" : "console key",
   free_uses_oc_key: freeUsesOcKey,
+  oc_keys: ocKeyState(),
   official_tools: OFFICIAL_TOOLS.length,
   session_ttl_ms: SESSION_TTL_MS,
   forward_params: FORWARD_PARAMS,
